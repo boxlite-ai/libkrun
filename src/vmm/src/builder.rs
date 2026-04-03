@@ -3,9 +3,9 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
+use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
 use crossbeam_channel::unbounded;
-use crossbeam_channel::Sender;
 use kernel::cmdline::Cmdline;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ use devices::legacy::{IoApic, IrqChipT};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
+use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, Vsock, port_io};
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -73,7 +73,7 @@ use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
 #[cfg(not(any(feature = "tee", feature = "nitro")))]
-use devices::virtio::{fs::ExportTable, VirtioShmRegion};
+use devices::virtio::{VirtioShmRegion, fs::ExportTable};
 use flate2::read::GzDecoder;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -88,8 +88,6 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
-#[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
-use vm_memory::mmap::MmapRegion;
 #[cfg(not(any(feature = "tee", feature = "nitro")))]
 use vm_memory::Address;
 use vm_memory::Bytes;
@@ -97,6 +95,8 @@ use vm_memory::Bytes;
 use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use vm_memory::GuestRegionMmap;
+#[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
+use vm_memory::mmap::MmapRegion;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 #[cfg(target_arch = "aarch64")]
@@ -1050,8 +1050,8 @@ pub fn build_microvm(
         #[cfg(not(feature = "net"))]
         vmm.kernel_cmdline.insert_str("tsi_hijack")?;
         #[cfg(feature = "net")]
-        if vm_resources.net.list.is_empty() {
-            // Only enable TSI if we don't have any network devices.
+        if vsock.lock().unwrap().enable_tsi() {
+            // Only enable the guest-side TSI hijack when the vsock device uses TSI.
             vmm.kernel_cmdline.insert_str("tsi_hijack")?;
         }
     }
