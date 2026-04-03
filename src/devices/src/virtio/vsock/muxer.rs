@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
+use super::VsockError;
 use super::defs;
 use super::defs::uapi;
-use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
+use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
@@ -18,7 +19,7 @@ use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
 use super::TsiFlags;
 use super::VsockError;
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -130,6 +131,10 @@ impl VsockMuxer {
             unix_ipc_port_map,
             tsi_flags,
         }
+    }
+
+    pub fn enable_tsi(&self) -> bool {
+        self.enable_tsi
     }
 
     pub(crate) fn activate(

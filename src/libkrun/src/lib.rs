@@ -3,13 +3,13 @@ extern crate log;
 
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
+use devices::virtio::CacheType;
+#[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
-#[cfg(feature = "blk")]
-use devices::virtio::CacheType;
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -19,13 +19,13 @@ use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
 #[cfg(all(feature = "blk", not(feature = "tee")))]
 use rand::distr::{Alphanumeric, SampleString};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::convert::TryInto;
 use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::fs::File;
 use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
@@ -33,9 +33,9 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use utils::eventfd::EventFd;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
@@ -52,7 +52,7 @@ use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
-use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLINE};
+use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfig};
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
@@ -62,7 +62,7 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 use aws_nitro::enclave::NitroEnclave;
 
 #[cfg(feature = "gpu")]
-use devices::virtio::display::{DisplayInfoEdid, PhysicalSize, MAX_DISPLAYS};
+use devices::virtio::display::{DisplayInfoEdid, MAX_DISPLAYS, PhysicalSize};
 #[cfg(feature = "input")]
 use krun_input::{InputConfigBackend, InputEventProviderBackend};
 
@@ -143,6 +143,8 @@ struct ContextConfig {
     legacy_net_cfg: Option<LegacyNetworkConfig>,
     #[cfg(feature = "net")]
     legacy_mac: Option<[u8; 6]>,
+    #[cfg(feature = "net")]
+    disable_tsi: bool,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
     vsock_config: VsockConfig,
@@ -1065,6 +1067,20 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(feature = "net")]
+pub unsafe extern "C" fn krun_disable_tsi(ctx_id: u32) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.disable_tsi = true;
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
 #[cfg(all(target_os = "linux", feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_tap(
     ctx_id: u32,
@@ -1093,7 +1109,9 @@ pub unsafe extern "C" fn krun_add_net_tap(
     if features & (NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6 | NET_FEATURE_GUEST_UFO) != 0
         && features & NET_FEATURE_GUEST_CSUM == 0
     {
-        debug!("Network tap backend requires GUEST_CSUM to be requested if any of GUEST_TSO4, GUEST_TSO6 and/or GUEST_UFO are required");
+        debug!(
+            "Network tap backend requires GUEST_CSUM to be requested if any of GUEST_TSO4, GUEST_TSO6 and/or GUEST_UFO are required"
+        );
         return -libc::EINVAL;
     }
 
@@ -1922,7 +1940,7 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
 pub extern "C" fn krun_get_max_vcpus() -> i32 {
     #[cfg(target_os = "macos")]
     {
-        use hvf::bindings::{hv_vm_get_max_vcpu_count, HV_SUCCESS};
+        use hvf::bindings::{HV_SUCCESS, hv_vm_get_max_vcpu_count};
         let mut max_vcpu_count: u32 = 0;
         let ret = unsafe { hv_vm_get_max_vcpu_count(&mut max_vcpu_count as *mut u32) };
         if ret == HV_SUCCESS {
