@@ -1,0 +1,705 @@
+//! DeviceManager — centralized I/O port and MMIO device dispatch.
+//!
+//! Owns all emulated devices (Serial, PIC, PIT, CMOS/RTC, virtio-*)
+//! and routes vCPU exit events to the appropriate device handlers.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
+
+use super::pic::Pic;
+use super::pit::Pit;
+use super::serial::{Serial, COM1_BASE};
+use super::virtio::block::VirtioBlock;
+use super::virtio::disk::open_disk_backend;
+use super::virtio::mmio::VirtioMmioDevice;
+use super::virtio::net::VirtioNet;
+use super::virtio::p9::Virtio9p;
+use super::virtio::queue::GuestMemoryAccessor;
+use super::virtio::vsock::VirtioVsock;
+use super::super::error::{Result, WkrunError};
+use super::super::cmdline::{irq_for_slot, mmio_base_for_slot, MmioSlot, MMIO_SLOT_SIZE};
+use super::super::context::VmContext;
+use super::super::vcpu::IoHandler;
+
+/// Shared console output buffer.
+pub type ConsoleBuffer = Arc<Mutex<Vec<u8>>>;
+
+/// Writer that copies output to both an inner writer and a shared buffer.
+struct TeeWriter {
+    inner: Box<dyn Write + Send>,
+    buffer: ConsoleBuffer,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Global console output buffers, keyed by ctx_id.
+static CONSOLE_BUFFERS: LazyLock<Mutex<HashMap<u32, ConsoleBuffer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Store a console buffer for a VM.
+pub fn store_console_buffer(ctx_id: u32, buffer: ConsoleBuffer) {
+    CONSOLE_BUFFERS.lock().unwrap().insert(ctx_id, buffer);
+}
+
+/// Get a snapshot of console output for a VM.
+///
+/// Returns None if no buffer exists for the given ctx_id.
+pub fn get_console_output(ctx_id: u32) -> Option<Vec<u8>> {
+    CONSOLE_BUFFERS
+        .lock()
+        .unwrap()
+        .get(&ctx_id)
+        .map(|buf| buf.lock().unwrap().clone())
+}
+
+/// Remove and drop the console buffer for a VM.
+pub fn remove_console_buffer(ctx_id: u32) {
+    CONSOLE_BUFFERS.lock().unwrap().remove(&ctx_id);
+}
+
+/// Default guest CID for vsock (standard value for single-VM hosts).
+const GUEST_CID: u64 = 3;
+
+/// Default vsock listen ports (BoxLite: 2695=gRPC, 2696=ready signal).
+const DEFAULT_VSOCK_PORTS: &[u32] = &[2695, 2696];
+
+/// CMOS register read values (static, read-only clock).
+fn cmos_read(addr: u8) -> u8 {
+    match addr {
+        0x00 => 0,    // Seconds
+        0x02 => 0,    // Minutes
+        0x04 => 12,   // Hours (12 noon)
+        0x06 => 3,    // Day of week (Wednesday)
+        0x07 => 1,    // Day of month
+        0x08 => 1,    // Month (January)
+        0x09 => 25,   // Year (2025)
+        0x0A => 0x26, // Status A: no update in progress, 32.768 kHz
+        0x0B => 0x02, // Status B: 24-hour, BCD mode
+        0x0C => 0x00, // Status C: no interrupt source
+        0x0D => 0x80, // Status D: battery OK
+        0x0E => 0x00, // Diagnostic status
+        0x0F => 0x00, // Shutdown status
+        0x10 => 0x00, // Floppy drive type
+        0x12 => 0x00, // Hard drive type
+        0x15 => 0x80, // Base memory low byte (640KB = 0x0280)
+        0x16 => 0x02, // Base memory high byte
+        0x17 => 0x00, // Extended memory low (kernel uses E820)
+        0x18 => 0x00, // Extended memory high
+        0x32 => 0x20, // Century (20xx)
+        _ => 0x00,
+    }
+}
+
+/// Result of creating devices from a VmContext.
+pub struct DeviceSetup {
+    /// The device manager.
+    pub devices: DeviceManager,
+    /// MMIO slots to include in the kernel command line.
+    pub mmio_slots: Vec<MmioSlot>,
+    /// Whether a root disk is present.
+    pub has_root_disk: bool,
+    /// Shared console output buffer (captures all serial output).
+    pub console_buffer: ConsoleBuffer,
+}
+
+/// Centralized device manager for all emulated devices.
+pub struct DeviceManager {
+    serial: Serial,
+    pub pic: Pic,
+    pit: Pit,
+    cmos_addr: u8,
+
+    /// Virtio-blk device (slot 0) — optional.
+    virtio_blk: Option<VirtioMmioDevice<VirtioBlock>>,
+    /// Virtio-vsock device (slot 1).
+    virtio_vsock: VirtioMmioDevice<VirtioVsock>,
+    /// Virtio-9p device (slot 2) — optional.
+    virtio_9p: Option<VirtioMmioDevice<Virtio9p>>,
+    /// Virtio-net device (slot 3) — optional.
+    virtio_net: Option<VirtioMmioDevice<VirtioNet>>,
+
+    /// Track whether we've requested an interrupt window.
+    window_requested: bool,
+    /// Last PIT tick timestamp.
+    last_tick: Instant,
+}
+
+impl DeviceManager {
+    /// Create all devices from a VmContext configuration.
+    ///
+    /// Returns the device manager plus MMIO slot info for the kernel cmdline.
+    pub fn from_context(ctx: &VmContext) -> Result<DeviceSetup> {
+        // Serial console with capture buffer.
+        let console_buffer: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
+        let serial = if let Some(ref path) = ctx.console_output {
+            let file = File::create(path).map_err(|e| {
+                WkrunError::Device(format!(
+                    "failed to create console output '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            let tee = TeeWriter {
+                inner: Box::new(file),
+                buffer: console_buffer.clone(),
+            };
+            Serial::new(COM1_BASE, Box::new(tee))
+        } else {
+            let tee = TeeWriter {
+                inner: Box::new(std::io::stdout()),
+                buffer: console_buffer.clone(),
+            };
+            Serial::new(COM1_BASE, Box::new(tee))
+        };
+
+        // Virtio-blk (slot 0).
+        let has_root_disk = !ctx.disks.is_empty();
+        let virtio_blk = if let Some(disk) = ctx.disks.first() {
+            let backend = open_disk_backend(&disk.path, disk.format, disk.read_only)?;
+            let blk = VirtioBlock::new(backend, disk.read_only);
+            Some(VirtioMmioDevice::new(blk))
+        } else {
+            None
+        };
+
+        // Virtio-vsock (slot 1) — always present.
+        let mut vsock_backend = VirtioVsock::new(GUEST_CID);
+        // Listen on configured ports, or defaults.
+        if ctx.vsock_ports.is_empty() {
+            for &port in DEFAULT_VSOCK_PORTS {
+                let _ = vsock_backend.listen(port);
+            }
+        } else {
+            for vp in &ctx.vsock_ports {
+                let host_port = vp.host_tcp_port.unwrap_or(vp.port as u16);
+                let _ = vsock_backend.listen_on(vp.port, host_port);
+            }
+        }
+        let virtio_vsock = VirtioMmioDevice::new(vsock_backend);
+
+        // Virtio-9p (slot 2) — optional, from fs_mounts.
+        let virtio_9p = ctx.fs_mounts.first().map(|mount| {
+            let p9 = Virtio9p::new(&mount.tag, mount.host_path.clone(), false);
+            VirtioMmioDevice::new(p9)
+        });
+
+        // Virtio-net (slot 3) — optional, from net_config.
+        let virtio_net = if let Some(ref net_cfg) = ctx.net_config {
+            let transport = Self::connect_net_transport(&net_cfg.socket_path)?;
+            let net = VirtioNet::new(net_cfg.mac, transport);
+            Some(VirtioMmioDevice::new(net))
+        } else {
+            None
+        };
+
+        // Build MMIO slots for kernel cmdline.
+        let mmio_slots = vec![
+            MmioSlot {
+                index: 0,
+                active: virtio_blk.is_some(),
+            },
+            MmioSlot {
+                index: 1,
+                active: true,
+            }, // vsock always active
+            MmioSlot {
+                index: 2,
+                active: virtio_9p.is_some(),
+            },
+            MmioSlot {
+                index: 3,
+                active: virtio_net.is_some(),
+            },
+        ];
+
+        let devices = DeviceManager {
+            serial,
+            pic: Pic::new(),
+            pit: Pit::new(),
+            cmos_addr: 0,
+            virtio_blk,
+            virtio_vsock,
+            virtio_9p,
+            virtio_net,
+            window_requested: false,
+            last_tick: Instant::now(),
+        };
+
+        Ok(DeviceSetup {
+            devices,
+            mmio_slots,
+            has_root_disk,
+            console_buffer,
+        })
+    }
+
+    /// Handle an I/O port output (write) from the guest.
+    ///
+    /// Returns `true` if skip_instruction should be called after.
+    pub fn handle_io_out(&mut self, port: u16, size: u8, data: u32) {
+        if self.serial.handles_port(port) {
+            self.serial.io_write(port, size, data);
+            if self.serial.has_interrupt() {
+                self.pic.raise_irq(4);
+            }
+        } else if self.pic.handles_port(port) {
+            self.pic.write_port(port, data as u8);
+        } else if self.pit.handles_port(port) {
+            self.pit.write_port(port, data as u8);
+        } else if port == 0x70 {
+            self.cmos_addr = (data as u8) & 0x7F;
+        }
+        // Ignore writes to other ports (PS/2, etc.).
+    }
+
+    /// Handle an I/O port input (read) from the guest.
+    ///
+    /// Returns the data to inject into the guest register.
+    pub fn handle_io_in(&mut self, port: u16, size: u8) -> u32 {
+        if self.serial.handles_port(port) {
+            let val = self.serial.io_read(port, size);
+            if self.serial.has_interrupt() {
+                self.pic.raise_irq(4);
+            }
+            val
+        } else if self.pic.handles_port(port) {
+            self.pic.read_port(port) as u32
+        } else if self.pit.handles_port(port) {
+            self.pit.read_port(port) as u32
+        } else if port == 0x71 {
+            cmos_read(self.cmos_addr) as u32
+        } else if (0xCF8..=0xCFF).contains(&port) {
+            0xFFFF_FFFF // PCI config: no devices.
+        } else if port == 0x61 {
+            0x20 // System control port B: timer 2 output high.
+        } else if port == 0x92 {
+            0x02 // System control port A: A20 enabled.
+        } else {
+            0xFF // Default: no device.
+        }
+    }
+
+    /// Handle an MMIO read from the guest.
+    ///
+    /// Returns the data to inject into the destination register.
+    pub fn handle_mmio_read(&self, address: u64, size: u8) -> u64 {
+        let blk_offset = address.wrapping_sub(mmio_base_for_slot(0));
+        let vsock_offset = address.wrapping_sub(mmio_base_for_slot(1));
+        let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
+        let net_offset = address.wrapping_sub(mmio_base_for_slot(3));
+
+        if blk_offset < MMIO_SLOT_SIZE {
+            if let Some(ref dev) = self.virtio_blk {
+                dev.read(blk_offset, size) as u64
+            } else {
+                0
+            }
+        } else if vsock_offset < MMIO_SLOT_SIZE {
+            self.virtio_vsock.read(vsock_offset, size) as u64
+        } else if p9_offset < MMIO_SLOT_SIZE {
+            if let Some(ref dev) = self.virtio_9p {
+                dev.read(p9_offset, size) as u64
+            } else {
+                0
+            }
+        } else if net_offset < MMIO_SLOT_SIZE {
+            if let Some(ref dev) = self.virtio_net {
+                dev.read(net_offset, size) as u64
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Handle an MMIO write from the guest.
+    ///
+    /// Returns `true` if an interrupt should be raised.
+    pub fn handle_mmio_write(
+        &mut self,
+        address: u64,
+        size: u8,
+        data: u64,
+        mem: &dyn GuestMemoryAccessor,
+    ) {
+        let blk_offset = address.wrapping_sub(mmio_base_for_slot(0));
+        let vsock_offset = address.wrapping_sub(mmio_base_for_slot(1));
+        let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
+
+        let net_offset = address.wrapping_sub(mmio_base_for_slot(3));
+
+        if blk_offset < MMIO_SLOT_SIZE {
+            if let Some(ref mut dev) = self.virtio_blk {
+                if dev.write(blk_offset, data as u32, size, mem) {
+                    self.pic.raise_irq(irq_for_slot(0));
+                }
+            }
+        } else if vsock_offset < MMIO_SLOT_SIZE {
+            if self
+                .virtio_vsock
+                .write(vsock_offset, data as u32, size, mem)
+            {
+                self.pic.raise_irq(irq_for_slot(1));
+            }
+        } else if p9_offset < MMIO_SLOT_SIZE {
+            if let Some(ref mut dev) = self.virtio_9p {
+                if dev.write(p9_offset, data as u32, size, mem) {
+                    self.pic.raise_irq(irq_for_slot(2));
+                }
+            }
+        } else if net_offset < MMIO_SLOT_SIZE {
+            if let Some(ref mut dev) = self.virtio_net {
+                if dev.write(net_offset, data as u32, size, mem) {
+                    self.pic.raise_irq(irq_for_slot(3));
+                }
+            }
+        }
+    }
+
+    /// Tick the PIT timer based on wall clock time and poll devices.
+    ///
+    /// Call this at the top of each vCPU run loop iteration.
+    pub fn tick_and_poll(&mut self, mem: &dyn GuestMemoryAccessor) {
+        // Tick PIT.
+        let now = Instant::now();
+        let elapsed_ns = now.duration_since(self.last_tick).as_nanos() as u64;
+        self.last_tick = now;
+
+        if elapsed_ns > 0 {
+            let fires = self.pit.tick(elapsed_ns);
+            for _ in 0..fires {
+                self.pic.raise_irq(0);
+            }
+        }
+
+        // Poll vsock for host-initiated data.
+        if self.virtio_vsock.poll(mem) {
+            self.pic.raise_irq(irq_for_slot(1));
+        }
+
+        // Poll net for incoming frames.
+        if let Some(ref mut dev) = self.virtio_net {
+            if dev.poll(mem) {
+                self.pic.raise_irq(irq_for_slot(3));
+            }
+        }
+    }
+
+    /// Connect to the userspace networking proxy and return a transport.
+    ///
+    /// On Unix: connects via Unix stream socket.
+    /// On Windows: parses "host:port" and connects via TCP.
+    fn connect_net_transport(
+        socket_path: &Path,
+    ) -> Result<Option<Box<dyn super::virtio::net::NetTransport>>> {
+        #[cfg(unix)]
+        {
+            let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
+                WkrunError::Device(format!(
+                    "failed to connect to net socket '{}': {}",
+                    socket_path.display(),
+                    e
+                ))
+            })?;
+            let transport =
+                super::virtio::net::UnixStreamTransport::new(stream).map_err(|e| {
+                    WkrunError::Device(format!("failed to configure net socket: {}", e))
+                })?;
+            Ok(Some(Box::new(transport)))
+        }
+        #[cfg(not(unix))]
+        {
+            let addr = socket_path.to_string_lossy();
+            let stream = std::net::TcpStream::connect(addr.as_ref()).map_err(|e| {
+                WkrunError::Device(format!("failed to connect to net proxy '{}': {}", addr, e))
+            })?;
+            let transport =
+                super::virtio::net::TcpTransport::new(stream).map_err(|e| {
+                    WkrunError::Device(format!("failed to configure net socket: {}", e))
+                })?;
+            Ok(Some(Box::new(transport)))
+        }
+    }
+
+    /// Whether an interrupt window has been requested.
+    pub fn window_requested(&self) -> bool {
+        self.window_requested
+    }
+
+    /// Set the interrupt window requested flag.
+    pub fn set_window_requested(&mut self, requested: bool) {
+        self.window_requested = requested;
+    }
+}
+
+/// Create a `DeviceManager` from explicit components (for testing).
+pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
+    let vsock_backend = VirtioVsock::new(GUEST_CID);
+    DeviceManager {
+        serial,
+        pic: Pic::new(),
+        pit: Pit::new(),
+        cmos_addr: 0,
+        virtio_blk: None,
+        virtio_vsock: VirtioMmioDevice::new(vsock_backend),
+        virtio_9p: None,
+        virtio_net: None,
+        window_requested: false,
+        last_tick: Instant::now(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    /// Capture buffer for serial output in tests.
+    #[derive(Clone)]
+    struct CaptureSink {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CaptureSink {
+        fn new() -> Self {
+            CaptureSink {
+                buf: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn contents(&self) -> Vec<u8> {
+            self.buf.lock().unwrap().clone()
+        }
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_test_devices() -> DeviceManager {
+        let serial = Serial::new(COM1_BASE, Box::new(std::io::sink()));
+        device_manager_with_serial(serial)
+    }
+
+    #[test]
+    fn test_io_out_serial_write() {
+        let sink = CaptureSink::new();
+        let serial = Serial::new(COM1_BASE, Box::new(sink.clone()));
+        let mut dm = device_manager_with_serial(serial);
+
+        // Write 'A' to THR (port 0x3F8).
+        dm.handle_io_out(0x3F8, 1, b'A' as u32);
+        assert_eq!(sink.contents(), b"A");
+    }
+
+    #[test]
+    fn test_io_in_serial_lsr() {
+        let mut dm = make_test_devices();
+        // Read LSR (port 0x3FD) — should report transmitter empty.
+        let lsr = dm.handle_io_in(0x3FD, 1);
+        // LSR bit 5 (THRE) and bit 6 (TEMT) should be set.
+        assert_ne!(lsr & 0x60, 0);
+    }
+
+    #[test]
+    fn test_io_in_pci_config_no_devices() {
+        let mut dm = make_test_devices();
+        let data = dm.handle_io_in(0xCF8, 4);
+        assert_eq!(data, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn test_io_in_system_control_port_b() {
+        let mut dm = make_test_devices();
+        assert_eq!(dm.handle_io_in(0x61, 1), 0x20);
+    }
+
+    #[test]
+    fn test_io_in_system_control_port_a() {
+        let mut dm = make_test_devices();
+        assert_eq!(dm.handle_io_in(0x92, 1), 0x02);
+    }
+
+    #[test]
+    fn test_io_in_unknown_port() {
+        let mut dm = make_test_devices();
+        assert_eq!(dm.handle_io_in(0x999, 1), 0xFF);
+    }
+
+    #[test]
+    fn test_cmos_read_via_io() {
+        let mut dm = make_test_devices();
+        // Select CMOS register 0x09 (year).
+        dm.handle_io_out(0x70, 1, 0x09);
+        // Read CMOS data.
+        let year = dm.handle_io_in(0x71, 1);
+        assert_eq!(year, 25); // 2025.
+    }
+
+    #[test]
+    fn test_cmos_read_battery_ok() {
+        let mut dm = make_test_devices();
+        dm.handle_io_out(0x70, 1, 0x0D);
+        let status_d = dm.handle_io_in(0x71, 1);
+        assert_eq!(status_d, 0x80);
+    }
+
+    #[test]
+    fn test_mmio_read_no_blk_device() {
+        let dm = make_test_devices();
+        // Read from virtio-blk slot when no device present.
+        let data = dm.handle_mmio_read(mmio_base_for_slot(0), 4);
+        assert_eq!(data, 0);
+    }
+
+    #[test]
+    fn test_mmio_read_vsock_magic() {
+        let dm = make_test_devices();
+        // Read virtio magic from vsock MMIO slot.
+        let magic = dm.handle_mmio_read(mmio_base_for_slot(1), 4);
+        assert_eq!(magic, 0x7472_6976); // "virt" in LE.
+    }
+
+    #[test]
+    fn test_mmio_read_vsock_device_id() {
+        let dm = make_test_devices();
+        // Device ID is at offset 0x008.
+        let device_id = dm.handle_mmio_read(mmio_base_for_slot(1) + 0x008, 4);
+        assert_eq!(device_id, 19); // vsock device ID.
+    }
+
+    #[test]
+    fn test_mmio_read_out_of_range() {
+        let dm = make_test_devices();
+        // Read from an address that doesn't belong to any device.
+        let data = dm.handle_mmio_read(0xE000_0000, 4);
+        assert_eq!(data, 0);
+    }
+
+    #[test]
+    fn test_window_requested_default() {
+        let dm = make_test_devices();
+        assert!(!dm.window_requested());
+    }
+
+    #[test]
+    fn test_window_requested_toggle() {
+        let mut dm = make_test_devices();
+        dm.set_window_requested(true);
+        assert!(dm.window_requested());
+        dm.set_window_requested(false);
+        assert!(!dm.window_requested());
+    }
+
+    #[test]
+    fn test_tee_writer() {
+        let inner_buf = Arc::new(Mutex::new(Vec::new()));
+        let capture_buf: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
+
+        let inner = CaptureSink {
+            buf: inner_buf.clone(),
+        };
+        let mut tee = super::TeeWriter {
+            inner: Box::new(inner),
+            buffer: capture_buf.clone(),
+        };
+
+        tee.write_all(b"Hello").unwrap();
+        tee.write_all(b", VM!").unwrap();
+        tee.flush().unwrap();
+
+        // Both sinks should have the same content.
+        assert_eq!(inner_buf.lock().unwrap().as_slice(), b"Hello, VM!");
+        assert_eq!(capture_buf.lock().unwrap().as_slice(), b"Hello, VM!");
+    }
+
+    #[test]
+    fn test_console_buffer_store_and_get() {
+        let buf: ConsoleBuffer = Arc::new(Mutex::new(Vec::new()));
+        buf.lock().unwrap().extend_from_slice(b"test output");
+
+        let ctx_id = 90000; // Unique ID to avoid conflicts.
+        super::store_console_buffer(ctx_id, buf);
+
+        let output = super::get_console_output(ctx_id).unwrap();
+        assert_eq!(output, b"test output");
+
+        // Cleanup.
+        super::remove_console_buffer(ctx_id);
+        assert!(super::get_console_output(ctx_id).is_none());
+    }
+
+    #[test]
+    fn test_console_buffer_not_found() {
+        assert!(super::get_console_output(89999).is_none());
+    }
+
+    #[test]
+    fn test_from_context_has_console_buffer() {
+        let ctx = VmContext::default_for_test();
+        let setup = DeviceManager::from_context(&ctx).unwrap();
+        // Buffer should be empty initially.
+        assert!(setup.console_buffer.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_from_context_minimal() {
+        let ctx = VmContext::default_for_test();
+        let setup = DeviceManager::from_context(&ctx).unwrap();
+        assert!(!setup.has_root_disk);
+        // Slot 0 (blk) inactive, slot 1 (vsock) active, slot 2 (9p) inactive.
+        assert!(!setup.mmio_slots[0].active);
+        assert!(setup.mmio_slots[1].active);
+        assert!(!setup.mmio_slots[2].active);
+    }
+
+    #[test]
+    fn test_from_context_with_fs_mount() {
+        let mut ctx = VmContext::default_for_test();
+        ctx.fs_mounts.push(super::super::super::context::FsMount {
+            tag: "test".to_string(),
+            host_path: PathBuf::from("/tmp"),
+        });
+        let setup = DeviceManager::from_context(&ctx).unwrap();
+        // Slot 2 (9p) should now be active.
+        assert!(setup.mmio_slots[2].active);
+    }
+
+    #[test]
+    fn test_from_context_net_slot_inactive_by_default() {
+        let ctx = VmContext::default_for_test();
+        let setup = DeviceManager::from_context(&ctx).unwrap();
+        // Slot 3 (net) should be inactive when no net_config.
+        assert!(!setup.mmio_slots[3].active);
+    }
+
+    #[test]
+    fn test_mmio_read_no_net_device() {
+        let dm = make_test_devices();
+        // Read from virtio-net slot when no device present.
+        let data = dm.handle_mmio_read(mmio_base_for_slot(3), 4);
+        assert_eq!(data, 0);
+    }
+}

@@ -1,6 +1,12 @@
 #[macro_use]
 extern crate log;
 
+// On Windows, the entire C API is implemented in windows_api.rs,
+// delegating to vmm::windows::* instead of the Unix VMM infrastructure.
+#[cfg(target_os = "windows")]
+mod windows_api;
+
+#[cfg(not(target_os = "windows"))]
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
@@ -2783,7 +2789,61 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 }
 
-#[cfg(feature = "aws-nitro")]
+// ============================================================================
+// New functions — Unix stubs (full implementations in windows_api.rs)
+// ============================================================================
+
+/// Start VM on a background thread (non-blocking).
+/// Not yet implemented on Unix — use krun_start_enter() instead.
+#[cfg(not(target_os = "windows"))]
+#[no_mangle]
+pub extern "C" fn krun_start(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Block until a running VM exits. Returns exit code.
+/// Not yet implemented on Unix.
+#[cfg(not(target_os = "windows"))]
+#[no_mangle]
+pub extern "C" fn krun_wait(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Request a running VM to stop (non-blocking).
+/// Not yet implemented on Unix.
+#[cfg(not(target_os = "windows"))]
+#[no_mangle]
+pub extern "C" fn krun_stop(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Get captured console output for a VM.
+/// Not yet implemented on Unix.
+#[cfg(not(target_os = "windows"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_get_console_output(
+    _ctx_id: u32,
+    _buf: *mut u8,
+    _buf_size: u32,
+) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Add a network device backed by a TCP endpoint.
+/// Not yet implemented on Unix — use krun_add_net_unixstream/unixgram instead.
+#[cfg(not(target_os = "windows"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_add_net(
+    _ctx_id: u32,
+    _c_endpoint: *const c_char,
+    _c_mac: *const u8,
+) -> i32 {
+    -libc::ENOSYS
+}
+
+// ============================================================================
+
+#[cfg(feature = "nitro")]
 #[no_mangle]
 fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
     let ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
