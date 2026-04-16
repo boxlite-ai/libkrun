@@ -6,7 +6,14 @@ extern crate log;
 #[cfg(target_os = "windows")]
 mod windows_api;
 
+// ── Unix C API implementation ────────────────────────────────────────────────
+// On Windows, the entire C API is implemented in windows_api.rs, which
+// delegates to vmm::windows::* directly. Everything below (imports, types,
+// statics, and all #[no_mangle] krun_* functions) is the upstream Unix
+// C API implementation — gated out on Windows by this single module cfg.
 #[cfg(not(target_os = "windows"))]
+mod unix_api {
+
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
@@ -72,12 +79,9 @@ use devices::virtio::display::{DisplayInfoEdid, MAX_DISPLAYS, PhysicalSize};
 #[cfg(feature = "input")]
 use krun_input::{InputConfigBackend, InputEventProviderBackend};
 
-// Value returned on success. We use libc's errors otherwise.
 const KRUN_SUCCESS: i32 = 0;
-// Maximum number of arguments/environment variables we allow
 const MAX_ARGS: usize = 4096;
 
-// krunfw library name for each context
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
 const KRUNFW_NAME: &str = "libkrunfw.so.5";
 #[cfg(all(target_os = "linux", feature = "amd-sev"))]
@@ -87,10 +91,9 @@ const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
 
-#[cfg(feature = "aws-nitro")]
+#[cfg(feature = "nitro")]
 static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 
-// Path to the init binary to be executed inside the VM.
 const INIT_PATH: &str = "/init.krun";
 
 static KRUNFW: LazyLock<Option<libloading::Library>> =
@@ -2789,60 +2792,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 }
 
-// ============================================================================
-// New functions — Unix stubs (full implementations in windows_api.rs)
-// ============================================================================
-
-/// Start VM on a background thread (non-blocking).
-/// Not yet implemented on Unix — use krun_start_enter() instead.
-#[cfg(not(target_os = "windows"))]
-#[no_mangle]
-pub extern "C" fn krun_start(_ctx_id: u32) -> i32 {
-    -libc::ENOSYS
-}
-
-/// Block until a running VM exits. Returns exit code.
-/// Not yet implemented on Unix.
-#[cfg(not(target_os = "windows"))]
-#[no_mangle]
-pub extern "C" fn krun_wait(_ctx_id: u32) -> i32 {
-    -libc::ENOSYS
-}
-
-/// Request a running VM to stop (non-blocking).
-/// Not yet implemented on Unix.
-#[cfg(not(target_os = "windows"))]
-#[no_mangle]
-pub extern "C" fn krun_stop(_ctx_id: u32) -> i32 {
-    -libc::ENOSYS
-}
-
-/// Get captured console output for a VM.
-/// Not yet implemented on Unix.
-#[cfg(not(target_os = "windows"))]
-#[no_mangle]
-pub unsafe extern "C" fn krun_get_console_output(
-    _ctx_id: u32,
-    _buf: *mut u8,
-    _buf_size: u32,
-) -> i32 {
-    -libc::ENOSYS
-}
-
-/// Add a network device backed by a TCP endpoint.
-/// Not yet implemented on Unix — use krun_add_net_unixstream/unixgram instead.
-#[cfg(not(target_os = "windows"))]
-#[no_mangle]
-pub unsafe extern "C" fn krun_add_net(
-    _ctx_id: u32,
-    _c_endpoint: *const c_char,
-    _c_mac: *const u8,
-) -> i32 {
-    -libc::ENOSYS
-}
-
-// ============================================================================
-
 #[cfg(feature = "nitro")]
 #[no_mangle]
 fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
@@ -2864,3 +2813,52 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
         }
     }
 }
+
+// ============================================================================
+// New functions — Unix stubs (full implementations in windows_api.rs)
+// ============================================================================
+
+/// Start VM on a background thread (non-blocking).
+/// Not yet implemented on Unix — use krun_start_enter() instead.
+#[no_mangle]
+pub extern "C" fn krun_start(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Block until a running VM exits. Returns exit code.
+/// Not yet implemented on Unix.
+#[no_mangle]
+pub extern "C" fn krun_wait(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Request a running VM to stop (non-blocking).
+/// Not yet implemented on Unix.
+#[no_mangle]
+pub extern "C" fn krun_stop(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Get captured console output for a VM.
+/// Not yet implemented on Unix.
+#[no_mangle]
+pub unsafe extern "C" fn krun_get_console_output(
+    _ctx_id: u32,
+    _buf: *mut u8,
+    _buf_size: u32,
+) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Add a network device backed by a TCP endpoint.
+/// Not yet implemented on Unix — use krun_add_net_unixstream/unixgram instead.
+#[no_mangle]
+pub unsafe extern "C" fn krun_add_net(
+    _ctx_id: u32,
+    _c_endpoint: *const c_char,
+    _c_mac: *const u8,
+) -> i32 {
+    -libc::ENOSYS
+}
+
+} // mod unix_api
