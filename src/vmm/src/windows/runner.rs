@@ -103,6 +103,7 @@ mod imp {
         // Create partition (no APIC emulation — avoids crash on some Win10 hardware).
         let partition = WhpxPartition::new()?;
         partition.set_processor_count(ctx.num_vcpus as u32)?;
+        partition.set_extended_vm_exits(true, true)?;
         partition.setup()?;
 
         // Allocate and map guest memory.
@@ -242,6 +243,48 @@ mod imp {
                         exit_code = 0;
                         break;
                     }
+                }
+                VcpuExit::MsrAccess { msr_number, is_write, rax, rdx } => {
+                    halt_count = 0;
+                    if is_write {
+                        log::trace!(
+                            "MSR write: 0x{:08X} <- 0x{:016X}",
+                            msr_number,
+                            (rdx << 32) | (rax & 0xFFFF_FFFF)
+                        );
+                        vcpu.skip_instruction()?;
+                    } else {
+                        log::trace!("MSR read: 0x{:08X} -> 0", msr_number);
+                        vcpu.complete_msr_read(0)?;
+                    }
+                }
+                VcpuExit::CpuidAccess {
+                    rax,
+                    rcx,
+                    default_rax,
+                    default_rbx,
+                    default_rcx,
+                    default_rdx,
+                } => {
+                    halt_count = 0;
+                    log::trace!("CPUID leaf=0x{:X} sub=0x{:X}", rax, rcx);
+                    vcpu.complete_cpuid(default_rax, default_rbx, default_rcx, default_rdx)?;
+                }
+                VcpuExit::UnrecoverableException => {
+                    let regs = vcpu.get_registers().ok();
+                    let sregs = vcpu.get_special_registers().ok();
+                    log::error!(
+                        "Unrecoverable exception (triple fault) after {} exits. \
+                         RIP={:#X}, CR0={:#X}, CR3={:#X}, CR4={:#X}, EFER={:#X}",
+                        exit_count,
+                        regs.as_ref().map_or(0, |r| r.rip),
+                        sregs.as_ref().map_or(0, |s| s.cr0),
+                        sregs.as_ref().map_or(0, |s| s.cr3),
+                        sregs.as_ref().map_or(0, |s| s.cr4),
+                        sregs.as_ref().map_or(0, |s| s.efer),
+                    );
+                    exit_code = -1;
+                    break;
                 }
                 VcpuExit::Unknown(reason) => {
                     log::error!(

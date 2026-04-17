@@ -61,6 +61,18 @@ mod imp {
         bits & 0x3
     }
 
+    /// Bitfield constants for WHV_EXTENDED_VM_EXITS.
+    /// Bit 0 = X64CpuidExit, Bit 1 = X64MsrExit.
+    const EXTENDED_VM_EXITS_CPUID: u64 = 1 << 0;
+    const EXTENDED_VM_EXITS_MSR: u64 = 1 << 1;
+
+    /// Bitfield accessor for WHV_X64_MSR_ACCESS_INFO.
+    /// Bit 0 = IsWrite.
+    fn msr_access_is_write(info: &WHV_X64_MSR_ACCESS_INFO) -> bool {
+        let bits = unsafe { info.Anonymous._bitfield };
+        (bits & 1) != 0
+    }
+
     /// A WHPX partition (VM container).
     ///
     /// Wraps `WHV_PARTITION_HANDLE` and manages its lifecycle.
@@ -142,6 +154,35 @@ mod imp {
                 )
             };
             check_hresult("WHvSetPartitionProperty(LocalApicEmulationMode)", hr)
+        }
+
+        /// Enable extended VM exits for MSR and/or CPUID interception.
+        ///
+        /// Must be called before [`setup()`]. When enabled, guest RDMSR/WRMSR
+        /// and CPUID instructions cause VM exits instead of being handled
+        /// by the hypervisor directly. This is required for Linux kernel boot
+        /// on WHPX — without it, MSR accesses to unrecognized registers cause
+        /// #GP faults that cascade into triple faults.
+        pub fn set_extended_vm_exits(&self, msr_exit: bool, cpuid_exit: bool) -> Result<()> {
+            let mut bits: u64 = 0;
+            if cpuid_exit {
+                bits |= EXTENDED_VM_EXITS_CPUID;
+            }
+            if msr_exit {
+                bits |= EXTENDED_VM_EXITS_MSR;
+            }
+            let property = WHV_PARTITION_PROPERTY {
+                ExtendedVmExits: WHV_EXTENDED_VM_EXITS { AsUINT64: bits },
+            };
+            let hr = unsafe {
+                WHvSetPartitionProperty(
+                    self.handle,
+                    WHvPartitionPropertyCodeExtendedVmExits,
+                    &property as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
+                )
+            };
+            check_hresult("WHvSetPartitionProperty(ExtendedVmExits)", hr)
         }
 
         /// Finalize the partition configuration. Must be called before creating
@@ -587,6 +628,29 @@ mod imp {
                 Ok(VcpuExit::Halt)
             } else if reason == WHvRunVpExitReasonCanceled {
                 Ok(VcpuExit::Cancelled)
+            } else if reason == WHvRunVpExitReasonX64MsrAccess {
+                // SAFETY: ExitReason is MsrAccess, so the MsrAccess union field is valid.
+                let msr_ctx = unsafe { &exit_context.Anonymous.MsrAccess };
+                let is_write = msr_access_is_write(&msr_ctx.AccessInfo);
+                Ok(VcpuExit::MsrAccess {
+                    msr_number: msr_ctx.MsrNumber,
+                    is_write,
+                    rax: msr_ctx.Rax,
+                    rdx: msr_ctx.Rdx,
+                })
+            } else if reason == WHvRunVpExitReasonX64Cpuid {
+                // SAFETY: ExitReason is CpuidAccess, so the CpuidAccess union field is valid.
+                let cpuid_ctx = unsafe { &exit_context.Anonymous.CpuidAccess };
+                Ok(VcpuExit::CpuidAccess {
+                    rax: cpuid_ctx.Rax,
+                    rcx: cpuid_ctx.Rcx,
+                    default_rax: cpuid_ctx.DefaultResultRax,
+                    default_rbx: cpuid_ctx.DefaultResultRbx,
+                    default_rcx: cpuid_ctx.DefaultResultRcx,
+                    default_rdx: cpuid_ctx.DefaultResultRdx,
+                })
+            } else if reason == WHvRunVpExitReasonUnrecoverableException {
+                Ok(VcpuExit::UnrecoverableException)
             } else if reason == WHvRunVpExitReasonNone {
                 Ok(VcpuExit::Shutdown)
             } else {
@@ -626,6 +690,69 @@ mod imp {
                 )
             };
             check_hresult("WHvSetVirtualProcessorRegisters(skip)", hr)
+        }
+
+        /// Complete an MSR read (RDMSR): inject result into RAX:RDX and advance RIP.
+        ///
+        /// For RDMSR, the 64-bit result is split: low 32 bits in EAX, high 32 in EDX.
+        /// Call after handling [`VcpuExit::MsrAccess`] where `is_write == false`.
+        pub fn complete_msr_read(&self, value: u64) -> Result<()> {
+            let instruction_len = self.exit_instruction_len.get();
+            let regs = self.get_registers()?;
+            let new_rip = regs.rip + instruction_len as u64;
+            let new_rax = value & 0xFFFF_FFFF;
+            let new_rdx = value >> 32;
+
+            let names = [WHvX64RegisterRip, WHvX64RegisterRax, WHvX64RegisterRdx];
+            let values: Vec<WHV_REGISTER_VALUE> = vec![
+                reg64(new_rip),
+                reg64(new_rax),
+                reg64(new_rdx),
+            ];
+            let hr = unsafe {
+                WHvSetVirtualProcessorRegisters(
+                    self.partition_handle,
+                    self.index,
+                    names.as_ptr(),
+                    3,
+                    values.as_ptr(),
+                )
+            };
+            check_hresult("WHvSetVirtualProcessorRegisters(msr_read)", hr)
+        }
+
+        /// Complete a CPUID exit: inject results into RAX/RBX/RCX/RDX and advance RIP.
+        ///
+        /// Call after handling [`VcpuExit::CpuidAccess`].
+        pub fn complete_cpuid(&self, rax: u64, rbx: u64, rcx: u64, rdx: u64) -> Result<()> {
+            let instruction_len = self.exit_instruction_len.get();
+            let regs = self.get_registers()?;
+            let new_rip = regs.rip + instruction_len as u64;
+
+            let names = [
+                WHvX64RegisterRip,
+                WHvX64RegisterRax,
+                WHvX64RegisterRbx,
+                WHvX64RegisterRcx,
+                WHvX64RegisterRdx,
+            ];
+            let values: Vec<WHV_REGISTER_VALUE> = vec![
+                reg64(new_rip),
+                reg64(rax),
+                reg64(rbx),
+                reg64(rcx),
+                reg64(rdx),
+            ];
+            let hr = unsafe {
+                WHvSetVirtualProcessorRegisters(
+                    self.partition_handle,
+                    self.index,
+                    names.as_ptr(),
+                    5,
+                    values.as_ptr(),
+                )
+            };
+            check_hresult("WHvSetVirtualProcessorRegisters(cpuid)", hr)
         }
 
         /// Complete an I/O IN operation: inject data into RAX and advance RIP.

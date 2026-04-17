@@ -83,6 +83,29 @@ pub enum VcpuExit {
     Cancelled,
     /// Interrupt window available (guest RFLAGS.IF became 1).
     InterruptWindow,
+    /// Guest executed RDMSR/WRMSR (requires ExtendedVmExits.X64MsrExit).
+    MsrAccess {
+        msr_number: u32,
+        is_write: bool,
+        /// RAX value (contains write data for WRMSR, undefined for RDMSR).
+        rax: u64,
+        /// RDX value (contains write data for WRMSR, undefined for RDMSR).
+        rdx: u64,
+    },
+    /// Guest executed CPUID (requires ExtendedVmExits.X64CpuidExit).
+    CpuidAccess {
+        /// Input: EAX (leaf).
+        rax: u64,
+        /// Input: ECX (sub-leaf).
+        rcx: u64,
+        /// Default results from host CPUID (pass-through values from WHPX).
+        default_rax: u64,
+        default_rbx: u64,
+        default_rcx: u64,
+        default_rdx: u64,
+    },
+    /// Unrecoverable guest exception (triple fault).
+    UnrecoverableException,
     /// Exit reason not handled.
     Unknown(u32),
 }
