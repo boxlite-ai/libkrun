@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use super::super::mmio::VirtioDeviceBackend;
-use super::super::queue::{GuestMemoryAccessor, Virtqueue};
-use super::connection::{ConnState, VsockConnection};
-use super::packet::{
+use super::mmio::VirtioDeviceBackend;
+use super::queue::{GuestMemoryAccessor, Virtqueue};
+use connection::{ConnState, VsockConnection};
+use packet::{
     VsockHeader, VSOCK_CID_HOST, VSOCK_HEADER_SIZE, VSOCK_OP_REQUEST,
 };
 

@@ -135,6 +135,11 @@ pub struct DeviceManager {
     window_requested: bool,
     /// Last PIT tick timestamp.
     last_tick: Instant,
+    /// Toggle state for port 0x61 bit 5 (PIT counter 2 output).
+    ///
+    /// Linux's `pit_calibrate_tsc()` loops reading port 0x61 waiting for
+    /// bit 5 to toggle. Without toggling, TSC calibration stalls forever.
+    port61_toggle: bool,
 }
 
 impl DeviceManager {
@@ -236,6 +241,7 @@ impl DeviceManager {
             virtio_net,
             window_requested: false,
             last_tick: Instant::now(),
+            port61_toggle: false,
         };
 
         Ok(DeviceSetup {
@@ -256,8 +262,10 @@ impl DeviceManager {
                 self.pic.raise_irq(4);
             }
         } else if self.pic.handles_port(port) {
+            log::trace!("PIC write: port={:#X} data={:#X}", port, data as u8);
             self.pic.write_port(port, data as u8);
         } else if self.pit.handles_port(port) {
+            log::trace!("PIT write: port={:#X} data={:#X}", port, data as u8);
             self.pit.write_port(port, data as u8);
         } else if port == 0x70 {
             self.cmos_addr = (data as u8) & 0x7F;
@@ -284,9 +292,23 @@ impl DeviceManager {
         } else if (0xCF8..=0xCFF).contains(&port) {
             0xFFFF_FFFF // PCI config: no devices.
         } else if port == 0x61 {
-            0x20 // System control port B: timer 2 output high.
+            // System control port B: toggle bit 5 (PIT counter 2 output).
+            //
+            // Linux's `pit_calibrate_tsc()` reads this port in a tight loop
+            // waiting for bit 5 to change. A static value causes an infinite
+            // loop that stalls kernel boot. Toggling on each read lets the
+            // calibration complete.
+            self.port61_toggle = !self.port61_toggle;
+            if self.port61_toggle { 0x20 } else { 0x00 }
         } else if port == 0x92 {
             0x02 // System control port A: A20 enabled.
+        } else if port == 0x60 || port == 0x64 {
+            // i8042 PS/2 controller: data (0x60) and status (0x64).
+            //
+            // Return 0x00 = both buffers empty, no pending data.
+            // Without this, the default 0xFF makes the i8042 driver spin in
+            // udelay() loops waiting for the input buffer to drain.
+            0x00
         } else {
             0xFF // Default: no device.
         }
@@ -460,6 +482,7 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
         virtio_net: None,
         window_requested: false,
         last_tick: Instant::now(),
+        port61_toggle: false,
     }
 }
 
@@ -531,15 +554,29 @@ mod tests {
     }
 
     #[test]
-    fn test_io_in_system_control_port_b() {
+    fn test_io_in_system_control_port_b_toggles() {
         let mut dm = make_test_devices();
-        assert_eq!(dm.handle_io_in(0x61, 1), 0x20);
+        // Port 0x61 bit 5 toggles on each read.
+        let first = dm.handle_io_in(0x61, 1);
+        let second = dm.handle_io_in(0x61, 1);
+        assert_ne!(first, second, "bit 5 should toggle");
+        let third = dm.handle_io_in(0x61, 1);
+        assert_eq!(first, third, "should cycle back");
     }
 
     #[test]
     fn test_io_in_system_control_port_a() {
         let mut dm = make_test_devices();
         assert_eq!(dm.handle_io_in(0x92, 1), 0x02);
+    }
+
+    #[test]
+    fn test_io_in_i8042_status_empty() {
+        let mut dm = make_test_devices();
+        // Port 0x64 (i8042 status): both buffers empty.
+        assert_eq!(dm.handle_io_in(0x64, 1), 0x00);
+        // Port 0x60 (i8042 data): no data.
+        assert_eq!(dm.handle_io_in(0x60, 1), 0x00);
     }
 
     #[test]

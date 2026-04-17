@@ -140,7 +140,7 @@ impl PitCounter {
 
     /// Read a data byte from this counter's data port.
     fn read_data(&mut self) -> u8 {
-        let value = self.latched_value.unwrap_or(self.reload);
+        let value = self.latched_value.unwrap_or_else(|| self.current_count());
 
         match self.access {
             AccessMode::Low => {
@@ -168,17 +168,52 @@ impl PitCounter {
     /// Latch the current count value for reading.
     fn latch(&mut self) {
         if self.latched_value.is_none() {
-            self.latched_value = Some(self.reload);
+            self.latched_value = Some(self.current_count());
         }
+    }
+
+    /// Effective reload value: 0 means 65536 per 8254 specification.
+    ///
+    /// In the real 8254 PIT, a reload value of 0 is treated as 65536
+    /// (the maximum 16-bit count). This matches BIOS behavior where the
+    /// PIT is initialized with reload=0 giving ~18.2 Hz.
+    fn effective_reload(&self) -> u64 {
+        if self.reload == 0 { 65536 } else { self.reload as u64 }
+    }
+
+    /// Compute the current counter value based on accumulated time.
+    ///
+    /// A real 8254 counts down from the reload value to 0. Software
+    /// reads the counter (via latch or direct read) to measure elapsed
+    /// time. Without this, counter reads return the static reload value
+    /// and Linux calibration loops that poll the counter never terminate.
+    fn current_count(&self) -> u16 {
+        if !self.reload_ready {
+            // Counter not (yet) programmed, or Mode 0 finished (one-shot).
+            // Mode 0 after terminal count: counter sits at 0.
+            if matches!(self.mode, CounterMode::InterruptOnTerminal) {
+                return 0;
+            }
+            return self.reload;
+        }
+        let reload = self.effective_reload();
+        // How many PIT ticks into the current reload cycle?
+        let ticks_in_period =
+            (self.ns_accumulator as u128 * PIT_FREQUENCY as u128) / NS_PER_SEC as u128;
+        let position = (ticks_in_period as u64) % reload;
+        // Counter counts down: reload → 0.
+        (reload - position) as u16
     }
 
     /// Advance the counter by `elapsed_ns` nanoseconds.
     ///
     /// Returns the number of times the counter reached zero (fired).
     fn tick(&mut self, elapsed_ns: u64) -> u64 {
-        if !self.reload_ready || self.reload == 0 {
+        if !self.reload_ready {
             return 0;
         }
+
+        let reload = self.effective_reload();
 
         match self.mode {
             CounterMode::RateGenerator | CounterMode::SquareWave => {
@@ -192,12 +227,12 @@ impl PitCounter {
                     (self.ns_accumulator as u128 * PIT_FREQUENCY as u128) / NS_PER_SEC as u128;
 
                 // How many full reload cycles is that?
-                let fires = total_ticks / self.reload as u128;
+                let fires = total_ticks / reload as u128;
 
                 // Subtract consumed nanoseconds (keep remainder in accumulator).
                 // consumed_ns = fires * reload * NS_PER_SEC / PIT_FREQUENCY
                 let consumed_ns =
-                    (fires * self.reload as u128 * NS_PER_SEC as u128) / PIT_FREQUENCY as u128;
+                    (fires * reload as u128 * NS_PER_SEC as u128) / PIT_FREQUENCY as u128;
                 self.ns_accumulator -= consumed_ns as u64;
 
                 fires as u64
@@ -207,7 +242,7 @@ impl PitCounter {
                 self.ns_accumulator += elapsed_ns;
                 let total_ticks =
                     (self.ns_accumulator as u128 * PIT_FREQUENCY as u128) / NS_PER_SEC as u128;
-                if total_ticks >= self.reload as u128 {
+                if total_ticks >= reload as u128 {
                     self.reload_ready = false; // One-shot: stop after firing.
                     self.ns_accumulator = 0;
                     1
@@ -232,10 +267,22 @@ impl Default for Pit {
 }
 
 impl Pit {
-    /// Create a new PIT with all counters in their initial state.
+    /// Create a new PIT with BIOS-compatible default state.
+    ///
+    /// Counter 0 is pre-programmed in Mode 2 (rate generator) with a
+    /// reload value of 0 (= 65536, giving ~18.2 Hz). This matches real
+    /// PC behavior where the BIOS initializes the PIT before handing
+    /// off to the OS. Without this, timer interrupts won't fire until
+    /// the kernel programs the PIT, but the kernel may depend on timer
+    /// interrupts *before* it programs the PIT (e.g., jiffies-based
+    /// timeouts in early hardware probing).
     pub fn new() -> Self {
+        let mut counter0 = PitCounter::new();
+        counter0.mode = CounterMode::RateGenerator;
+        counter0.reload = 0; // 0 = 65536 per 8254 spec → ~18.2 Hz
+        counter0.reload_ready = true;
         Pit {
-            counters: [PitCounter::new(), PitCounter::new(), PitCounter::new()],
+            counters: [counter0, PitCounter::new(), PitCounter::new()],
         }
     }
 
@@ -266,12 +313,18 @@ impl Pit {
         }
     }
 
-    /// Advance counter 0 by `elapsed_ns` nanoseconds.
+    /// Advance all counters by `elapsed_ns` nanoseconds.
     ///
     /// Returns the number of times counter 0 fired (should raise IRQ 0
-    /// for each fire).
+    /// for each fire). Counters 1 and 2 are also ticked so their
+    /// `ns_accumulator` stays current — required for `current_count()`
+    /// to return meaningful values when Linux reads these counters
+    /// (e.g., PIT counter 2 for TSC calibration).
     pub fn tick(&mut self, elapsed_ns: u64) -> u64 {
-        self.counters[0].tick(elapsed_ns)
+        let fires = self.counters[0].tick(elapsed_ns);
+        self.counters[1].tick(elapsed_ns);
+        self.counters[2].tick(elapsed_ns);
+        fires
     }
 
     /// Parse and apply a control word written to port 0x43.
@@ -399,13 +452,16 @@ mod tests {
     }
 
     #[test]
-    fn test_counter_zero_reload_no_fire() {
+    fn test_counter_zero_reload_means_65536() {
         let mut counter = PitCounter::new();
         counter.mode = CounterMode::RateGenerator;
-        counter.reload = 0; // Zero reload should not fire.
+        counter.reload = 0; // 0 = 65536 per 8254 spec.
         counter.reload_ready = true;
 
-        assert_eq!(counter.tick(1_000_000), 0);
+        // 65536 ticks at 1,193,182 Hz → ~54.9ms period.
+        // 100ms should produce ~1 fire.
+        let fires = counter.tick(100_000_000);
+        assert!(fires >= 1 && fires <= 2, "expected ~1 fire, got {}", fires);
     }
 
     #[test]
@@ -579,12 +635,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pit_no_fire_before_program() {
+    fn test_pit_fires_with_bios_defaults() {
         let mut pit = Pit::new();
-        assert_eq!(
-            pit.tick(100_000_000),
-            0,
-            "should not fire when unprogrammed"
+        // PIT starts pre-programmed at ~18.2 Hz (reload 0 = 65536).
+        // 100ms should produce ~1-2 fires.
+        let fires = pit.tick(100_000_000);
+        assert!(
+            fires >= 1 && fires <= 2,
+            "expected ~1-2 fires from BIOS defaults, got {}",
+            fires
         );
     }
 
@@ -621,6 +680,58 @@ mod tests {
             fires >= 99 && fires <= 101,
             "expected ~100 fires for HZ=100, got {}",
             fires
+        );
+    }
+
+    #[test]
+    fn test_counter_read_decrements_after_tick() {
+        let mut counter = PitCounter::new();
+        counter.mode = CounterMode::RateGenerator;
+        counter.access = AccessMode::LoThenHi;
+        counter.reload = 11932; // ~100 Hz
+        counter.reload_ready = true;
+
+        // Initially, count should equal reload (no time elapsed).
+        assert_eq!(counter.current_count(), 11932);
+
+        // Tick 5ms — about half a period. Counter should be roughly half.
+        counter.tick(5_000_000);
+        let count = counter.current_count();
+        assert!(
+            count < 11932 && count > 0,
+            "expected count between 0 and 11932, got {}",
+            count
+        );
+    }
+
+    #[test]
+    fn test_counter2_counts_down_for_tsc_calibration() {
+        // Linux's pit_calibrate_tsc() programs counter 2 in Mode 0
+        // and reads it in a loop expecting the value to decrease.
+        let mut pit = Pit::new();
+
+        // Program counter 2: mode 0 (interrupt on terminal), lo-hi.
+        // Control word: counter=2 (bits 7-6=10), access=lo-hi (bits 5-4=11),
+        //               mode=0 (bits 3-1=000), BCD=0 (bit 0=0)
+        // = 0b_10_11_000_0 = 0xB0
+        pit.write_port(PIT_COMMAND, 0xB0);
+        pit.write_port(PIT_COUNTER2, 0xFF); // Low byte.
+        pit.write_port(PIT_COUNTER2, 0xFF); // High byte → reload = 0xFFFF.
+
+        // Tick the PIT (simulating vCPU loop iterations).
+        pit.tick(10_000_000); // 10ms
+
+        // Latch counter 2 and read it.
+        pit.write_port(PIT_COMMAND, 0x80); // Latch counter 2 (counter=2, access=00).
+        let lo = pit.read_port(PIT_COUNTER2);
+        let hi = pit.read_port(PIT_COUNTER2);
+        let count = lo as u16 | ((hi as u16) << 8);
+
+        // Count should be less than the initial reload value.
+        assert!(
+            count < 0xFFFF,
+            "counter 2 should have decremented, got {:#X}",
+            count
         );
     }
 

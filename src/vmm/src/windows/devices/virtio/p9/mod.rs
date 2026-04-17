@@ -11,8 +11,8 @@ pub mod protocol;
 
 use std::path::PathBuf;
 
-use super::super::mmio::VirtioDeviceBackend;
-use super::super::queue::{GuestMemoryAccessor, Virtqueue};
+use super::mmio::VirtioDeviceBackend;
+use super::queue::{GuestMemoryAccessor, Virtqueue};
 
 use self::filesystem::P9Filesystem;
 use self::protocol::*;

@@ -12,7 +12,7 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::super::boot::loader::load_kernel_with_initrd;
     use super::super::devices::virtio::queue::GuestMemoryAccessor;
@@ -58,6 +58,49 @@ mod imp {
     /// removed by `wait()`.
     static RUNNING_VMS: std::sync::LazyLock<Mutex<HashMap<u32, VmHandle>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Translate a guest virtual address (GVA) to guest physical address (GPA)
+    /// by walking the x86_64 4-level page table starting from CR3.
+    #[allow(dead_code)]
+    fn translate_gva(guest_mem: &GuestMemory, cr3: u64, gva: u64) -> Option<u64> {
+        let pml4_base = cr3 & !0xFFF;
+        let pml4_idx = ((gva >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((gva >> 30) & 0x1FF) as usize;
+        let pd_idx = ((gva >> 21) & 0x1FF) as usize;
+        let pt_idx = ((gva >> 12) & 0x1FF) as usize;
+        let offset = gva & 0xFFF;
+
+        // PML4 entry
+        let mut buf = [0u8; 8];
+        guest_mem.read_at_addr(pml4_base + (pml4_idx as u64) * 8, &mut buf).ok()?;
+        let pml4e = u64::from_le_bytes(buf);
+        if pml4e & 1 == 0 { return None; } // not present
+
+        // PDPT entry
+        let pdpt_base = pml4e & 0x000F_FFFF_FFFF_F000;
+        guest_mem.read_at_addr(pdpt_base + (pdpt_idx as u64) * 8, &mut buf).ok()?;
+        let pdpte = u64::from_le_bytes(buf);
+        if pdpte & 1 == 0 { return None; }
+        if pdpte & 0x80 != 0 { // 1GB page
+            return Some((pdpte & 0x000F_FFFF_C000_0000) | (gva & 0x3FFF_FFFF));
+        }
+
+        // PD entry
+        let pd_base = pdpte & 0x000F_FFFF_FFFF_F000;
+        guest_mem.read_at_addr(pd_base + (pd_idx as u64) * 8, &mut buf).ok()?;
+        let pde = u64::from_le_bytes(buf);
+        if pde & 1 == 0 { return None; }
+        if pde & 0x80 != 0 { // 2MB page
+            return Some((pde & 0x000F_FFFF_FFE0_0000) | (gva & 0x1F_FFFF));
+        }
+
+        // PT entry
+        let pt_base = pde & 0x000F_FFFF_FFFF_F000;
+        guest_mem.read_at_addr(pt_base + (pt_idx as u64) * 8, &mut buf).ok()?;
+        let pte = u64::from_le_bytes(buf);
+        if pte & 1 == 0 { return None; }
+        Some((pte & 0x000F_FFFF_FFFF_F000) | offset)
+    }
 
     /// Core vCPU loop shared by `run()` and `start()`.
     ///
@@ -111,8 +154,9 @@ mod imp {
         guest_mem.map_to_partition(&partition)?;
 
         // Create devices from context.
+        let ctx_id = ctx.id;
         let setup = DeviceManager::from_context(&ctx)?;
-        devices::store_console_buffer(ctx.id, setup.console_buffer);
+        devices::store_console_buffer(ctx_id, setup.console_buffer);
         let mut devices = setup.devices;
 
         // Build kernel command line.
@@ -157,6 +201,14 @@ mod imp {
         let mem_adapter = GuestMemoryAdapter(&guest_mem);
         let mut exit_count: u64 = 0;
         let mut halt_count: u64 = 0;
+        let start_time = Instant::now();
+        let mut last_progress = Instant::now();
+        // IO/MMIO access counters for debugging boot stalls.
+        let mut io_read_counts: HashMap<u16, u64> = HashMap::new();
+        let mut io_write_counts: HashMap<u16, u64> = HashMap::new();
+        let mut mmio_count: u64 = 0;
+        let mut msr_count: u64 = 0;
+        let mut cpuid_count: u64 = 0;
         let exit_code;
 
         loop {
@@ -168,6 +220,7 @@ mod imp {
                 match vcpu.interrupts_enabled() {
                     Ok(true) => {
                         if let Some(vector) = devices.pic.acknowledge() {
+                            log::trace!("Injecting interrupt vector {:#X}", vector);
                             vcpu.inject_interrupt(vector)?;
                             devices.set_window_requested(false);
                         }
@@ -188,16 +241,19 @@ mod imp {
             match exit {
                 VcpuExit::IoOut { port, size, data } => {
                     halt_count = 0;
+                    *io_write_counts.entry(port).or_insert(0) += 1;
                     devices.handle_io_out(port, size, data);
                     vcpu.skip_instruction()?;
                 }
                 VcpuExit::IoIn { port, size } => {
                     halt_count = 0;
+                    *io_read_counts.entry(port).or_insert(0) += 1;
                     let data = devices.handle_io_in(port, size);
                     vcpu.complete_io_in(data, size)?;
                 }
                 VcpuExit::MmioRead { address, size } => {
                     halt_count = 0;
+                    mmio_count += 1;
                     let data = devices.handle_mmio_read(address, size);
                     vcpu.complete_mmio_read(data)?;
                 }
@@ -207,6 +263,7 @@ mod imp {
                     data,
                 } => {
                     halt_count = 0;
+                    mmio_count += 1;
                     devices.handle_mmio_write(address, size, data, &mem_adapter);
                     vcpu.skip_instruction()?;
                 }
@@ -243,9 +300,45 @@ mod imp {
                         exit_code = 0;
                         break;
                     }
+                    // Wall-clock progress report every 5 seconds.
+                    if last_progress.elapsed() >= Duration::from_secs(5) {
+                        last_progress = Instant::now();
+                        if let Ok(regs) = vcpu.get_registers() {
+                            let console_len = devices::get_console_output(ctx_id)
+                                .map(|b| b.len())
+                                .unwrap_or(0);
+                            // Sort IO ports by frequency (descending), show all.
+                            let mut reads: Vec<_> = io_read_counts.iter().collect();
+                            reads.sort_by(|a, b| b.1.cmp(a.1));
+                            let top_reads: Vec<String> = reads.iter()
+                                .map(|(p, c)| format!("{:#X}:{}", p, c))
+                                .collect();
+                            let mut writes: Vec<_> = io_write_counts.iter().collect();
+                            writes.sort_by(|a, b| b.1.cmp(a.1));
+                            let top_writes: Vec<String> = writes.iter()
+                                .map(|(p, c)| format!("{:#X}:{}", p, c))
+                                .collect();
+                            log::info!(
+                                "Progress @ {:.1}s: exits={} RIP={:#X} RSP={:#X} RFLAGS={:#X} console={}B \
+                                 mmio={} msr={} cpuid={}",
+                                start_time.elapsed().as_secs_f64(),
+                                exit_count,
+                                regs.rip,
+                                regs.rsp,
+                                regs.rflags,
+                                console_len,
+                                mmio_count,
+                                msr_count,
+                                cpuid_count,
+                            );
+                            log::info!("  IO_reads=[{}]", top_reads.join(", "));
+                            log::info!("  IO_writes=[{}]", top_writes.join(", "));
+                        }
+                    }
                 }
                 VcpuExit::MsrAccess { msr_number, is_write, rax, rdx } => {
                     halt_count = 0;
+                    msr_count += 1;
                     if is_write {
                         log::trace!(
                             "MSR write: 0x{:08X} <- 0x{:016X}",
@@ -267,8 +360,22 @@ mod imp {
                     default_rdx,
                 } => {
                     halt_count = 0;
-                    log::trace!("CPUID leaf=0x{:X} sub=0x{:X}", rax, rcx);
-                    vcpu.complete_cpuid(default_rax, default_rbx, default_rcx, default_rdx)?;
+                    cpuid_count += 1;
+                    let leaf = rax as u32;
+                    // Mask hypervisor-related CPUID leaves to prevent the Linux
+                    // guest from detecting Hyper-V and trying to use enlightenments
+                    // (synthetic timers, SynIC, TSC page) that our WHPX partition
+                    // doesn't fully support. Without this, the kernel's Hyper-V
+                    // init code stalls on broken clock sources.
+                    let (out_rax, out_rbx, out_rcx, out_rdx) = match leaf {
+                        // Leaf 1: clear "hypervisor present" bit (ECX bit 31).
+                        1 => (default_rax, default_rbx, default_rcx & !(1u64 << 31), default_rdx),
+                        // Hyper-V CPUID range: return zeros (no hypervisor features).
+                        0x40000000..=0x400000FF => (0, 0, 0, 0),
+                        _ => (default_rax, default_rbx, default_rcx, default_rdx),
+                    };
+                    log::trace!("CPUID leaf=0x{:X} sub=0x{:X} -> rax=0x{:X}", rax, rcx, out_rax);
+                    vcpu.complete_cpuid(out_rax, out_rbx, out_rcx, out_rdx)?;
                 }
                 VcpuExit::UnrecoverableException => {
                     let regs = vcpu.get_registers().ok();
