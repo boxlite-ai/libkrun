@@ -9,8 +9,16 @@ pub const MMIO_SLOT_SIZE: u64 = 0x200;
 pub const FIRST_MMIO_IRQ: u8 = 5;
 
 /// Base kernel command line parameters.
+///
+/// - `nohyperv`: Disable Hyper-V guest enlightenments. WHPX exposes Hyper-V
+///   CPUID leaves but doesn't fully support synthetic timers/SynIC, causing
+///   clock stalls if the kernel tries to use them.
+/// - `lpj=1000000`: Preset loops_per_jiffy to skip delay calibration, which
+///   depends on a reliable timer source.
+/// - `nokaslr`: Disable kernel address space randomization for deterministic
+///   boot in our controlled single-vCPU environment.
 const BASE_CMDLINE: &str =
-    "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic nolapic noacpi nosmp";
+    "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic nolapic noacpi nosmp nohyperv lpj=1000000 nokaslr";
 
 /// Description of a virtio-MMIO device slot for command line generation.
 #[derive(Debug, Clone)]
@@ -130,7 +138,16 @@ mod tests {
     #[test]
     fn test_empty_user_cmdline_no_trailing_space() {
         let cmdline = build_kernel_cmdline(Some(""), false, &[]);
+        assert!(!cmdline.ends_with(' '));
         assert_eq!(cmdline, BASE_CMDLINE);
+    }
+
+    #[test]
+    fn test_base_cmdline_has_nohyperv() {
+        let cmdline = build_kernel_cmdline(None, false, &[]);
+        assert!(cmdline.contains("nohyperv"));
+        assert!(cmdline.contains("lpj=1000000"));
+        assert!(cmdline.contains("nokaslr"));
     }
 
     #[test]

@@ -365,8 +365,7 @@ mod imp {
                     // Mask hypervisor-related CPUID leaves to prevent the Linux
                     // guest from detecting Hyper-V and trying to use enlightenments
                     // (synthetic timers, SynIC, TSC page) that our WHPX partition
-                    // doesn't fully support. Without this, the kernel's Hyper-V
-                    // init code stalls on broken clock sources.
+                    // doesn't fully support.
                     let (out_rax, out_rbx, out_rcx, out_rdx) = match leaf {
                         // Leaf 1: clear "hypervisor present" bit (ECX bit 31).
                         1 => (default_rax, default_rbx, default_rcx & !(1u64 << 31), default_rdx),

@@ -1,13 +1,16 @@
 //! Smoke test: boot a Linux kernel inside a WHPX VM using the VMM runner.
 //!
 //! Usage:
-//!   boot_kernel.exe <vmlinuz> [initrd] [-- extra-cmdline-args...]
+//!   boot_kernel.exe <vmlinuz> [initrd] [--disk <path>] [-- extra-cmdline-args...]
 //!
 //! Example:
 //!   boot_kernel.exe C:\kernels\vmlinuz-6.6.75 C:\kernels\initrd.img
-//!   boot_kernel.exe C:\kernels\vmlinuz-6.6.75 -- console=ttyS0 lpj=1000000
+//!   boot_kernel.exe C:\kernels\vmlinuz-6.6.75 -- lpj=1000000 nokaslr
+//!   boot_kernel.exe C:\kernels\vmlinuz-6.6.75 --disk C:\rootfs.img -- lpj=1000000
 
 use std::path::PathBuf;
+
+use vmm::windows::context::{DiskConfig, DISK_FORMAT_RAW};
 
 fn main() {
     // Initialize logging (RUST_LOG controls verbosity).
@@ -15,7 +18,10 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <vmlinuz> [initrd] [-- extra-cmdline-args...]", args[0]);
+        eprintln!(
+            "Usage: {} <vmlinuz> [initrd] [--disk <path>] [-- extra-cmdline-args...]",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -25,18 +31,37 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Parse optional initrd and extra cmdline args.
+    // Parse optional initrd, --disk, and extra cmdline args.
     let mut initrd_path: Option<PathBuf> = None;
+    let mut disk_path: Option<PathBuf> = None;
     let mut extra_cmdline: Vec<&str> = Vec::new();
     let mut past_separator = false;
+    let mut i = 2;
 
-    for arg in &args[2..] {
+    while i < args.len() {
+        let arg = &args[i];
         if arg == "--" {
             past_separator = true;
+            i += 1;
             continue;
         }
         if past_separator {
             extra_cmdline.push(arg);
+            i += 1;
+            continue;
+        }
+        if arg == "--disk" {
+            i += 1;
+            if i >= args.len() {
+                eprintln!("--disk requires a path argument");
+                std::process::exit(1);
+            }
+            let p = PathBuf::from(&args[i]);
+            if !p.exists() {
+                eprintln!("Disk image not found: {}", p.display());
+                std::process::exit(1);
+            }
+            disk_path = Some(p);
         } else if initrd_path.is_none() {
             let p = PathBuf::from(arg);
             if p.exists() {
@@ -48,6 +73,7 @@ fn main() {
         } else {
             extra_cmdline.push(arg);
         }
+        i += 1;
     }
 
     // Build the VmContext via the C-API-style context functions.
@@ -59,20 +85,21 @@ fn main() {
         ctx.kernel_path = Some(kernel_path.clone());
         ctx.initramfs_path = initrd_path.clone();
 
-        // Build kernel command line.
-        let mut cmdline_parts = vec![
-            "console=ttyS0",
-            "earlyprintk=serial",
-            "noapic",
-            "nolapic",
-            "noacpi",
-            "nosmp",
-            "lpj=1000000",
-            "nokaslr",
-            "panic=-1",
-        ];
-        cmdline_parts.extend(extra_cmdline.iter());
-        ctx.kernel_cmdline = Some(cmdline_parts.join(" "));
+        // Attach disk if provided.
+        if let Some(ref dp) = disk_path {
+            ctx.disks.push(DiskConfig {
+                block_id: "root".to_string(),
+                path: dp.clone(),
+                format: DISK_FORMAT_RAW,
+                read_only: false,
+            });
+        }
+
+        // Extra cmdline args are appended after the base cmdline and MMIO
+        // device lines that build_kernel_cmdline() generates automatically.
+        if !extra_cmdline.is_empty() {
+            ctx.kernel_cmdline = Some(extra_cmdline.join(" "));
+        }
 
         Ok(())
     })
@@ -83,6 +110,13 @@ fn main() {
     println!(
         "Initrd:  {}",
         initrd_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    println!(
+        "Disk:    {}",
+        disk_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".to_string())
