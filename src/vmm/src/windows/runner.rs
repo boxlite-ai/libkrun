@@ -164,6 +164,10 @@ mod imp {
             ctx.kernel_cmdline.as_deref(),
             setup.has_root_disk,
             &setup.mmio_slots,
+            ctx.root_disk_device.as_deref(),
+            ctx.root_disk_fstype.as_deref(),
+            ctx.exec_path.as_deref(),
+            &ctx.argv,
         );
 
         // Load kernel.

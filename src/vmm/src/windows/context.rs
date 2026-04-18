@@ -62,6 +62,11 @@ pub struct VmContext {
     pub apic_emulation: bool,
     /// Network device configuration.
     pub net_config: Option<NetConfig>,
+    /// Root disk device path override (e.g., "/dev/vdb").
+    /// When set, the kernel cmdline uses this instead of the default "/dev/vda".
+    pub root_disk_device: Option<String>,
+    /// Root disk filesystem type (e.g., "ext4").
+    pub root_disk_fstype: Option<String>,
 }
 
 /// Network device configuration.
@@ -119,6 +124,8 @@ impl VmContext {
             rlimits: Vec::new(),
             apic_emulation: true,
             net_config: None,
+            root_disk_device: None,
+            root_disk_fstype: None,
         }
     }
 

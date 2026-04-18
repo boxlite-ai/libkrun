@@ -486,12 +486,16 @@ pub unsafe extern "C" fn krun_set_data_disk(_ctx_id: u32, _c_disk_path: *const c
 
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_root_disk_remount(
-    _ctx_id: u32,
-    _device: *const c_char,
-    _fstype: *const c_char,
+    ctx_id: u32,
+    device: *const c_char,
+    fstype: *const c_char,
     _options: *const c_char,
 ) -> i32 {
-    -libc::ENOSYS
+    to_c_result(context::with_ctx_mut(ctx_id, |ctx| {
+        ctx.root_disk_device = c_str_to_string(device);
+        ctx.root_disk_fstype = c_str_to_string(fstype);
+        Ok(())
+    }))
 }
 
 #[no_mangle]
