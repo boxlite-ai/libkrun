@@ -54,8 +54,9 @@ const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
 /// Virtio-MMIO version (2 = virtio 1.0+).
 const VIRTIO_MMIO_VERSION: u32 = 2;
 
-/// Vendor ID (0 = no vendor).
-const VIRTIO_VENDOR_ID: u32 = 0;
+/// Vendor ID — "QEMU" in little-endian (standard for virtio devices).
+/// The Linux kernel's virtio-mmio driver rejects devices with vendor_id == 0.
+const VIRTIO_VENDOR_ID: u32 = 0x554D_4551;
 
 // Interrupt status bits.
 const INTERRUPT_USED_RING: u32 = 1;

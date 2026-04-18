@@ -64,17 +64,20 @@ impl VirtioBlock {
     fn process_request(&mut self, chain: &[Descriptor], mem: &dyn GuestMemoryAccessor) -> u8 {
         // Minimum: header + status (flush has no data descriptor).
         if chain.len() < 2 {
+            log::debug!("BLK: short chain len={}", chain.len());
             return VIRTIO_BLK_S_IOERR;
         }
 
         // First descriptor: request header (device-readable).
         let header_desc = &chain[0];
         if header_desc.len < 16 {
+            log::debug!("BLK: short header len={}", header_desc.len);
             return VIRTIO_BLK_S_IOERR;
         }
 
         let mut header_buf = [0u8; 16];
         if mem.read_at(header_desc.addr, &mut header_buf).is_err() {
+            log::debug!("BLK: header read failed addr=0x{:X}", header_desc.addr);
             return VIRTIO_BLK_S_IOERR;
         }
 
@@ -121,15 +124,27 @@ impl VirtioBlock {
     ) -> u8 {
         let mut offset = sector * SECTOR_SIZE;
 
-        for desc in data_descs {
+        for (i, desc) in data_descs.iter().enumerate() {
             if !desc.is_write() {
-                return VIRTIO_BLK_S_IOERR; // Data buffer must be device-writable for reads.
-            }
-            let mut buf = vec![0u8; desc.len as usize];
-            if self.disk.read_at(offset, &mut buf).is_err() {
+                log::debug!(
+                    "BLK READ: desc[{}] not writable, flags=0x{:X}",
+                    i, desc.flags
+                );
                 return VIRTIO_BLK_S_IOERR;
             }
-            if mem.write_at(desc.addr, &buf).is_err() {
+            let mut buf = vec![0u8; desc.len as usize];
+            if let Err(e) = self.disk.read_at(offset, &mut buf) {
+                log::debug!(
+                    "BLK READ: disk.read_at(0x{:X}, {}) failed: {}",
+                    offset, desc.len, e
+                );
+                return VIRTIO_BLK_S_IOERR;
+            }
+            if let Err(e) = mem.write_at(desc.addr, &buf) {
+                log::debug!(
+                    "BLK READ: mem.write_at(0x{:X}, {}) failed: {}",
+                    desc.addr, buf.len(), e
+                );
                 return VIRTIO_BLK_S_IOERR;
             }
             offset += desc.len as u64;
