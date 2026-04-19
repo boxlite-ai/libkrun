@@ -8,6 +8,8 @@ use super::super::error::{Result, WkrunError};
 
 #[cfg(any(target_os = "windows", test))]
 use super::params::{E820Entry, E820_RAM, E820_RESERVED};
+#[cfg(any(target_os = "windows", test))]
+use super::super::memory::{MMIO_REGION_SIZE, VIRTIO_MMIO_BASE};
 
 // These imports are only used by the Windows-only load_kernel() function.
 #[cfg(target_os = "windows")]
@@ -148,13 +150,45 @@ fn build_e820_map(ram_mib: u32) -> Vec<E820Entry> {
     });
 
     // High memory: 1MB to end of RAM.
+    // When RAM extends past the MMIO region, split around the reserved hole
+    // so the kernel doesn't try to use MMIO addresses as regular RAM.
     if ram_bytes > 0x100000 {
-        entries.push(E820Entry {
-            addr: 0x100000,
-            size: ram_bytes - 0x100000,
-            entry_type: E820_RAM,
-            _pad: 0,
-        });
+        if ram_bytes > VIRTIO_MMIO_BASE {
+            let mmio_end = VIRTIO_MMIO_BASE + MMIO_REGION_SIZE;
+
+            // High memory below MMIO.
+            entries.push(E820Entry {
+                addr: 0x100000,
+                size: VIRTIO_MMIO_BASE - 0x100000,
+                entry_type: E820_RAM,
+                _pad: 0,
+            });
+
+            // MMIO region (reserved).
+            entries.push(E820Entry {
+                addr: VIRTIO_MMIO_BASE,
+                size: MMIO_REGION_SIZE,
+                entry_type: E820_RESERVED,
+                _pad: 0,
+            });
+
+            // High memory above MMIO.
+            if ram_bytes > mmio_end {
+                entries.push(E820Entry {
+                    addr: mmio_end,
+                    size: ram_bytes - mmio_end,
+                    entry_type: E820_RAM,
+                    _pad: 0,
+                });
+            }
+        } else {
+            entries.push(E820Entry {
+                addr: 0x100000,
+                size: ram_bytes - 0x100000,
+                entry_type: E820_RAM,
+                _pad: 0,
+            });
+        }
     }
 
     entries
@@ -447,5 +481,46 @@ mod tests {
         // With only 1MB of RAM, high memory region should be empty (1MB - 1MB = 0).
         let map = build_e820_map(1);
         assert_eq!(map.len(), 2, "1MB RAM should only have low + reserved");
+    }
+
+    #[test]
+    fn test_build_e820_map_4096mb_has_mmio_hole() {
+        let map = build_e820_map(4096);
+        // Low + BIOS reserved + high1 + MMIO reserved + high2 = 5 entries.
+        assert_eq!(map.len(), 5, "4GB RAM should have MMIO hole: {:?}", map);
+
+        // Low memory.
+        assert_eq!(map[0].addr, 0);
+        assert_eq!(map[0].entry_type, E820_RAM);
+
+        // BIOS reserved.
+        assert_eq!(map[1].addr, 0x9FC00);
+        assert_eq!(map[1].entry_type, E820_RESERVED);
+
+        // High memory below MMIO.
+        assert_eq!(map[2].addr, 0x100000);
+        assert_eq!(map[2].size, VIRTIO_MMIO_BASE - 0x100000);
+        assert_eq!(map[2].entry_type, E820_RAM);
+
+        // MMIO reserved region.
+        assert_eq!(map[3].addr, VIRTIO_MMIO_BASE);
+        assert_eq!(map[3].size, MMIO_REGION_SIZE);
+        assert_eq!(map[3].entry_type, E820_RESERVED);
+
+        // High memory above MMIO.
+        let mmio_end = VIRTIO_MMIO_BASE + MMIO_REGION_SIZE;
+        assert_eq!(map[4].addr, mmio_end);
+        assert_eq!(map[4].size, 4096 * 1024 * 1024 - mmio_end);
+        assert_eq!(map[4].entry_type, E820_RAM);
+    }
+
+    #[test]
+    fn test_build_e820_map_no_hole_below_mmio() {
+        // 3072 MB = 3GB < VIRTIO_MMIO_BASE (3.25GB) — no hole needed.
+        let map = build_e820_map(3072);
+        assert_eq!(map.len(), 3, "3GB RAM should not have MMIO hole");
+        assert_eq!(map[2].addr, 0x100000);
+        assert_eq!(map[2].size, 3072 * 1024 * 1024 - 0x100000);
+        assert_eq!(map[2].entry_type, E820_RAM);
     }
 }

@@ -43,6 +43,10 @@ pub const BOOT_STACK_POINTER: u64 = 0x8FF0;
 /// Virtio-MMIO base address (above guest RAM, below 4GB identity map).
 pub const VIRTIO_MMIO_BASE: u64 = 0xD000_0000;
 
+/// Size of the MMIO region reserved for virtio devices.
+/// 2MB provides room for many devices and aligns with 2MB page table granularity.
+pub const MMIO_REGION_SIZE: u64 = 0x20_0000;
+
 // Windows-specific guest memory allocation and mapping.
 #[cfg(target_os = "windows")]
 mod imp {
@@ -201,14 +205,35 @@ mod imp {
     }
 
     impl GuestMemory {
-        /// Create guest memory with a single contiguous region starting at GPA 0.
+        /// Create guest memory, leaving a hole for the MMIO region if RAM exceeds it.
+        ///
+        /// When `size_mib` is large enough that RAM overlaps `VIRTIO_MMIO_BASE`,
+        /// the memory is split into two regions with an unmapped gap so that WHPX
+        /// generates MMIO exits (instead of treating device accesses as RAM reads).
         pub fn new(size_mib: u32) -> Result<Self> {
             let size = (size_mib as u64) * 1024 * 1024;
-            let region = GuestMemoryRegion::new(0, size)?;
-            Ok(GuestMemory {
-                regions: vec![region],
-                total_size: size,
-            })
+
+            if size > super::VIRTIO_MMIO_BASE {
+                // RAM extends past MMIO region — split into two regions.
+                // Region 1: GPA 0 .. VIRTIO_MMIO_BASE
+                // (hole):   VIRTIO_MMIO_BASE .. VIRTIO_MMIO_BASE + MMIO_REGION_SIZE
+                // Region 2: VIRTIO_MMIO_BASE + MMIO_REGION_SIZE .. ram_end
+                let mmio_base = super::VIRTIO_MMIO_BASE;
+                let mmio_end = mmio_base + super::MMIO_REGION_SIZE;
+                let region1 = GuestMemoryRegion::new(0, mmio_base)?;
+                let region2 = GuestMemoryRegion::new(mmio_end, size - mmio_end)?;
+                Ok(GuestMemory {
+                    regions: vec![region1, region2],
+                    total_size: size,
+                })
+            } else {
+                // RAM fits below MMIO — single contiguous region.
+                let region = GuestMemoryRegion::new(0, size)?;
+                Ok(GuestMemory {
+                    regions: vec![region],
+                    total_size: size,
+                })
+            }
         }
 
         /// Map all guest memory regions into a WHPX partition.

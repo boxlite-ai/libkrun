@@ -49,8 +49,14 @@ pub struct VirtioVsock {
     guest_cid: u64,
     /// Active connections keyed by (guest_port, host_port).
     connections: HashMap<ConnKey, VsockConnection>,
-    /// TCP listeners on the host side, keyed by host port.
+    /// TCP listeners on the host side, keyed by vsock port.
+    /// Used for host-initiated connections (host TCP → guest vsock).
     listeners: HashMap<u32, TcpListener>,
+    /// Outbound TCP targets keyed by vsock port.
+    /// Used for guest-initiated connections (guest vsock → host TCP).
+    /// When the guest connects to a port in this map, the device makes
+    /// an outbound TCP connection to the specified address.
+    connect_targets: HashMap<u32, String>,
     /// Accepted TCP streams, keyed by (guest_port, host_port).
     streams: HashMap<ConnKey, TcpStream>,
     /// Pending response/control packets to inject into the RX queue.
@@ -64,6 +70,7 @@ impl VirtioVsock {
             guest_cid,
             connections: HashMap::new(),
             listeners: HashMap::new(),
+            connect_targets: HashMap::new(),
             streams: HashMap::new(),
             rx_pending: Vec::new(),
         }
@@ -87,6 +94,16 @@ impl VirtioVsock {
         listener.set_nonblocking(true)?;
         self.listeners.insert(vsock_port, listener);
         Ok(())
+    }
+
+    /// Register an outbound TCP target for guest-initiated connections.
+    ///
+    /// When the guest connects to `vsock_port`, the device makes an outbound
+    /// TCP connection to `host_addr` instead of accepting from a listener.
+    /// Used for notification channels where the guest initiates the connection
+    /// and the host is already listening.
+    pub fn connect_to(&mut self, vsock_port: u32, host_addr: String) {
+        self.connect_targets.insert(vsock_port, host_addr);
     }
 
     /// Get the guest CID.
@@ -198,11 +215,46 @@ impl VirtioVsock {
     fn handle_connect_request(&mut self, hdr: &VsockHeader) {
         let key = (hdr.src_port, hdr.dst_port);
 
-        // Check if we have a listener on the requested host port.
-        let has_listener = self.listeners.contains_key(&hdr.dst_port);
+        // Try outbound connection first (guest-initiated → host TCP target).
+        if let Some(addr) = self.connect_targets.get(&hdr.dst_port).cloned() {
+            let stream = match TcpStream::connect(&addr) {
+                Ok(stream) => {
+                    let _ = stream.set_nonblocking(true);
+                    stream
+                }
+                Err(_) => {
+                    let rst = VsockHeader::new_rst(
+                        VSOCK_CID_HOST,
+                        hdr.dst_port,
+                        self.guest_cid,
+                        hdr.src_port,
+                    );
+                    self.rx_pending.push((rst, Vec::new()));
+                    return;
+                }
+            };
 
-        if !has_listener {
-            // No listener -> RST.
+            let mut conn =
+                VsockConnection::new(VSOCK_CID_HOST, hdr.dst_port, self.guest_cid, hdr.src_port);
+
+            if let Some(resp) = conn.handle_request(hdr) {
+                self.rx_pending.push((resp, Vec::new()));
+                self.connections.insert(key, conn);
+                self.streams.insert(key, stream);
+            } else {
+                let rst = VsockHeader::new_rst(
+                    VSOCK_CID_HOST,
+                    hdr.dst_port,
+                    self.guest_cid,
+                    hdr.src_port,
+                );
+                self.rx_pending.push((rst, Vec::new()));
+            }
+            return;
+        }
+
+        // Fall back to listener-based connection (host-initiated).
+        if !self.listeners.contains_key(&hdr.dst_port) {
             let rst =
                 VsockHeader::new_rst(VSOCK_CID_HOST, hdr.dst_port, self.guest_cid, hdr.src_port);
             self.rx_pending.push((rst, Vec::new()));
@@ -1234,5 +1286,130 @@ mod tests {
 
         let payload = mem.read_bytes(rx_buf + VSOCK_HEADER_SIZE as u64, 8);
         assert_eq!(payload, b"tcp data");
+    }
+
+    // --- Guest-initiated outbound connection ---
+
+    #[test]
+    fn test_connect_to_registers_target() {
+        let mut dev = VirtioVsock::new(3);
+        dev.connect_to(2696, "127.0.0.1:9999".to_string());
+        assert_eq!(dev.connect_targets.len(), 1);
+        assert!(dev.connect_targets.contains_key(&2696));
+    }
+
+    #[test]
+    fn test_connect_to_outbound_success() {
+        // Set up a host-side TCP listener to receive the outbound connection.
+        let host_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = host_listener.local_addr().unwrap().port();
+
+        let mut dev = VirtioVsock::new(3);
+        dev.connect_to(2696, format!("127.0.0.1:{}", host_port));
+
+        let mem = MockMem::new(0x10000);
+        let mut tx_queue = setup_queue(128);
+
+        // Guest sends CONNECT to vsock port 2696.
+        let hdr = VsockHeader {
+            src_cid: 3,
+            dst_cid: 2,
+            src_port: 5000,
+            dst_port: 2696,
+            len: 0,
+            type_: 1,
+            op: VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc: 32768,
+            fwd_cnt: 0,
+        };
+        mem.write_bytes(BUF_BASE, &hdr.to_bytes());
+        write_descriptor(&mem, 0, BUF_BASE, VSOCK_HEADER_SIZE as u32, 0, 0);
+        push_avail(&mem, 0, 0);
+
+        dev.process_tx(&mut tx_queue, &mem);
+
+        // Should get RESPONSE (not RST) and have a connection + stream.
+        assert_eq!(dev.rx_pending.len(), 1);
+        assert_eq!(dev.rx_pending[0].0.op, packet::VSOCK_OP_RESPONSE);
+        assert_eq!(dev.connection_count(), 1);
+        assert_eq!(dev.streams.len(), 1);
+
+        // Host listener should have received the connection.
+        host_listener.set_nonblocking(true).unwrap();
+        let accepted = host_listener.accept();
+        assert!(accepted.is_ok(), "Host should have received TCP connection");
+    }
+
+    #[test]
+    fn test_connect_to_unreachable_sends_rst() {
+        let mut dev = VirtioVsock::new(3);
+        // Port 1 is not listening — connection will fail.
+        dev.connect_to(2696, "127.0.0.1:1".to_string());
+
+        let mem = MockMem::new(0x10000);
+        let mut tx_queue = setup_queue(128);
+
+        let hdr = VsockHeader {
+            src_cid: 3,
+            dst_cid: 2,
+            src_port: 5000,
+            dst_port: 2696,
+            len: 0,
+            type_: 1,
+            op: VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc: 32768,
+            fwd_cnt: 0,
+        };
+        mem.write_bytes(BUF_BASE, &hdr.to_bytes());
+        write_descriptor(&mem, 0, BUF_BASE, VSOCK_HEADER_SIZE as u32, 0, 0);
+        push_avail(&mem, 0, 0);
+
+        dev.process_tx(&mut tx_queue, &mem);
+
+        // Should get RST because target is unreachable.
+        assert_eq!(dev.rx_pending.len(), 1);
+        assert_eq!(dev.rx_pending[0].0.op, VSOCK_OP_RST);
+        assert_eq!(dev.connection_count(), 0);
+    }
+
+    #[test]
+    fn test_connect_to_preferred_over_listener() {
+        // If both connect_target and listener exist for same port,
+        // connect_target should be used (checked first).
+        let host_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = host_listener.local_addr().unwrap().port();
+
+        let mut dev = VirtioVsock::new(3);
+        dev.connect_to(2696, format!("127.0.0.1:{}", host_port));
+        dev.listen_on(2696, 0).unwrap(); // Also add a listener on same vsock port.
+
+        let mem = MockMem::new(0x10000);
+        let mut tx_queue = setup_queue(128);
+
+        let hdr = VsockHeader {
+            src_cid: 3,
+            dst_cid: 2,
+            src_port: 5000,
+            dst_port: 2696,
+            len: 0,
+            type_: 1,
+            op: VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc: 32768,
+            fwd_cnt: 0,
+        };
+        mem.write_bytes(BUF_BASE, &hdr.to_bytes());
+        write_descriptor(&mem, 0, BUF_BASE, VSOCK_HEADER_SIZE as u32, 0, 0);
+        push_avail(&mem, 0, 0);
+
+        dev.process_tx(&mut tx_queue, &mem);
+
+        // Should get RESPONSE via outbound connection.
+        assert_eq!(dev.rx_pending.len(), 1);
+        assert_eq!(dev.rx_pending[0].0.op, packet::VSOCK_OP_RESPONSE);
+        assert_eq!(dev.connection_count(), 1);
+        assert_eq!(dev.streams.len(), 1);
     }
 }

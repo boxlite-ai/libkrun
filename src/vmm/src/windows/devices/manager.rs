@@ -130,6 +130,8 @@ pub struct DeviceManager {
     virtio_9p: Option<VirtioMmioDevice<Virtio9p>>,
     /// Virtio-net device (slot 3) — optional.
     virtio_net: Option<VirtioMmioDevice<VirtioNet>>,
+    /// Second virtio-blk device (slot 4) — optional, for guest rootfs.
+    virtio_blk2: Option<VirtioMmioDevice<VirtioBlock>>,
 
     /// Track whether we've requested an interrupt window.
     window_requested: bool,
@@ -170,7 +172,7 @@ impl DeviceManager {
             Serial::new(COM1_BASE, Box::new(tee))
         };
 
-        // Virtio-blk (slot 0).
+        // Virtio-blk (slot 0) — first disk (container rootfs).
         let has_root_disk = !ctx.disks.is_empty();
         let virtio_blk = if let Some(disk) = ctx.disks.first() {
             let backend = open_disk_backend(&disk.path, disk.format, disk.read_only)?;
@@ -180,9 +182,19 @@ impl DeviceManager {
             None
         };
 
+        // Virtio-blk2 (slot 4) — second disk (guest rootfs), if present.
+        let virtio_blk2 = if let Some(disk) = ctx.disks.get(1) {
+            let backend = open_disk_backend(&disk.path, disk.format, disk.read_only)?;
+            let blk = VirtioBlock::new(backend, disk.read_only);
+            Some(VirtioMmioDevice::new(blk))
+        } else {
+            None
+        };
+
         // Virtio-vsock (slot 1) — always present.
         let mut vsock_backend = VirtioVsock::new(GUEST_CID);
-        // Listen on configured ports, or defaults.
+        // Configure ports: listen=true creates TCP listener (host→guest),
+        // listen=false registers outbound target (guest→host).
         if ctx.vsock_ports.is_empty() {
             for &port in DEFAULT_VSOCK_PORTS {
                 let _ = vsock_backend.listen(port);
@@ -190,7 +202,12 @@ impl DeviceManager {
         } else {
             for vp in &ctx.vsock_ports {
                 let host_port = vp.host_tcp_port.unwrap_or(vp.port as u16);
-                let _ = vsock_backend.listen_on(vp.port, host_port);
+                if vp.listen {
+                    let _ = vsock_backend.listen_on(vp.port, host_port);
+                } else {
+                    let addr = format!("127.0.0.1:{}", host_port);
+                    vsock_backend.connect_to(vp.port, addr);
+                }
             }
         }
         let virtio_vsock = VirtioMmioDevice::new(vsock_backend);
@@ -228,6 +245,10 @@ impl DeviceManager {
                 index: 3,
                 active: virtio_net.is_some(),
             },
+            MmioSlot {
+                index: 4,
+                active: virtio_blk2.is_some(),
+            },
         ];
 
         let devices = DeviceManager {
@@ -239,6 +260,7 @@ impl DeviceManager {
             virtio_vsock,
             virtio_9p,
             virtio_net,
+            virtio_blk2,
             window_requested: false,
             last_tick: Instant::now(),
             port61_toggle: false,
@@ -322,6 +344,7 @@ impl DeviceManager {
         let vsock_offset = address.wrapping_sub(mmio_base_for_slot(1));
         let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
         let net_offset = address.wrapping_sub(mmio_base_for_slot(3));
+        let blk2_offset = address.wrapping_sub(mmio_base_for_slot(4));
 
         if blk_offset < MMIO_SLOT_SIZE {
             if let Some(ref dev) = self.virtio_blk {
@@ -343,6 +366,12 @@ impl DeviceManager {
             } else {
                 0
             }
+        } else if blk2_offset < MMIO_SLOT_SIZE {
+            if let Some(ref dev) = self.virtio_blk2 {
+                dev.read(blk2_offset, size) as u64
+            } else {
+                0
+            }
         } else {
             0
         }
@@ -361,8 +390,8 @@ impl DeviceManager {
         let blk_offset = address.wrapping_sub(mmio_base_for_slot(0));
         let vsock_offset = address.wrapping_sub(mmio_base_for_slot(1));
         let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
-
         let net_offset = address.wrapping_sub(mmio_base_for_slot(3));
+        let blk2_offset = address.wrapping_sub(mmio_base_for_slot(4));
 
         if blk_offset < MMIO_SLOT_SIZE {
             if let Some(ref mut dev) = self.virtio_blk {
@@ -387,6 +416,12 @@ impl DeviceManager {
             if let Some(ref mut dev) = self.virtio_net {
                 if dev.write(net_offset, data as u32, size, mem) {
                     self.pic.raise_irq(irq_for_slot(3));
+                }
+            }
+        } else if blk2_offset < MMIO_SLOT_SIZE {
+            if let Some(ref mut dev) = self.virtio_blk2 {
+                if dev.write(blk2_offset, data as u32, size, mem) {
+                    self.pic.raise_irq(irq_for_slot(4));
                 }
             }
         }
@@ -480,6 +515,7 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
         virtio_vsock: VirtioMmioDevice::new(vsock_backend),
         virtio_9p: None,
         virtio_net: None,
+        virtio_blk2: None,
         window_requested: false,
         last_tick: Instant::now(),
         port61_toggle: false,

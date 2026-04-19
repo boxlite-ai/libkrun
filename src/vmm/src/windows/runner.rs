@@ -180,6 +180,15 @@ mod imp {
             regs.rip,
             cmdline
         );
+        // Also emit to stderr so shim can capture it (log::* may be silently dropped
+        // when no log→tracing bridge is installed).
+        eprintln!(
+            "[WHPX] Kernel loaded, RIP={:#X}, ram={}MB, mmio_hole={}, cmdline_len={}",
+            regs.rip,
+            ctx.ram_mib,
+            ctx.ram_mib as u64 * 1024 * 1024 > crate::windows::memory::VIRTIO_MMIO_BASE,
+            cmdline.len()
+        );
 
         // Create vCPU and set registers.
         let vcpu = WhpxVcpu::new(&partition, 0)?;
@@ -337,6 +346,14 @@ mod imp {
                             );
                             log::info!("  IO_reads=[{}]", top_reads.join(", "));
                             log::info!("  IO_writes=[{}]", top_writes.join(", "));
+                            eprintln!(
+                                "[WHPX] {:.1}s: exits={} RIP={:#X} console={}B mmio={}",
+                                start_time.elapsed().as_secs_f64(),
+                                exit_count,
+                                regs.rip,
+                                console_len,
+                                mmio_count,
+                            );
                         }
                     }
                 }
@@ -393,6 +410,11 @@ mod imp {
                         sregs.as_ref().map_or(0, |s| s.cr4),
                         sregs.as_ref().map_or(0, |s| s.efer),
                     );
+                    eprintln!(
+                        "[WHPX] TRIPLE FAULT after {} exits, RIP={:#X}",
+                        exit_count,
+                        regs.as_ref().map_or(0, |r| r.rip),
+                    );
                     exit_code = -1;
                     break;
                 }
@@ -419,6 +441,7 @@ mod imp {
         let _ = timer_thread.join();
 
         log::info!("VM exited with code {} ({} exits)", exit_code, exit_count);
+        eprintln!("[WHPX] VM exited, code={} exits={}", exit_code, exit_count);
         Ok(exit_code)
     }
 

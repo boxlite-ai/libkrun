@@ -9,6 +9,8 @@
 //!   --root <device>   Override root device (e.g., /dev/vda). Default: auto from --disk
 //!   --fstype <type>   Root filesystem type (e.g., ext4). Used with --root
 //!   --argv <args...>  Arguments passed to init after `--` separator (repeat for each arg)
+//!   --vsock-listen <guest_port>:<host_tcp_port>  VMM listens on TCP, bridges to guest vsock
+//!   --vsock-connect <guest_port>:<host_tcp_port> VMM connects to TCP when guest connects to vsock
 //!
 //! Examples:
 //!   # Boot with initramfs only (existing behavior)
@@ -25,7 +27,7 @@
 
 use std::path::PathBuf;
 
-use vmm::windows::context::{DiskConfig, DISK_FORMAT_RAW};
+use vmm::windows::context::{DiskConfig, VsockPort, DISK_FORMAT_RAW};
 
 fn main() {
     // Initialize logging (RUST_LOG controls verbosity).
@@ -54,6 +56,7 @@ fn main() {
     let mut root_device: Option<String> = None;
     let mut root_fstype: Option<String> = None;
     let mut init_argv: Vec<String> = Vec::new();
+    let mut vsock_ports: Vec<VsockPort> = Vec::new();
     let mut extra_cmdline: Vec<&str> = Vec::new();
     let mut past_separator = false;
     let mut i = 2;
@@ -115,6 +118,33 @@ fn main() {
                     std::process::exit(1);
                 }
                 init_argv.push(args[i].clone());
+            }
+            "--vsock-listen" | "--vsock-connect" => {
+                let is_listen = arg == "--vsock-listen";
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("{} requires <guest_port>:<host_tcp_port>", arg);
+                    std::process::exit(1);
+                }
+                let parts: Vec<&str> = args[i].split(':').collect();
+                if parts.len() != 2 {
+                    eprintln!("Expected <guest_port>:<host_tcp_port>, got: {}", args[i]);
+                    std::process::exit(1);
+                }
+                let guest_port: u32 = parts[0].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid guest port: {}", parts[0]);
+                    std::process::exit(1);
+                });
+                let host_port: u16 = parts[1].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid host port: {}", parts[1]);
+                    std::process::exit(1);
+                });
+                vsock_ports.push(VsockPort {
+                    port: guest_port,
+                    host_path: PathBuf::new(),
+                    listen: is_listen,
+                    host_tcp_port: Some(host_port),
+                });
             }
             _ => {
                 if initrd_path.is_none() {
@@ -194,6 +224,23 @@ fn main() {
     }
     if !init_argv.is_empty() {
         println!("Argv:    {:?}", init_argv);
+    }
+    for vp in &vsock_ports {
+        let host_port = vp.host_tcp_port.unwrap_or(vp.port as u16);
+        if vp.listen {
+            println!("Vsock:   guest:{} <- TCP listen:{} (host→guest)", vp.port, host_port);
+        } else {
+            println!("Vsock:   guest:{} -> TCP connect:127.0.0.1:{} (guest→host)", vp.port, host_port);
+        }
+    }
+
+    // Move vsock ports into context (after printing, since VsockPort doesn't impl Clone).
+    if !vsock_ports.is_empty() {
+        vmm::windows::context::with_ctx_mut(ctx_id, |ctx| {
+            ctx.vsock_ports = vsock_ports;
+            Ok(())
+        })
+        .expect("set vsock_ports failed");
     }
 
     // Take the context out of the global map and run synchronously.
