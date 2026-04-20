@@ -4,8 +4,8 @@
 //! TX and RX virtqueues. It carries addressing, flow control credits,
 //! and operation codes for the vsock connection protocol.
 
-use super::super::queue::GuestMemoryAccessor;
 use super::super::super::super::error::{Result, WkrunError};
+use super::super::queue::GuestMemoryAccessor;
 
 // --- CID constants ---
 
@@ -247,8 +247,8 @@ impl VsockHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::super::error::Result;
+    use super::*;
     use std::cell::RefCell;
 
     struct MockMem(RefCell<Vec<u8>>);

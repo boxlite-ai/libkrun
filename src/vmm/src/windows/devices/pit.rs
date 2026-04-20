@@ -178,7 +178,11 @@ impl PitCounter {
     /// (the maximum 16-bit count). This matches BIOS behavior where the
     /// PIT is initialized with reload=0 giving ~18.2 Hz.
     fn effective_reload(&self) -> u64 {
-        if self.reload == 0 { 65536 } else { self.reload as u64 }
+        if self.reload == 0 {
+            65536
+        } else {
+            self.reload as u64
+        }
     }
 
     /// Compute the current counter value based on accumulated time.

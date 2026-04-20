@@ -704,11 +704,8 @@ mod imp {
             let new_rdx = value >> 32;
 
             let names = [WHvX64RegisterRip, WHvX64RegisterRax, WHvX64RegisterRdx];
-            let values: Vec<WHV_REGISTER_VALUE> = vec![
-                reg64(new_rip),
-                reg64(new_rax),
-                reg64(new_rdx),
-            ];
+            let values: Vec<WHV_REGISTER_VALUE> =
+                vec![reg64(new_rip), reg64(new_rax), reg64(new_rdx)];
             let hr = unsafe {
                 WHvSetVirtualProcessorRegisters(
                     self.partition_handle,

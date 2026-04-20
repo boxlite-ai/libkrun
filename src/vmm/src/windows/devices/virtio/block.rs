@@ -128,7 +128,8 @@ impl VirtioBlock {
             if !desc.is_write() {
                 log::debug!(
                     "BLK READ: desc[{}] not writable, flags=0x{:X}",
-                    i, desc.flags
+                    i,
+                    desc.flags
                 );
                 return VIRTIO_BLK_S_IOERR;
             }
@@ -136,14 +137,18 @@ impl VirtioBlock {
             if let Err(e) = self.disk.read_at(offset, &mut buf) {
                 log::debug!(
                     "BLK READ: disk.read_at(0x{:X}, {}) failed: {}",
-                    offset, desc.len, e
+                    offset,
+                    desc.len,
+                    e
                 );
                 return VIRTIO_BLK_S_IOERR;
             }
             if let Err(e) = mem.write_at(desc.addr, &buf) {
                 log::debug!(
                     "BLK READ: mem.write_at(0x{:X}, {}) failed: {}",
-                    desc.addr, buf.len(), e
+                    desc.addr,
+                    buf.len(),
+                    e
                 );
                 return VIRTIO_BLK_S_IOERR;
             }
@@ -264,9 +269,9 @@ impl VirtioDeviceBackend for VirtioBlock {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::disk::RawDiskBackend;
     use super::super::super::error::WkrunError;
+    use super::disk::RawDiskBackend;
+    use super::*;
     use std::cell::RefCell;
     use std::fs::File;
     use std::io::Write as IoWrite;

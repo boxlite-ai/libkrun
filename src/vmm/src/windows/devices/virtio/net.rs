@@ -394,9 +394,9 @@ impl VirtioDeviceBackend for VirtioNet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::queue::Virtqueue;
     use super::super::super::error::{Result, WkrunError};
+    use super::queue::Virtqueue;
+    use super::*;
     use std::cell::RefCell;
 
     struct MockMem {

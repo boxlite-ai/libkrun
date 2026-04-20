@@ -324,9 +324,9 @@ impl VirtioDeviceBackend for Virtio9p {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::queue::Virtqueue;
     use super::super::super::super::error::Result;
+    use super::super::queue::Virtqueue;
+    use super::*;
     use std::cell::RefCell;
     use std::io::Write as IoWrite;
     use tempfile::TempDir;
@@ -372,7 +372,9 @@ mod tests {
             let a = addr as usize;
             let data = self.data.borrow();
             if a + buf.len() > data.len() {
-                return Err(super::super::super::super::error::WkrunError::Memory("out of bounds".into()));
+                return Err(super::super::super::super::error::WkrunError::Memory(
+                    "out of bounds".into(),
+                ));
             }
             buf.copy_from_slice(&data[a..a + buf.len()]);
             Ok(())
@@ -381,7 +383,9 @@ mod tests {
             let a = addr as usize;
             let mut mem = self.data.borrow_mut();
             if a + data.len() > mem.len() {
-                return Err(super::super::super::super::error::WkrunError::Memory("out of bounds".into()));
+                return Err(super::super::super::super::error::WkrunError::Memory(
+                    "out of bounds".into(),
+                ));
             }
             mem[a..a + data.len()].copy_from_slice(data);
             Ok(())

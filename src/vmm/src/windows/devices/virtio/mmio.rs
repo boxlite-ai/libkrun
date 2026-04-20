@@ -327,9 +327,9 @@ impl<D: VirtioDeviceBackend> VirtioMmioDevice<D> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::queue::GuestMemoryAccessor;
     use super::super::super::error::Result;
+    use super::queue::GuestMemoryAccessor;
+    use super::*;
     use std::cell::RefCell;
 
     /// Null backend for testing the MMIO transport layer.

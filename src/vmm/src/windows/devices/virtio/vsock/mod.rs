@@ -19,9 +19,7 @@ use std::net::{TcpListener, TcpStream};
 use super::mmio::VirtioDeviceBackend;
 use super::queue::{GuestMemoryAccessor, Virtqueue};
 use connection::{ConnState, VsockConnection};
-use packet::{
-    VsockHeader, VSOCK_CID_HOST, VSOCK_HEADER_SIZE, VSOCK_OP_REQUEST,
-};
+use packet::{VsockHeader, VSOCK_CID_HOST, VSOCK_HEADER_SIZE, VSOCK_OP_REQUEST};
 
 /// Virtio device ID for vsock (spec Section 5.10).
 const VIRTIO_VSOCK_ID: u32 = 19;
@@ -487,10 +485,10 @@ impl VirtioDeviceBackend for VirtioVsock {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::super::super::error::Result;
     use super::super::queue::Virtqueue;
     use super::packet::VSOCK_OP_RST;
-    use super::super::super::super::error::Result;
+    use super::*;
     use std::cell::RefCell;
 
     struct MockMem {
@@ -534,7 +532,9 @@ mod tests {
             let a = addr as usize;
             let data = self.data.borrow();
             if a + buf.len() > data.len() {
-                return Err(super::super::super::super::error::WkrunError::Memory("out of bounds".into()));
+                return Err(super::super::super::super::error::WkrunError::Memory(
+                    "out of bounds".into(),
+                ));
             }
             buf.copy_from_slice(&data[a..a + buf.len()]);
             Ok(())
@@ -543,7 +543,9 @@ mod tests {
             let a = addr as usize;
             let mut mem = self.data.borrow_mut();
             if a + data.len() > mem.len() {
-                return Err(super::super::super::super::error::WkrunError::Memory("out of bounds".into()));
+                return Err(super::super::super::super::error::WkrunError::Memory(
+                    "out of bounds".into(),
+                ));
             }
             mem[a..a + data.len()].copy_from_slice(data);
             Ok(())

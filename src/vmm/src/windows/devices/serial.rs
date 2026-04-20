@@ -41,6 +41,14 @@ const IIR_FIFO_ENABLED: u8 = 0xC0;
 /// IER bit: Transmitter Holding Register Empty interrupt.
 const IER_THRE: u8 = 0x02;
 
+/// FCR bit: FIFO Enable.
+const FCR_FIFO_ENABLE: u8 = 0x01;
+/// FCR bit: Transmit FIFO Reset.
+const FCR_TX_RESET: u8 = 0x04;
+
+/// 16550 FIFO depth (bytes).
+const FIFO_SIZE: usize = 16;
+
 /// Serial port state.
 struct SerialState {
     /// Interrupt Enable Register.
@@ -63,6 +71,12 @@ struct SerialState {
     output: Box<dyn Write + Send>,
     /// THRE interrupt pending (set after THR write when IER THRE bit is set).
     thre_pending: bool,
+    /// Whether FIFO mode is enabled (FCR bit 0).
+    fifo_enabled: bool,
+    /// Transmit FIFO buffer. When FIFO is enabled, bytes are buffered here
+    /// and flushed to `output` when the buffer is full, a newline is written,
+    /// or the guest reads IIR (polling for completion).
+    tx_fifo: Vec<u8>,
 }
 
 /// 16550 UART emulation.
@@ -87,6 +101,8 @@ impl Serial {
                 dlh: 0,
                 output,
                 thre_pending: false,
+                fifo_enabled: false,
+                tx_fifo: Vec::with_capacity(FIFO_SIZE),
             }),
         }
     }
@@ -130,7 +146,13 @@ impl Serial {
                 }
             }
             2 => {
-                // IIR — check for pending interrupt
+                // IIR — check for pending interrupt.
+                // Flush any buffered FIFO data (guest is polling for completion).
+                if state.fifo_enabled && !state.tx_fifo.is_empty() {
+                    let pending: Vec<u8> = state.tx_fifo.drain(..).collect();
+                    let _ = state.output.write_all(&pending);
+                    let _ = state.output.flush();
+                }
                 if state.thre_pending {
                     state.thre_pending = false;
                     IIR_THRE | IIR_FIFO_ENABLED
@@ -162,13 +184,23 @@ impl Serial {
             0 => {
                 if dlab {
                     state.dll = data;
+                } else if state.fifo_enabled {
+                    // THR with FIFO: buffer bytes, flush on newline or full.
+                    state.tx_fifo.push(data);
+                    if data == b'\n' || state.tx_fifo.len() >= FIFO_SIZE {
+                        let pending: Vec<u8> = state.tx_fifo.drain(..).collect();
+                        let _ = state.output.write_all(&pending);
+                        let _ = state.output.flush();
+                    }
+                    state.lsr |= LSR_THR_EMPTY | LSR_IDLE;
+                    if state.ier & IER_THRE != 0 {
+                        state.thre_pending = true;
+                    }
                 } else {
-                    // THR — transmit holding register: output the character
+                    // THR without FIFO: immediate output per byte.
                     let _ = state.output.write_all(&[data]);
                     let _ = state.output.flush();
-                    // THR is always ready (we write synchronously)
                     state.lsr |= LSR_THR_EMPTY | LSR_IDLE;
-                    // Signal THRE interrupt if enabled
                     if state.ier & IER_THRE != 0 {
                         state.thre_pending = true;
                     }
@@ -190,7 +222,22 @@ impl Serial {
                 }
             }
             2 => {
-                // FCR — FIFO control (we acknowledge but don't implement FIFO)
+                // FCR — FIFO Control Register.
+                state.fifo_enabled = data & FCR_FIFO_ENABLE != 0;
+                if data & FCR_TX_RESET != 0 {
+                    // TX FIFO reset: flush pending data and clear buffer.
+                    if !state.tx_fifo.is_empty() {
+                        let pending: Vec<u8> = state.tx_fifo.drain(..).collect();
+                        let _ = state.output.write_all(&pending);
+                        let _ = state.output.flush();
+                    }
+                }
+                if !state.fifo_enabled && !state.tx_fifo.is_empty() {
+                    // Disabling FIFO: flush remaining data.
+                    let pending: Vec<u8> = state.tx_fifo.drain(..).collect();
+                    let _ = state.output.write_all(&pending);
+                    let _ = state.output.flush();
+                }
             }
             3 => state.lcr = data,
             4 => state.mcr = data & 0x1F, // Only lower 5 bits valid
@@ -377,5 +424,126 @@ mod tests {
         serial.write(COM1_BASE, b'X');
         let lsr = serial.read(COM1_BASE + 5);
         assert_ne!(lsr & LSR_THR_EMPTY, 0, "THR should be ready after write");
+    }
+
+    // ---- FIFO tests ----
+
+    #[test]
+    fn test_fifo_enable_via_fcr() {
+        let (serial, _) = create_test_serial();
+        // FIFO should be disabled initially.
+        assert!(!serial.state.lock().unwrap().fifo_enabled);
+        // Write FCR with FIFO enable bit.
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+        assert!(serial.state.lock().unwrap().fifo_enabled);
+        // Disable FIFO.
+        serial.write(COM1_BASE + 2, 0);
+        assert!(!serial.state.lock().unwrap().fifo_enabled);
+    }
+
+    #[test]
+    fn test_fifo_batches_output() {
+        let (serial, buffer) = create_test_serial();
+        // Enable FIFO.
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+
+        // Write bytes that don't trigger flush (no newline, under FIFO_SIZE).
+        for &b in b"Hello" {
+            serial.write(COM1_BASE, b);
+        }
+        // Buffer should be empty (data is in FIFO, not flushed yet).
+        assert!(
+            buffer.lock().unwrap().is_empty(),
+            "FIFO should batch writes"
+        );
+
+        // Write newline to trigger flush.
+        serial.write(COM1_BASE, b'\n');
+        let captured = buffer.lock().unwrap().clone();
+        assert_eq!(captured, b"Hello\n", "newline should flush FIFO");
+    }
+
+    #[test]
+    fn test_fifo_flushes_on_full() {
+        let (serial, buffer) = create_test_serial();
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+
+        // Write exactly FIFO_SIZE bytes (no newline).
+        for i in 0..FIFO_SIZE {
+            serial.write(COM1_BASE, b'A' + (i as u8 % 26));
+        }
+        // Should have flushed on the 16th byte.
+        let captured = buffer.lock().unwrap().clone();
+        assert_eq!(captured.len(), FIFO_SIZE, "FIFO should flush when full");
+    }
+
+    #[test]
+    fn test_fifo_flushes_on_iir_read() {
+        let (serial, buffer) = create_test_serial();
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+
+        // Write partial data (no newline, under FIFO_SIZE).
+        for &b in b"Test" {
+            serial.write(COM1_BASE, b);
+        }
+        assert!(buffer.lock().unwrap().is_empty(), "not flushed yet");
+
+        // Read IIR — should flush the FIFO.
+        let _iir = serial.read(COM1_BASE + 2);
+        let captured = buffer.lock().unwrap().clone();
+        assert_eq!(captured, b"Test", "IIR read should flush FIFO");
+    }
+
+    #[test]
+    fn test_fifo_disable_flushes_remaining() {
+        let (serial, buffer) = create_test_serial();
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+
+        for &b in b"Data" {
+            serial.write(COM1_BASE, b);
+        }
+        assert!(buffer.lock().unwrap().is_empty());
+
+        // Disable FIFO — should flush remaining data.
+        serial.write(COM1_BASE + 2, 0);
+        let captured = buffer.lock().unwrap().clone();
+        assert_eq!(captured, b"Data", "disabling FIFO should flush");
+    }
+
+    #[test]
+    fn test_fifo_tx_reset_flushes() {
+        let (serial, buffer) = create_test_serial();
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+
+        for &b in b"Reset" {
+            serial.write(COM1_BASE, b);
+        }
+        assert!(buffer.lock().unwrap().is_empty());
+
+        // TX FIFO reset.
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE | FCR_TX_RESET);
+        let captured = buffer.lock().unwrap().clone();
+        assert_eq!(captured, b"Reset", "TX reset should flush FIFO");
+    }
+
+    #[test]
+    fn test_no_fifo_immediate_output() {
+        let (serial, buffer) = create_test_serial();
+        // FIFO disabled (default) — each byte goes out immediately.
+        serial.write(COM1_BASE, b'A');
+        assert_eq!(buffer.lock().unwrap().as_slice(), b"A");
+        serial.write(COM1_BASE, b'B');
+        assert_eq!(buffer.lock().unwrap().as_slice(), b"AB");
+    }
+
+    #[test]
+    fn test_fifo_lsr_stays_ready() {
+        let (serial, _) = create_test_serial();
+        serial.write(COM1_BASE + 2, FCR_FIFO_ENABLE);
+
+        // Even with FIFO buffering, LSR should report THR empty.
+        serial.write(COM1_BASE, b'X');
+        let lsr = serial.read(COM1_BASE + 5);
+        assert_ne!(lsr & LSR_THR_EMPTY, 0, "THR should be ready in FIFO mode");
     }
 }
