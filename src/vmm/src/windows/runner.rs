@@ -15,11 +15,11 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use super::super::boot::loader::load_kernel_with_initrd;
-    use super::super::devices::virtio::queue::GuestMemoryAccessor;
-    use super::super::error::{Result, WkrunError};
     use super::super::cmdline::build_kernel_cmdline;
     use super::super::context::VmContext;
     use super::super::devices::manager::{self as devices, DeviceManager};
+    use super::super::devices::virtio::queue::GuestMemoryAccessor;
+    use super::super::error::{Result, WkrunError};
     use super::super::memory::GuestMemory;
     use super::super::types::VcpuExit;
     use super::super::vcpu::VcpuRunConfig;
@@ -40,12 +40,12 @@ mod imp {
     /// Maximum vCPU exits before giving up.
     const MAX_EXITS: u64 = 500_000_000;
 
-    /// Maximum consecutive HLT instructions before giving up.
+    /// Maximum consecutive HLT instructions before assuming shutdown.
     ///
-    /// When the guest executes `poweroff -f` on WHPX (no ACPI), the kernel
-    /// enters an HLT loop. With the 1ms timer tick, this translates to
-    /// ~5 seconds of wall-clock time before we detect the shutdown.
-    const MAX_HALTS: u64 = 5_000;
+    /// With ACPI tables, `poweroff` is detected instantly via PM1a_CNT.
+    /// MAX_HALTS is a safety fallback for non-ACPI shutdown paths.
+    /// At 1ms per tick, 50 = ~50ms timeout.
+    const MAX_HALTS: u64 = 50;
 
     /// Handle for a running VM, stored in `RUNNING_VMS`.
     struct VmHandle {
@@ -72,33 +72,51 @@ mod imp {
 
         // PML4 entry
         let mut buf = [0u8; 8];
-        guest_mem.read_at_addr(pml4_base + (pml4_idx as u64) * 8, &mut buf).ok()?;
+        guest_mem
+            .read_at_addr(pml4_base + (pml4_idx as u64) * 8, &mut buf)
+            .ok()?;
         let pml4e = u64::from_le_bytes(buf);
-        if pml4e & 1 == 0 { return None; } // not present
+        if pml4e & 1 == 0 {
+            return None;
+        } // not present
 
         // PDPT entry
         let pdpt_base = pml4e & 0x000F_FFFF_FFFF_F000;
-        guest_mem.read_at_addr(pdpt_base + (pdpt_idx as u64) * 8, &mut buf).ok()?;
+        guest_mem
+            .read_at_addr(pdpt_base + (pdpt_idx as u64) * 8, &mut buf)
+            .ok()?;
         let pdpte = u64::from_le_bytes(buf);
-        if pdpte & 1 == 0 { return None; }
-        if pdpte & 0x80 != 0 { // 1GB page
+        if pdpte & 1 == 0 {
+            return None;
+        }
+        if pdpte & 0x80 != 0 {
+            // 1GB page
             return Some((pdpte & 0x000F_FFFF_C000_0000) | (gva & 0x3FFF_FFFF));
         }
 
         // PD entry
         let pd_base = pdpte & 0x000F_FFFF_FFFF_F000;
-        guest_mem.read_at_addr(pd_base + (pd_idx as u64) * 8, &mut buf).ok()?;
+        guest_mem
+            .read_at_addr(pd_base + (pd_idx as u64) * 8, &mut buf)
+            .ok()?;
         let pde = u64::from_le_bytes(buf);
-        if pde & 1 == 0 { return None; }
-        if pde & 0x80 != 0 { // 2MB page
+        if pde & 1 == 0 {
+            return None;
+        }
+        if pde & 0x80 != 0 {
+            // 2MB page
             return Some((pde & 0x000F_FFFF_FFE0_0000) | (gva & 0x1F_FFFF));
         }
 
         // PT entry
         let pt_base = pde & 0x000F_FFFF_FFFF_F000;
-        guest_mem.read_at_addr(pt_base + (pt_idx as u64) * 8, &mut buf).ok()?;
+        guest_mem
+            .read_at_addr(pt_base + (pt_idx as u64) * 8, &mut buf)
+            .ok()?;
         let pte = u64::from_le_bytes(buf);
-        if pte & 1 == 0 { return None; }
+        if pte & 1 == 0 {
+            return None;
+        }
         Some((pte & 0x000F_FFFF_FFFF_F000) | offset)
     }
 
@@ -168,6 +186,7 @@ mod imp {
             ctx.root_disk_fstype.as_deref(),
             ctx.exec_path.as_deref(),
             &ctx.argv,
+            ctx.verbose,
         );
 
         // Load kernel.
@@ -256,6 +275,11 @@ mod imp {
                     halt_count = 0;
                     *io_write_counts.entry(port).or_insert(0) += 1;
                     devices.handle_io_out(port, size, data);
+                    if devices.shutdown_requested() {
+                        log::info!("ACPI shutdown detected after {} exits", exit_count);
+                        exit_code = 0;
+                        break;
+                    }
                     vcpu.skip_instruction()?;
                 }
                 VcpuExit::IoIn { port, size } => {
@@ -323,12 +347,14 @@ mod imp {
                             // Sort IO ports by frequency (descending), show all.
                             let mut reads: Vec<_> = io_read_counts.iter().collect();
                             reads.sort_by(|a, b| b.1.cmp(a.1));
-                            let top_reads: Vec<String> = reads.iter()
+                            let top_reads: Vec<String> = reads
+                                .iter()
                                 .map(|(p, c)| format!("{:#X}:{}", p, c))
                                 .collect();
                             let mut writes: Vec<_> = io_write_counts.iter().collect();
                             writes.sort_by(|a, b| b.1.cmp(a.1));
-                            let top_writes: Vec<String> = writes.iter()
+                            let top_writes: Vec<String> = writes
+                                .iter()
                                 .map(|(p, c)| format!("{:#X}:{}", p, c))
                                 .collect();
                             log::info!(
@@ -357,7 +383,12 @@ mod imp {
                         }
                     }
                 }
-                VcpuExit::MsrAccess { msr_number, is_write, rax, rdx } => {
+                VcpuExit::MsrAccess {
+                    msr_number,
+                    is_write,
+                    rax,
+                    rdx,
+                } => {
                     halt_count = 0;
                     msr_count += 1;
                     if is_write {
@@ -389,12 +420,22 @@ mod imp {
                     // doesn't fully support.
                     let (out_rax, out_rbx, out_rcx, out_rdx) = match leaf {
                         // Leaf 1: clear "hypervisor present" bit (ECX bit 31).
-                        1 => (default_rax, default_rbx, default_rcx & !(1u64 << 31), default_rdx),
+                        1 => (
+                            default_rax,
+                            default_rbx,
+                            default_rcx & !(1u64 << 31),
+                            default_rdx,
+                        ),
                         // Hyper-V CPUID range: return zeros (no hypervisor features).
                         0x40000000..=0x400000FF => (0, 0, 0, 0),
                         _ => (default_rax, default_rbx, default_rcx, default_rdx),
                     };
-                    log::trace!("CPUID leaf=0x{:X} sub=0x{:X} -> rax=0x{:X}", rax, rcx, out_rax);
+                    log::trace!(
+                        "CPUID leaf=0x{:X} sub=0x{:X} -> rax=0x{:X}",
+                        rax,
+                        rcx,
+                        out_rax
+                    );
                     vcpu.complete_cpuid(out_rax, out_rbx, out_rcx, out_rdx)?;
                 }
                 VcpuExit::UnrecoverableException => {
@@ -568,9 +609,9 @@ pub fn stop(_ctx_id: u32) -> super::error::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::context::VmContext;
     use super::super::vcpu::VcpuRunConfig;
+    use super::*;
     use std::sync::{Arc, Mutex};
 
     #[test]

@@ -11,6 +11,7 @@
 //!   --argv <args...>  Arguments passed to init after `--` separator (repeat for each arg)
 //!   --vsock-listen <guest_port>:<host_tcp_port>  VMM listens on TCP, bridges to guest vsock
 //!   --vsock-connect <guest_port>:<host_tcp_port> VMM connects to TCP when guest connects to vsock
+//!   --verbose         Enable serial console output (slower boot, useful for debugging)
 //!
 //! Examples:
 //!   # Boot with initramfs only (existing behavior)
@@ -58,6 +59,7 @@ fn main() {
     let mut init_argv: Vec<String> = Vec::new();
     let mut vsock_ports: Vec<VsockPort> = Vec::new();
     let mut extra_cmdline: Vec<&str> = Vec::new();
+    let mut verbose = false;
     let mut past_separator = false;
     let mut i = 2;
 
@@ -119,6 +121,9 @@ fn main() {
                 }
                 init_argv.push(args[i].clone());
             }
+            "--verbose" => {
+                verbose = true;
+            }
             "--vsock-listen" | "--vsock-connect" => {
                 let is_listen = arg == "--vsock-listen";
                 i += 1;
@@ -152,7 +157,10 @@ fn main() {
                     if p.exists() {
                         initrd_path = Some(p);
                     } else {
-                        eprintln!("Warning: initrd not found: {}, treating as cmdline arg", arg);
+                        eprintln!(
+                            "Warning: initrd not found: {}, treating as cmdline arg",
+                            arg
+                        );
                         extra_cmdline.push(arg);
                     }
                 } else {
@@ -190,6 +198,9 @@ fn main() {
         ctx.exec_path = init_path.clone();
         ctx.argv = init_argv.clone();
 
+        // Verbose mode: enable serial console output for debugging.
+        ctx.verbose = verbose;
+
         // Extra cmdline args are appended after the base cmdline and MMIO
         // device lines that build_kernel_cmdline() generates automatically.
         if !extra_cmdline.is_empty() {
@@ -217,7 +228,11 @@ fn main() {
             .unwrap_or_else(|| "(none)".to_string())
     );
     if let Some(ref root) = root_device {
-        println!("Root:    {} (fstype: {})", root, root_fstype.as_deref().unwrap_or("auto"));
+        println!(
+            "Root:    {} (fstype: {})",
+            root,
+            root_fstype.as_deref().unwrap_or("auto")
+        );
     }
     if let Some(ref init) = init_path {
         println!("Init:    {}", init);
@@ -225,12 +240,21 @@ fn main() {
     if !init_argv.is_empty() {
         println!("Argv:    {:?}", init_argv);
     }
+    if verbose {
+        println!("Verbose: enabled (serial console on, slower boot)");
+    }
     for vp in &vsock_ports {
         let host_port = vp.host_tcp_port.unwrap_or(vp.port as u16);
         if vp.listen {
-            println!("Vsock:   guest:{} <- TCP listen:{} (host→guest)", vp.port, host_port);
+            println!(
+                "Vsock:   guest:{} <- TCP listen:{} (host→guest)",
+                vp.port, host_port
+            );
         } else {
-            println!("Vsock:   guest:{} -> TCP connect:127.0.0.1:{} (guest→host)", vp.port, host_port);
+            println!(
+                "Vsock:   guest:{} -> TCP connect:127.0.0.1:{} (guest→host)",
+                vp.port, host_port
+            );
         }
     }
 

@@ -8,8 +8,14 @@ pub const MMIO_SLOT_SIZE: u64 = 0x200;
 /// IRQ number for the first MMIO device slot.
 pub const FIRST_MMIO_IRQ: u8 = 5;
 
-/// Base kernel command line parameters.
+/// Base kernel command line parameters (quiet mode — fast boot).
 ///
+/// Quiet mode suppresses serial console output and i8042 keyboard probing,
+/// eliminating ~36K VM exits per boot (~26K serial + ~10K i8042). This reduces
+/// WHPX boot time from ~5s to ~1-2s.
+///
+/// - `quiet loglevel=1`: Suppress kernel printk to console.
+/// - `i8042.nokbd i8042.noaux`: Skip PS/2 keyboard/mouse probe (10K+ exits).
 /// - `nohyperv`: Disable Hyper-V guest enlightenments. WHPX exposes Hyper-V
 ///   CPUID leaves but doesn't fully support synthetic timers/SynIC, causing
 ///   clock stalls if the kernel tries to use them.
@@ -18,7 +24,13 @@ pub const FIRST_MMIO_IRQ: u8 = 5;
 /// - `nokaslr`: Disable kernel address space randomization for deterministic
 ///   boot in our controlled single-vCPU environment.
 const BASE_CMDLINE: &str =
-    "console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic nolapic noacpi nosmp nohyperv lpj=1000000 nokaslr";
+    "console=ttyS0 quiet loglevel=1 i8042.nokbd i8042.noaux noapic nolapic nosmp nohyperv lpj=1000000 nokaslr";
+
+/// Serial console parameters appended in verbose mode.
+///
+/// Enables full kernel boot output on the serial console. Useful for debugging
+/// but adds ~26K VM exits (~3s) due to per-byte serial I/O port access.
+const VERBOSE_CONSOLE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200";
 
 /// Description of a virtio-MMIO device slot for command line generation.
 #[derive(Debug, Clone)]
@@ -39,6 +51,8 @@ pub struct MmioSlot {
 /// - `root_disk_fstype`: Filesystem type for root device (e.g., "ext4").
 /// - `exec_path`: Path to init binary (added as `init=<path>`).
 /// - `exec_argv`: Arguments passed after `--` separator for the init process.
+/// - `verbose`: Enable serial console output. Adds `console=ttyS0` and removes
+///   `quiet`/`i8042.nokbd` for full kernel boot logging. Slower (~5s vs ~1-2s).
 pub fn build_kernel_cmdline(
     user_cmdline: Option<&str>,
     has_root_disk: bool,
@@ -47,8 +61,17 @@ pub fn build_kernel_cmdline(
     root_disk_fstype: Option<&str>,
     exec_path: Option<&str>,
     exec_argv: &[String],
+    verbose: bool,
 ) -> String {
-    let mut cmdline = BASE_CMDLINE.to_string();
+    let mut cmdline = if verbose {
+        // Verbose mode: serial console + full i8042 probe for debugging.
+        format!(
+            "{} noapic nolapic nosmp nohyperv lpj=1000000 nokaslr",
+            VERBOSE_CONSOLE
+        )
+    } else {
+        BASE_CMDLINE.to_string()
+    };
 
     // Root device: explicit override takes priority over default.
     if let Some(device) = root_disk_device {
@@ -110,13 +133,38 @@ mod tests {
 
     /// Helper: build cmdline with only the legacy params (no root override, no init).
     fn build_simple(user: Option<&str>, has_root: bool, slots: &[MmioSlot]) -> String {
-        build_kernel_cmdline(user, has_root, slots, None, None, None, &[])
+        build_kernel_cmdline(user, has_root, slots, None, None, None, &[], false)
     }
 
     #[test]
     fn test_base_cmdline_only() {
         let cmdline = build_simple(None, false, &[]);
         assert_eq!(cmdline, BASE_CMDLINE);
+    }
+
+    #[test]
+    fn test_quiet_mode_default() {
+        let cmdline = build_simple(None, false, &[]);
+        assert!(cmdline.contains("console=ttyS0"));
+        assert!(cmdline.contains("quiet"));
+        assert!(cmdline.contains("loglevel=1"));
+        assert!(cmdline.contains("i8042.nokbd"));
+        assert!(cmdline.contains("i8042.noaux"));
+        assert!(!cmdline.contains("earlyprintk"));
+    }
+
+    #[test]
+    fn test_verbose_mode() {
+        let cmdline = build_kernel_cmdline(None, false, &[], None, None, None, &[], true);
+        assert!(cmdline.contains("console=ttyS0"));
+        assert!(cmdline.contains("earlyprintk=serial,ttyS0,115200"));
+        assert!(!cmdline.contains("quiet"));
+        assert!(!cmdline.contains("loglevel=1"));
+        assert!(!cmdline.contains("i8042.nokbd"));
+        // Common params present in both modes.
+        assert!(cmdline.contains("nohyperv"));
+        assert!(cmdline.contains("lpj=1000000"));
+        assert!(cmdline.contains("nokaslr"));
     }
 
     #[test]
@@ -184,6 +232,28 @@ mod tests {
         assert!(cmdline.contains("nohyperv"));
         assert!(cmdline.contains("lpj=1000000"));
         assert!(cmdline.contains("nokaslr"));
+        // noacpi must NOT be present (ACPI tables are provided).
+        assert!(!cmdline.contains("noacpi"));
+    }
+
+    #[test]
+    fn test_cmdline_no_noacpi() {
+        // Verify neither quiet nor verbose mode includes noacpi.
+        let quiet = build_simple(None, false, &[]);
+        assert!(
+            !quiet.contains("noacpi"),
+            "quiet cmdline must not contain noacpi"
+        );
+
+        let verbose = build_kernel_cmdline(None, false, &[], None, None, None, &[], true);
+        assert!(
+            !verbose.contains("noacpi"),
+            "verbose cmdline must not contain noacpi"
+        );
+
+        // Ensure noapic (APIC disable) is still present — it's different from noacpi.
+        assert!(quiet.contains("noapic"));
+        assert!(verbose.contains("noapic"));
     }
 
     #[test]
@@ -216,14 +286,14 @@ mod tests {
                 active: true,
             },
         ];
-        let cmdline = build_simple(Some("quiet"), true, &slots);
+        let cmdline = build_simple(Some("custom_test=1"), true, &slots);
 
         let base_pos = cmdline.find(BASE_CMDLINE).unwrap();
         let root_pos = cmdline.find("root=/dev/vda").unwrap();
         let mmio0_pos = cmdline.find("0xd0000000:5").unwrap();
         let mmio1_pos = cmdline.find("0xd0000200:6").unwrap();
         let mmio2_pos = cmdline.find("0xd0000400:7").unwrap();
-        let user_pos = cmdline.find("quiet").unwrap();
+        let user_pos = cmdline.find("custom_test=1").unwrap();
 
         assert!(base_pos < root_pos);
         assert!(root_pos < mmio0_pos);
@@ -244,6 +314,7 @@ mod tests {
             Some("ext4"),
             None,
             &[],
+            false,
         );
         assert!(cmdline.contains("root=/dev/vdb"));
         assert!(cmdline.contains("rootfstype=ext4"));
@@ -263,6 +334,7 @@ mod tests {
             Some("ext4"),
             None,
             &[],
+            false,
         );
         assert!(cmdline.contains("root=/dev/vdb"));
         assert!(!cmdline.contains("root=/dev/vda"));
@@ -270,15 +342,8 @@ mod tests {
 
     #[test]
     fn test_root_disk_device_without_fstype() {
-        let cmdline = build_kernel_cmdline(
-            None,
-            false,
-            &[],
-            Some("/dev/vdb"),
-            None,
-            None,
-            &[],
-        );
+        let cmdline =
+            build_kernel_cmdline(None, false, &[], Some("/dev/vdb"), None, None, &[], false);
         assert!(cmdline.contains("root=/dev/vdb"));
         assert!(!cmdline.contains("rootfstype="));
         assert!(cmdline.contains("rw"));
@@ -294,6 +359,7 @@ mod tests {
             None,
             Some("/boxlite/bin/boxlite-guest"),
             &[],
+            false,
         );
         assert!(cmdline.contains("init=/boxlite/bin/boxlite-guest"));
     }
@@ -314,6 +380,7 @@ mod tests {
             None,
             Some("/boxlite/bin/boxlite-guest"),
             &argv,
+            false,
         );
         assert!(cmdline.contains("init=/boxlite/bin/boxlite-guest"));
         assert!(cmdline.ends_with("-- --listen vsock://2695 --notify vsock://2696"));
@@ -321,15 +388,8 @@ mod tests {
 
     #[test]
     fn test_no_separator_when_argv_empty() {
-        let cmdline = build_kernel_cmdline(
-            None,
-            false,
-            &[],
-            None,
-            None,
-            Some("/bin/init"),
-            &[],
-        );
+        let cmdline =
+            build_kernel_cmdline(None, false, &[], None, None, Some("/bin/init"), &[], false);
         assert!(cmdline.contains("init=/bin/init"));
         assert!(!cmdline.contains("--"));
     }
@@ -340,13 +400,16 @@ mod tests {
         // root=/dev/vdb rootfstype=ext4 rw init=/boxlite/bin/boxlite-guest
         // virtio_mmio devices, then -- <guest args>
         let slots = vec![
-            MmioSlot { index: 0, active: true },
-            MmioSlot { index: 1, active: true },
+            MmioSlot {
+                index: 0,
+                active: true,
+            },
+            MmioSlot {
+                index: 1,
+                active: true,
+            },
         ];
-        let argv = vec![
-            "--listen".to_string(),
-            "vsock://2695".to_string(),
-        ];
+        let argv = vec!["--listen".to_string(), "vsock://2695".to_string()];
         let cmdline = build_kernel_cmdline(
             None,
             true,
@@ -355,6 +418,7 @@ mod tests {
             Some("ext4"),
             Some("/boxlite/bin/boxlite-guest"),
             &argv,
+            false,
         );
 
         // Verify ordering: base < root < init < mmio < argv

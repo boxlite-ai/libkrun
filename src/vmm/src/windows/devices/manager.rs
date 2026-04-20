@@ -10,6 +10,10 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
+use super::super::cmdline::{irq_for_slot, mmio_base_for_slot, MmioSlot, MMIO_SLOT_SIZE};
+use super::super::context::VmContext;
+use super::super::error::{Result, WkrunError};
+use super::super::vcpu::IoHandler;
 use super::pic::Pic;
 use super::pit::Pit;
 use super::serial::{Serial, COM1_BASE};
@@ -20,10 +24,6 @@ use super::virtio::net::VirtioNet;
 use super::virtio::p9::Virtio9p;
 use super::virtio::queue::GuestMemoryAccessor;
 use super::virtio::vsock::VirtioVsock;
-use super::super::error::{Result, WkrunError};
-use super::super::cmdline::{irq_for_slot, mmio_base_for_slot, MmioSlot, MMIO_SLOT_SIZE};
-use super::super::context::VmContext;
-use super::super::vcpu::IoHandler;
 
 /// Shared console output buffer.
 pub type ConsoleBuffer = Arc<Mutex<Vec<u8>>>;
@@ -72,6 +72,12 @@ pub fn remove_console_buffer(ctx_id: u32) {
 
 /// Default guest CID for vsock (standard value for single-VM hosts).
 const GUEST_CID: u64 = 3;
+
+/// ACPI PM1a event block base port (4 bytes wide).
+const PM1A_EVT_BLK: u16 = 0x600;
+
+/// ACPI PM1a control block base port (2 bytes wide).
+const PM1A_CNT_BLK: u16 = 0x604;
 
 /// Default vsock listen ports (BoxLite: 2695=gRPC, 2696=ready signal).
 const DEFAULT_VSOCK_PORTS: &[u32] = &[2695, 2696];
@@ -142,6 +148,8 @@ pub struct DeviceManager {
     /// Linux's `pit_calibrate_tsc()` loops reading port 0x61 waiting for
     /// bit 5 to toggle. Without toggling, TSC calibration stalls forever.
     port61_toggle: bool,
+    /// ACPI shutdown detected (PM1a_CNT S5 sleep type written).
+    shutdown_requested: bool,
 }
 
 impl DeviceManager {
@@ -264,6 +272,7 @@ impl DeviceManager {
             window_requested: false,
             last_tick: Instant::now(),
             port61_toggle: false,
+            shutdown_requested: false,
         };
 
         Ok(DeviceSetup {
@@ -289,6 +298,15 @@ impl DeviceManager {
         } else if self.pit.handles_port(port) {
             log::trace!("PIT write: port={:#X} data={:#X}", port, data as u8);
             self.pit.write_port(port, data as u8);
+        } else if port == PM1A_CNT_BLK {
+            // ACPI PM1a control register: detect S5 shutdown.
+            // SLP_EN = bit 13, SLP_TYP = bits 12:10.
+            let slp_en = (data >> 13) & 1;
+            let slp_typ = (data >> 10) & 0x7;
+            if slp_en == 1 && slp_typ == 5 {
+                log::info!("ACPI S5 shutdown detected (PM1a_CNT={:#X})", data);
+                self.shutdown_requested = true;
+            }
         } else if port == 0x70 {
             self.cmos_addr = (data as u8) & 0x7F;
         }
@@ -311,6 +329,10 @@ impl DeviceManager {
             self.pit.read_port(port) as u32
         } else if port == 0x71 {
             cmos_read(self.cmos_addr) as u32
+        } else if (PM1A_EVT_BLK..PM1A_EVT_BLK + 4).contains(&port) {
+            0x00 // PM1a event: no events pending
+        } else if (PM1A_CNT_BLK..PM1A_CNT_BLK + 2).contains(&port) {
+            0x00 // PM1a control: clear state
         } else if (0xCF8..=0xCFF).contains(&port) {
             0xFFFF_FFFF // PCI config: no devices.
         } else if port == 0x61 {
@@ -321,7 +343,11 @@ impl DeviceManager {
             // loop that stalls kernel boot. Toggling on each read lets the
             // calibration complete.
             self.port61_toggle = !self.port61_toggle;
-            if self.port61_toggle { 0x20 } else { 0x00 }
+            if self.port61_toggle {
+                0x20
+            } else {
+                0x00
+            }
         } else if port == 0x92 {
             0x02 // System control port A: A20 enabled.
         } else if port == 0x60 || port == 0x64 {
@@ -472,10 +498,9 @@ impl DeviceManager {
                     e
                 ))
             })?;
-            let transport =
-                super::virtio::net::UnixStreamTransport::new(stream).map_err(|e| {
-                    WkrunError::Device(format!("failed to configure net socket: {}", e))
-                })?;
+            let transport = super::virtio::net::UnixStreamTransport::new(stream).map_err(|e| {
+                WkrunError::Device(format!("failed to configure net socket: {}", e))
+            })?;
             Ok(Some(Box::new(transport)))
         }
         #[cfg(not(unix))]
@@ -484,12 +509,16 @@ impl DeviceManager {
             let stream = std::net::TcpStream::connect(addr.as_ref()).map_err(|e| {
                 WkrunError::Device(format!("failed to connect to net proxy '{}': {}", addr, e))
             })?;
-            let transport =
-                super::virtio::net::TcpTransport::new(stream).map_err(|e| {
-                    WkrunError::Device(format!("failed to configure net socket: {}", e))
-                })?;
+            let transport = super::virtio::net::TcpTransport::new(stream).map_err(|e| {
+                WkrunError::Device(format!("failed to configure net socket: {}", e))
+            })?;
             Ok(Some(Box::new(transport)))
         }
+    }
+
+    /// Whether an ACPI S5 shutdown was detected.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
     }
 
     /// Whether an interrupt window has been requested.
@@ -519,6 +548,7 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
         window_requested: false,
         last_tick: Instant::now(),
         port61_toggle: false,
+        shutdown_requested: false,
     }
 }
 
@@ -774,5 +804,40 @@ mod tests {
         // Read from virtio-net slot when no device present.
         let data = dm.handle_mmio_read(mmio_base_for_slot(3), 4);
         assert_eq!(data, 0);
+    }
+
+    #[test]
+    fn test_acpi_shutdown_not_requested_initially() {
+        let dm = make_test_devices();
+        assert!(!dm.shutdown_requested());
+    }
+
+    #[test]
+    fn test_acpi_s5_shutdown_detected() {
+        let mut dm = make_test_devices();
+        // Write SLP_TYP=5, SLP_EN=1 → bits 12:10 = 0b101, bit 13 = 1.
+        // Value = (1 << 13) | (5 << 10) = 0x2000 | 0x1400 = 0x3400.
+        dm.handle_io_out(0x604, 2, 0x3400);
+        assert!(dm.shutdown_requested());
+    }
+
+    #[test]
+    fn test_acpi_non_s5_write_ignored() {
+        let mut dm = make_test_devices();
+        // SLP_EN=1, SLP_TYP=0 → not S5.
+        dm.handle_io_out(0x604, 2, 0x2000);
+        assert!(!dm.shutdown_requested());
+    }
+
+    #[test]
+    fn test_acpi_pm1a_evt_read_zero() {
+        let mut dm = make_test_devices();
+        assert_eq!(dm.handle_io_in(0x600, 4), 0x00);
+    }
+
+    #[test]
+    fn test_acpi_pm1a_cnt_read_zero() {
+        let mut dm = make_test_devices();
+        assert_eq!(dm.handle_io_in(0x604, 2), 0x00);
     }
 }

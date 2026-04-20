@@ -67,6 +67,12 @@ pub struct VmContext {
     pub root_disk_device: Option<String>,
     /// Root disk filesystem type (e.g., "ext4").
     pub root_disk_fstype: Option<String>,
+    /// Enable verbose serial console output for debugging.
+    ///
+    /// When true, the kernel cmdline includes `console=ttyS0` for full boot
+    /// logging. When false (default), quiet mode suppresses serial output and
+    /// i8042 probing for faster boot (~1-2s vs ~5s).
+    pub verbose: bool,
 }
 
 /// Network device configuration.
@@ -126,6 +132,7 @@ impl VmContext {
             net_config: None,
             root_disk_device: None,
             root_disk_fstype: None,
+            verbose: false,
         }
     }
 

@@ -3,26 +3,28 @@
 //! Parses a bzImage file, loads the protected-mode kernel into guest memory,
 //! sets up page tables, GDT, boot parameters, and kernel command line.
 
-use super::params::HDRS_MAGIC;
 use super::super::error::{Result, WkrunError};
+use super::params::HDRS_MAGIC;
 
-#[cfg(any(target_os = "windows", test))]
-use super::params::{E820Entry, E820_RAM, E820_RESERVED};
 #[cfg(any(target_os = "windows", test))]
 use super::super::memory::{MMIO_REGION_SIZE, VIRTIO_MMIO_BASE};
+#[cfg(any(target_os = "windows", test))]
+use super::params::{E820Entry, E820_ACPI, E820_RAM, E820_RESERVED};
 
 // These imports are only used by the Windows-only load_kernel() function.
+#[cfg(target_os = "windows")]
+use super::super::memory::{
+    ACPI_START, CMDLINE_MAX_SIZE, CMDLINE_START, KERNEL_64BIT_ENTRY_OFFSET, KERNEL_START,
+    PDPT_START, PD_START, PML4_START, ZERO_PAGE_START,
+};
+#[cfg(target_os = "windows")]
+use super::acpi;
+#[cfg(target_os = "windows")]
+use super::super::types::{SpecialRegisters, StandardRegisters};
 #[cfg(target_os = "windows")]
 use super::params::BootParams;
 #[cfg(target_os = "windows")]
 use super::setup::{build_gdt, build_page_tables, configure_boot_registers, gdt_bytes};
-#[cfg(target_os = "windows")]
-use super::super::memory::{
-    CMDLINE_MAX_SIZE, CMDLINE_START, KERNEL_64BIT_ENTRY_OFFSET, KERNEL_START, PDPT_START, PD_START,
-    PML4_START, ZERO_PAGE_START,
-};
-#[cfg(target_os = "windows")]
-use super::super::types::{SpecialRegisters, StandardRegisters};
 
 /// Loadflags bit: kernel was loaded high (at 0x100000).
 #[cfg(any(target_os = "windows", test))]
@@ -126,9 +128,10 @@ pub fn parse_bzimage(kernel_image: &[u8]) -> Result<KernelHeader> {
 /// Creates a standard memory map with:
 /// - Low memory (0 .. 0x9FC00) — 640KB conventional
 /// - Reserved (0x9FC00 .. 0x100000) — BIOS area
+/// - ACPI tables (acpi_base .. acpi_base + acpi_size)
 /// - High memory (0x100000 .. ram_end) — main RAM
 #[cfg(any(target_os = "windows", test))]
-fn build_e820_map(ram_mib: u32) -> Vec<E820Entry> {
+fn build_e820_map(ram_mib: u32, acpi_base: u64, acpi_size: u64) -> Vec<E820Entry> {
     let ram_bytes = (ram_mib as u64) * 1024 * 1024;
 
     let mut entries = Vec::new();
@@ -146,6 +149,14 @@ fn build_e820_map(ram_mib: u32) -> Vec<E820Entry> {
         addr: 0x9FC00,
         size: 0x100000 - 0x9FC00,
         entry_type: E820_RESERVED,
+        _pad: 0,
+    });
+
+    // ACPI tables (within the BIOS reserved region).
+    entries.push(E820Entry {
+        addr: acpi_base,
+        size: acpi_size,
+        entry_type: E820_ACPI,
         _pad: 0,
     });
 
@@ -282,8 +293,12 @@ pub fn load_kernel_with_initrd(
     boot_params.set_cmdline_ptr(CMDLINE_START as u32);
     boot_params.set_cmdline_size(cmdline_bytes.len() as u32);
 
+    // Write ACPI tables to guest memory.
+    let acpi_data = acpi::build_acpi_tables(ACPI_START);
+    guest_mem.write_at_addr(ACPI_START, &acpi_data)?;
+
     // Set E820 memory map.
-    let e820_map = build_e820_map(ram_mib);
+    let e820_map = build_e820_map(ram_mib, ACPI_START, acpi::ACPI_REGION_SIZE);
     boot_params.set_e820_map(&e820_map);
 
     // Load initrd if provided. Place at the end of RAM (page-aligned).
@@ -456,10 +471,14 @@ mod tests {
         );
     }
 
+    // ACPI constants for test assertions.
+    const TEST_ACPI_BASE: u64 = 0xE0000;
+    const TEST_ACPI_SIZE: u64 = 0x200;
+
     #[test]
     fn test_build_e820_map_256mb() {
-        let map = build_e820_map(256);
-        assert_eq!(map.len(), 3);
+        let map = build_e820_map(256, TEST_ACPI_BASE, TEST_ACPI_SIZE);
+        assert_eq!(map.len(), 4);
 
         // Low memory: 0 .. 640KB
         assert_eq!(map[0].addr, 0);
@@ -470,24 +489,29 @@ mod tests {
         assert_eq!(map[1].addr, 0x9FC00);
         assert_eq!(map[1].entry_type, E820_RESERVED);
 
+        // ACPI tables
+        assert_eq!(map[2].addr, TEST_ACPI_BASE);
+        assert_eq!(map[2].size, TEST_ACPI_SIZE);
+        assert_eq!(map[2].entry_type, E820_ACPI);
+
         // High memory: 1MB .. 256MB
-        assert_eq!(map[2].addr, 0x100000);
-        assert_eq!(map[2].size, 256 * 1024 * 1024 - 0x100000);
-        assert_eq!(map[2].entry_type, E820_RAM);
+        assert_eq!(map[3].addr, 0x100000);
+        assert_eq!(map[3].size, 256 * 1024 * 1024 - 0x100000);
+        assert_eq!(map[3].entry_type, E820_RAM);
     }
 
     #[test]
     fn test_build_e820_map_1mb_no_high_memory() {
         // With only 1MB of RAM, high memory region should be empty (1MB - 1MB = 0).
-        let map = build_e820_map(1);
-        assert_eq!(map.len(), 2, "1MB RAM should only have low + reserved");
+        let map = build_e820_map(1, TEST_ACPI_BASE, TEST_ACPI_SIZE);
+        assert_eq!(map.len(), 3, "1MB RAM should only have low + reserved + ACPI");
     }
 
     #[test]
     fn test_build_e820_map_4096mb_has_mmio_hole() {
-        let map = build_e820_map(4096);
-        // Low + BIOS reserved + high1 + MMIO reserved + high2 = 5 entries.
-        assert_eq!(map.len(), 5, "4GB RAM should have MMIO hole: {:?}", map);
+        let map = build_e820_map(4096, TEST_ACPI_BASE, TEST_ACPI_SIZE);
+        // Low + BIOS reserved + ACPI + high1 + MMIO reserved + high2 = 6 entries.
+        assert_eq!(map.len(), 6, "4GB RAM should have MMIO hole: {:?}", map);
 
         // Low memory.
         assert_eq!(map[0].addr, 0);
@@ -497,30 +521,45 @@ mod tests {
         assert_eq!(map[1].addr, 0x9FC00);
         assert_eq!(map[1].entry_type, E820_RESERVED);
 
+        // ACPI tables.
+        assert_eq!(map[2].addr, TEST_ACPI_BASE);
+        assert_eq!(map[2].size, TEST_ACPI_SIZE);
+        assert_eq!(map[2].entry_type, E820_ACPI);
+
         // High memory below MMIO.
-        assert_eq!(map[2].addr, 0x100000);
-        assert_eq!(map[2].size, VIRTIO_MMIO_BASE - 0x100000);
-        assert_eq!(map[2].entry_type, E820_RAM);
+        assert_eq!(map[3].addr, 0x100000);
+        assert_eq!(map[3].size, VIRTIO_MMIO_BASE - 0x100000);
+        assert_eq!(map[3].entry_type, E820_RAM);
 
         // MMIO reserved region.
-        assert_eq!(map[3].addr, VIRTIO_MMIO_BASE);
-        assert_eq!(map[3].size, MMIO_REGION_SIZE);
-        assert_eq!(map[3].entry_type, E820_RESERVED);
+        assert_eq!(map[4].addr, VIRTIO_MMIO_BASE);
+        assert_eq!(map[4].size, MMIO_REGION_SIZE);
+        assert_eq!(map[4].entry_type, E820_RESERVED);
 
         // High memory above MMIO.
         let mmio_end = VIRTIO_MMIO_BASE + MMIO_REGION_SIZE;
-        assert_eq!(map[4].addr, mmio_end);
-        assert_eq!(map[4].size, 4096 * 1024 * 1024 - mmio_end);
-        assert_eq!(map[4].entry_type, E820_RAM);
+        assert_eq!(map[5].addr, mmio_end);
+        assert_eq!(map[5].size, 4096 * 1024 * 1024 - mmio_end);
+        assert_eq!(map[5].entry_type, E820_RAM);
     }
 
     #[test]
     fn test_build_e820_map_no_hole_below_mmio() {
         // 3072 MB = 3GB < VIRTIO_MMIO_BASE (3.25GB) — no hole needed.
-        let map = build_e820_map(3072);
-        assert_eq!(map.len(), 3, "3GB RAM should not have MMIO hole");
-        assert_eq!(map[2].addr, 0x100000);
-        assert_eq!(map[2].size, 3072 * 1024 * 1024 - 0x100000);
-        assert_eq!(map[2].entry_type, E820_RAM);
+        let map = build_e820_map(3072, TEST_ACPI_BASE, TEST_ACPI_SIZE);
+        assert_eq!(map.len(), 4, "3GB RAM should not have MMIO hole");
+        assert_eq!(map[3].addr, 0x100000);
+        assert_eq!(map[3].size, 3072 * 1024 * 1024 - 0x100000);
+        assert_eq!(map[3].entry_type, E820_RAM);
+    }
+
+    #[test]
+    fn test_build_e820_map_has_acpi_entry() {
+        let map = build_e820_map(256, TEST_ACPI_BASE, TEST_ACPI_SIZE);
+        let acpi_entry = map.iter().find(|e| e.entry_type == E820_ACPI);
+        assert!(acpi_entry.is_some(), "E820 map must contain ACPI entry");
+        let entry = acpi_entry.unwrap();
+        assert_eq!(entry.addr, TEST_ACPI_BASE);
+        assert_eq!(entry.size, TEST_ACPI_SIZE);
     }
 }
