@@ -119,6 +119,29 @@ impl VsockHeader {
         buf
     }
 
+    /// Create a REQUEST header (host -> guest) for a host-initiated connection.
+    pub fn new_request(
+        src_cid: u64,
+        src_port: u32,
+        dst_cid: u64,
+        dst_port: u32,
+        buf_alloc: u32,
+        fwd_cnt: u32,
+    ) -> Self {
+        VsockHeader {
+            src_cid,
+            dst_cid,
+            src_port,
+            dst_port,
+            len: 0,
+            type_: VIRTIO_VSOCK_TYPE_STREAM,
+            op: VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc,
+            fwd_cnt,
+        }
+    }
+
     /// Create a RESPONSE header (host -> guest) for a given REQUEST.
     pub fn new_response(
         src_cid: u64,
@@ -368,6 +391,20 @@ mod tests {
         hdr.write_to(&mem, 0).unwrap();
         let read_back = VsockHeader::read_from(&mem, 0).unwrap();
         assert_eq!(read_back, hdr);
+    }
+
+    #[test]
+    fn test_new_request() {
+        let hdr = VsockHeader::new_request(2, 49152, 3, 2695, 65536, 0);
+        assert_eq!(hdr.src_cid, 2);
+        assert_eq!(hdr.dst_cid, 3);
+        assert_eq!(hdr.src_port, 49152);
+        assert_eq!(hdr.dst_port, 2695);
+        assert_eq!(hdr.len, 0);
+        assert_eq!(hdr.type_, VIRTIO_VSOCK_TYPE_STREAM);
+        assert_eq!(hdr.op, VSOCK_OP_REQUEST);
+        assert_eq!(hdr.buf_alloc, 65536);
+        assert_eq!(hdr.fwd_cnt, 0);
     }
 
     #[test]

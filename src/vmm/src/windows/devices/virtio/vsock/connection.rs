@@ -115,6 +115,25 @@ impl VsockConnection {
         self.credit_update_needed = false;
     }
 
+    /// Initiate a host-to-guest connection (host-initiated).
+    ///
+    /// Transitions Idle -> Connecting and returns a REQUEST header to send
+    /// to the guest via the RX queue. Returns None if not in Idle state.
+    pub fn initiate_connect(&mut self) -> Option<VsockHeader> {
+        if self.state != ConnState::Idle {
+            return None;
+        }
+        self.state = ConnState::Connecting;
+        Some(VsockHeader::new_request(
+            self.local_cid,
+            self.local_port,
+            self.peer_cid,
+            self.peer_port,
+            self.buf_alloc,
+            self.fwd_cnt,
+        ))
+    }
+
     /// Handle a REQUEST from the guest.
     ///
     /// Transitions Idle -> Connected and returns a RESPONSE header.
@@ -371,6 +390,57 @@ mod tests {
         assert_eq!(r.src_cid, 2);
         assert_eq!(r.dst_cid, 3);
         assert_eq!(r.buf_alloc, DEFAULT_BUF_ALLOC);
+    }
+
+    // --- Host-initiated connection ---
+
+    #[test]
+    fn test_initiate_connect_transitions_to_connecting() {
+        let mut conn = guest_conn();
+        let req = conn.initiate_connect();
+        assert!(req.is_some());
+        assert_eq!(conn.state(), ConnState::Connecting);
+
+        let r = req.unwrap();
+        assert_eq!(r.op, VSOCK_OP_REQUEST);
+        assert_eq!(r.src_cid, 2); // HOST
+        assert_eq!(r.dst_cid, 3); // guest
+        assert_eq!(r.src_port, 2695); // local_port
+        assert_eq!(r.dst_port, 5000); // peer_port
+        assert_eq!(r.buf_alloc, DEFAULT_BUF_ALLOC);
+    }
+
+    #[test]
+    fn test_initiate_connect_on_non_idle_returns_none() {
+        let mut conn = guest_conn();
+        conn.initiate_connect();
+        // Second call should fail (already Connecting).
+        assert!(conn.initiate_connect().is_none());
+    }
+
+    #[test]
+    fn test_response_transitions_connecting_to_connected() {
+        let mut conn = guest_conn();
+        conn.initiate_connect();
+        assert_eq!(conn.state(), ConnState::Connecting);
+
+        let resp = VsockHeader {
+            src_cid: 3,
+            dst_cid: 2,
+            src_port: 5000,
+            dst_port: 2695,
+            len: 0,
+            type_: 1,
+            op: VSOCK_OP_RESPONSE,
+            flags: 0,
+            buf_alloc: 32768,
+            fwd_cnt: 0,
+        };
+        let (hdr, data) = conn.dispatch(&resp, &[]);
+        assert!(hdr.is_none()); // No response to a RESPONSE
+        assert!(data.is_none());
+        assert_eq!(conn.state(), ConnState::Connected);
+        assert_eq!(conn.peer_credit(), 32768);
     }
 
     #[test]

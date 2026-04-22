@@ -209,12 +209,31 @@ impl DeviceManager {
             }
         } else {
             for vp in &ctx.vsock_ports {
-                let host_port = vp.host_tcp_port.unwrap_or(vp.port as u16);
-                if vp.listen {
-                    let _ = vsock_backend.listen_on(vp.port, host_port);
+                // Resolve the host TCP address from either:
+                // 1. Explicit host_tcp_port (set by boot_kernel CLI)
+                // 2. host_path as "host:port" string (set by krun_add_vsock_port2 API)
+                // 3. Fallback: vsock port number as TCP port
+                let host_addr = if let Some(tcp_port) = vp.host_tcp_port {
+                    format!("127.0.0.1:{}", tcp_port)
                 } else {
-                    let addr = format!("127.0.0.1:{}", host_port);
-                    vsock_backend.connect_to(vp.port, addr);
+                    let path_str = vp.host_path.to_string_lossy();
+                    if path_str.contains(':') {
+                        // host_path is "host:port" format (e.g., "127.0.0.1:55008")
+                        path_str.to_string()
+                    } else {
+                        format!("127.0.0.1:{}", vp.port)
+                    }
+                };
+                if vp.listen {
+                    // Parse port from host_addr for listen_on
+                    let port = host_addr
+                        .rsplit(':')
+                        .next()
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(vp.port as u16);
+                    let _ = vsock_backend.listen_on(vp.port, port);
+                } else {
+                    vsock_backend.connect_to(vp.port, host_addr);
                 }
             }
         }
