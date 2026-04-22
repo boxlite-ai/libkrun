@@ -18,9 +18,9 @@ use super::super::memory::{
     PDPT_START, PD_START, PML4_START, ZERO_PAGE_START,
 };
 #[cfg(target_os = "windows")]
-use super::acpi;
-#[cfg(target_os = "windows")]
 use super::super::types::{SpecialRegisters, StandardRegisters};
+#[cfg(target_os = "windows")]
+use super::acpi;
 #[cfg(target_os = "windows")]
 use super::params::BootParams;
 #[cfg(target_os = "windows")]
@@ -504,7 +504,11 @@ mod tests {
     fn test_build_e820_map_1mb_no_high_memory() {
         // With only 1MB of RAM, high memory region should be empty (1MB - 1MB = 0).
         let map = build_e820_map(1, TEST_ACPI_BASE, TEST_ACPI_SIZE);
-        assert_eq!(map.len(), 3, "1MB RAM should only have low + reserved + ACPI");
+        assert_eq!(
+            map.len(),
+            3,
+            "1MB RAM should only have low + reserved + ACPI"
+        );
     }
 
     #[test]

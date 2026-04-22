@@ -57,7 +57,7 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     // ---- RSDP (20 bytes at offset 0x00) ----
     let rsdp = &mut region[RSDP_OFFSET..RSDP_OFFSET + RSDP_SIZE];
     rsdp[0..8].copy_from_slice(b"RSD PTR "); // Signature
-    // rsdp[8] = checksum (computed below)
+                                             // rsdp[8] = checksum (computed below)
     rsdp[9..15].copy_from_slice(b"BOXLTE"); // OEMID
     rsdp[15] = 0; // Revision: ACPI 1.0
     rsdp[16..20].copy_from_slice(&(rsdt_addr as u32).to_le_bytes()); // RsdtAddress
@@ -68,13 +68,13 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     rsdt[0..4].copy_from_slice(b"RSDT"); // Signature
     rsdt[4..8].copy_from_slice(&(RSDT_SIZE as u32).to_le_bytes()); // Length
     rsdt[8] = 1; // Revision
-    // rsdt[9] = checksum (computed below)
+                 // rsdt[9] = checksum (computed below)
     rsdt[10..16].copy_from_slice(b"BOXLTE"); // OEMID
     rsdt[16..24].copy_from_slice(b"BOXLITEV"); // OEM Table ID
     rsdt[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM Revision
     rsdt[28..32].copy_from_slice(b"BXLT"); // Creator ID
     rsdt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
-    // Entry[0]: pointer to FADT
+                                                       // Entry[0]: pointer to FADT
     rsdt[36..40].copy_from_slice(&(fadt_addr as u32).to_le_bytes());
     acpi_checksum(&mut region[RSDT_OFFSET..RSDT_OFFSET + RSDT_SIZE], 9);
 
@@ -83,14 +83,14 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     fadt[0..4].copy_from_slice(b"FACP"); // Signature (NOT "FADT")
     fadt[4..8].copy_from_slice(&(FADT_SIZE as u32).to_le_bytes()); // Length
     fadt[8] = 1; // Revision
-    // fadt[9] = checksum (computed below)
+                 // fadt[9] = checksum (computed below)
     fadt[10..16].copy_from_slice(b"BOXLTE"); // OEMID
     fadt[16..24].copy_from_slice(b"BOXLITEV"); // OEM Table ID
     fadt[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM Revision
     fadt[28..32].copy_from_slice(b"BXLT"); // Creator ID
     fadt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
-    // FACS pointer (offset 36) — 0, not needed for shutdown.
-    // DSDT pointer (offset 40).
+                                                       // FACS pointer (offset 36) — 0, not needed for shutdown.
+                                                       // DSDT pointer (offset 40).
     fadt[40..44].copy_from_slice(&(dsdt_addr as u32).to_le_bytes());
     // SCI_INT (offset 46) — interrupt for ACPI System Control.
     fadt[46..48].copy_from_slice(&SCI_INT.to_le_bytes());
@@ -110,18 +110,15 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     dsdt[0..4].copy_from_slice(b"DSDT"); // Signature
     dsdt[4..8].copy_from_slice(&(dsdt_size as u32).to_le_bytes()); // Length
     dsdt[8] = 1; // Revision
-    // dsdt[9] = checksum (computed below)
+                 // dsdt[9] = checksum (computed below)
     dsdt[10..16].copy_from_slice(b"BOXLTE"); // OEMID
     dsdt[16..24].copy_from_slice(b"BOXLITEV"); // OEM Table ID
     dsdt[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM Revision
     dsdt[28..32].copy_from_slice(b"BXLT"); // Creator ID
     dsdt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
-    // AML body: \_S5_ package.
+                                                       // AML body: \_S5_ package.
     dsdt[DSDT_HEADER_SIZE..DSDT_HEADER_SIZE + S5_AML.len()].copy_from_slice(S5_AML);
-    acpi_checksum(
-        &mut region[DSDT_OFFSET..DSDT_OFFSET + dsdt_size],
-        9,
-    );
+    acpi_checksum(&mut region[DSDT_OFFSET..DSDT_OFFSET + dsdt_size], 9);
 
     region
 }
