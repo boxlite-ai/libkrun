@@ -164,14 +164,31 @@ impl PicChip {
         self.irr &= !(1 << (irq & 7));
     }
 
-    /// Get the highest-priority pending (unmasked, not in-service) IRQ, if any.
+    /// Get the highest-priority pending (unmasked, deliverable) IRQ, if any.
+    ///
+    /// Implements proper 8259A priority masking: when an interrupt is
+    /// in-service, all equal-or-lower-priority interrupts are blocked.
+    /// IRQ 0 has highest priority, IRQ 7 has lowest (default fixed
+    /// priority mode).
     fn pending_irq(&self) -> Option<u8> {
-        let pending = self.irr & !self.imr & !self.isr;
-        if pending == 0 {
+        let requested = self.irr & !self.imr;
+        if requested == 0 {
             return None;
         }
-        // Lowest bit number = highest priority.
-        (0..8u8).find(|&i| pending & (1 << i) != 0)
+        // Find the highest-priority (lowest-numbered) in-service IRQ.
+        // All IRQs at that level or lower are blocked.
+        let priority_ceiling = (0..8u8).find(|&i| self.isr & (1 << i) != 0);
+        match priority_ceiling {
+            Some(ceil) => {
+                // Only IRQs with higher priority (lower number) than the
+                // in-service IRQ can be delivered.
+                (0..ceil).find(|&i| requested & (1 << i) != 0)
+            }
+            None => {
+                // No interrupt in-service — deliver highest priority pending.
+                (0..8u8).find(|&i| requested & (1 << i) != 0)
+            }
+        }
     }
 
     /// Acknowledge the highest-priority pending interrupt.
@@ -266,6 +283,16 @@ impl Pic {
         } else {
             None
         }
+    }
+
+    /// Get master PIC state for diagnostics: (IRR, ISR, IMR, vector_base).
+    pub fn master_state(&self) -> (u8, u8, u8, u8) {
+        (
+            self.master.irr,
+            self.master.isr,
+            self.master.imr,
+            self.master.vector_base,
+        )
     }
 
     /// Check if the given I/O port belongs to either PIC.
@@ -377,7 +404,12 @@ mod tests {
 
         let vector = chip.acknowledge();
         assert_eq!(vector, Some(0x21)); // 0x20 + 1
-                                        // IRQ 3 still pending.
+
+        // IRQ 3 is blocked while IRQ 1 is in-service (lower priority).
+        assert_eq!(chip.pending_irq(), None, "IRQ 3 blocked while IRQ 1 in-service");
+
+        // After EOI for IRQ 1, IRQ 3 becomes deliverable.
+        chip.write_command(0x61); // Specific EOI for IRQ 1.
         assert_eq!(chip.pending_irq(), Some(3));
     }
 
@@ -390,12 +422,16 @@ mod tests {
         chip.raise_irq(0);
         chip.acknowledge(); // IRQ 0 now in ISR.
 
-        // Raise IRQ 1 — it's pending but IRQ 0 is in-service.
-        // Since ISR bit 0 is set, IRQ 0 blocks IRQ 0 but not IRQ 1.
-        // Actually, pending = irr & !imr & !isr. IRQ 1 is not in ISR,
-        // so it should be deliverable.
+        // Raise IRQ 1 — lower priority than IRQ 0.
+        // With proper 8259A priority masking, IRQ 1 is blocked while
+        // IRQ 0 is in-service (all equal-or-lower priority blocked).
         chip.raise_irq(1);
-        assert_eq!(chip.pending_irq(), Some(1));
+        assert_eq!(chip.pending_irq(), None, "IRQ 1 must be blocked while IRQ 0 is in-service");
+
+        // After EOI for IRQ 0, IRQ 1 becomes deliverable.
+        chip.write_command(0x60); // Specific EOI for IRQ 0.
+        assert_eq!(chip.isr, 0, "ISR cleared after specific EOI");
+        assert_eq!(chip.pending_irq(), Some(1), "IRQ 1 deliverable after EOI");
     }
 
     #[test]
@@ -419,15 +455,24 @@ mod tests {
         chip.imr = 0;
         chip.vector_base = 0x20;
 
+        // Acknowledge IRQ 0, then EOI it, then acknowledge IRQ 2.
         chip.raise_irq(0);
         chip.raise_irq(2);
-        chip.acknowledge(); // IRQ 0 acknowledged.
-        chip.acknowledge(); // IRQ 2 acknowledged.
-        assert_eq!(chip.isr, 0x05); // bits 0 and 2.
+        chip.acknowledge(); // IRQ 0 acknowledged → ISR bit 0.
+        assert_eq!(chip.isr, 0x01);
+
+        // IRQ 2 is blocked while IRQ 0 in-service (priority masking).
+        assert_eq!(chip.pending_irq(), None);
+
+        // EOI IRQ 0, then IRQ 2 becomes deliverable.
+        chip.write_command(0x60); // Specific EOI for IRQ 0.
+        assert_eq!(chip.isr, 0x00);
+        chip.acknowledge(); // IRQ 2 acknowledged → ISR bit 2.
+        assert_eq!(chip.isr, 0x04);
 
         // Specific EOI for IRQ 2 (OCW2: 0x60 | 2 = 0x62).
         chip.write_command(0x62);
-        assert_eq!(chip.isr, 0x01, "only IRQ 0 should remain in ISR");
+        assert_eq!(chip.isr, 0x00, "ISR should be clear after both EOIs");
     }
 
     #[test]
@@ -519,6 +564,61 @@ mod tests {
         let vector = chip.acknowledge();
         assert_eq!(vector, Some(0x20));
         assert_eq!(chip.isr, 0, "ISR should not be set in auto-EOI mode");
+    }
+
+    /// Validates the fix for the WHPX flakiness root cause: PIT (IRQ 0)
+    /// in-service must block vsock (IRQ 6) delivery. Without this fix,
+    /// both interrupts end up in ISR simultaneously (ISR=0x41), causing
+    /// a deadlock where the kernel can't service either handler.
+    #[test]
+    fn test_pic_chip_pit_blocks_vsock_priority() {
+        let mut chip = PicChip::new();
+        chip.imr = 0;
+        chip.vector_base = 0x30; // Linux programs master PIC to base 0x30.
+
+        // PIT fires (IRQ 0) and gets acknowledged.
+        chip.raise_irq(0);
+        assert_eq!(chip.acknowledge(), Some(0x30));
+        assert_eq!(chip.isr, 0x01); // PIT in-service.
+
+        // While PIT handler runs, vsock (IRQ 6) fires.
+        chip.raise_irq(6);
+
+        // IRQ 6 must NOT be deliverable (lower priority than IRQ 0).
+        assert_eq!(
+            chip.pending_irq(),
+            None,
+            "vsock IRQ 6 must be blocked while PIT IRQ 0 is in-service"
+        );
+
+        // Kernel sends specific EOI for PIT (0x60 | 0 = 0x60).
+        chip.write_command(0x60);
+        assert_eq!(chip.isr, 0x00);
+
+        // Now vsock IRQ 6 is deliverable.
+        assert_eq!(chip.pending_irq(), Some(6));
+        assert_eq!(chip.acknowledge(), Some(0x36));
+        assert_eq!(chip.isr, 0x40); // Only vsock in-service, NOT 0x41.
+    }
+
+    #[test]
+    fn test_pic_chip_higher_priority_preempts() {
+        let mut chip = PicChip::new();
+        chip.imr = 0;
+        chip.vector_base = 0x30;
+
+        // IRQ 6 (vsock) in-service.
+        chip.raise_irq(6);
+        chip.acknowledge();
+        assert_eq!(chip.isr, 0x40);
+
+        // IRQ 0 (PIT) fires — higher priority, should preempt.
+        chip.raise_irq(0);
+        assert_eq!(
+            chip.pending_irq(),
+            Some(0),
+            "higher-priority IRQ 0 should preempt IRQ 6"
+        );
     }
 
     #[test]

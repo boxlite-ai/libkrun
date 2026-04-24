@@ -191,9 +191,34 @@ impl VirtioVsock {
             let (resp_hdr, fwd_data) = conn.dispatch(hdr, payload);
 
             // Forward data to host TCP socket.
+            // Use retry loop for non-blocking sockets (write_all fails on WouldBlock).
             if let Some(data) = fwd_data {
                 if let Some(stream) = self.streams.get_mut(&key) {
-                    let _ = stream.write_all(&data);
+                    let mut written = 0;
+                    let mut retries = 0;
+                    while written < data.len() {
+                        match stream.write(&data[written..]) {
+                            Ok(n) => written += n,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                retries += 1;
+                                if retries > 1000 {
+                                    log::warn!(
+                                        "vsock write stuck: {}/{} bytes after {} retries, key=({},{})",
+                                        written, data.len(), retries, key.0, key.1
+                                    );
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "vsock write failed: {}/{} bytes, err={}, key=({},{})",
+                                    written, data.len(), e, key.0, key.1
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -221,12 +246,20 @@ impl VirtioVsock {
 
         // Try outbound connection first (guest-initiated → host TCP target).
         if let Some(addr) = self.connect_targets.get(&hdr.dst_port).cloned() {
+            log::debug!("guest-initiated CONNECT: port={} → {}", hdr.dst_port, addr);
             let stream = match TcpStream::connect(&addr) {
                 Ok(stream) => {
-                    let _ = stream.set_nonblocking(true);
+                    if let Err(e) = stream.set_nonblocking(true) {
+                        log::warn!("guest-connect: set_nonblocking failed: {}", e);
+                    }
+                    if let Err(e) = stream.set_nodelay(true) {
+                        log::warn!("guest-connect: set_nodelay failed: {}", e);
+                    }
+                    log::debug!("TCP connect OK to {}", addr);
                     stream
                 }
-                Err(_) => {
+                Err(ref e) => {
+                    log::warn!("TCP connect FAILED to {}: {}", addr, e);
                     let rst = VsockHeader::new_rst(
                         VSOCK_CID_HOST,
                         hdr.dst_port,
@@ -333,8 +366,19 @@ impl VirtioVsock {
         for vsock_port in vsock_ports {
             let stream = if let Some(listener) = self.listeners.get(&vsock_port) {
                 match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let _ = stream.set_nonblocking(true);
+                    Ok((stream, addr)) => {
+                        if let Err(e) = stream.set_nonblocking(true) {
+                            log::warn!(
+                                "vsock set_nonblocking failed: {} (addr={:?})",
+                                e, addr
+                            );
+                        }
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::warn!(
+                                "vsock set_nodelay failed: {} (addr={:?})",
+                                e, addr
+                            );
+                        }
                         stream
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -351,6 +395,10 @@ impl VirtioVsock {
                 VsockConnection::new(VSOCK_CID_HOST, host_port, self.guest_cid, vsock_port);
 
             if let Some(req) = conn.initiate_connect() {
+                log::debug!(
+                    "host-initiated CONNECT: vsock_port={}, host_port={}, queuing REQUEST",
+                    vsock_port, host_port
+                );
                 self.rx_pending.push((req, Vec::new()));
                 self.connections.insert(key, conn);
                 self.streams.insert(key, stream);
@@ -377,6 +425,7 @@ impl VirtioVsock {
                 match stream.read(&mut buf) {
                     Ok(0) => {
                         // TCP connection closed. Send SHUTDOWN to guest.
+                        log::debug!("TCP EOF, key=({},{})", key.0, key.1);
                         if let Some(conn) = self.connections.get(&key) {
                             let hdr = VsockHeader::new_shutdown(
                                 conn.local_cid,
@@ -395,10 +444,19 @@ impl VirtioVsock {
                         }
                         continue;
                     }
-                    Ok(n) => Some(buf[..n].to_vec()),
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => None,
-                    Err(_) => {
+                    Ok(n) => {
+                        log::trace!("TCP read {} bytes, key=({},{})", n, key.0, key.1);
+                        Some(buf[..n].to_vec())
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        None
+                    }
+                    Err(ref e) => {
                         // I/O error on TCP stream. RST the vsock connection.
+                        log::warn!(
+                            "vsock TCP read error: {} (raw={:?}), key=({},{})",
+                            e, e.raw_os_error(), key.0, key.1
+                        );
                         if let Some(conn) = self.connections.get(&key) {
                             let rst = conn.make_rst();
                             self.rx_pending.push((rst, Vec::new()));
@@ -415,7 +473,13 @@ impl VirtioVsock {
             // Enqueue data from TCP into the connection's TX buffer.
             if let Some(data) = data {
                 if let Some(conn) = self.connections.get_mut(&key) {
-                    conn.enqueue_tx(&data);
+                    let enqueued = conn.enqueue_tx(&data);
+                    if enqueued < data.len() {
+                        log::debug!(
+                            "vsock enqueue_tx partial: {}/{} bytes, credit={}, key=({},{})",
+                            enqueued, data.len(), conn.peer_credit(), key.0, key.1
+                        );
+                    }
                 }
             }
         }
@@ -447,7 +511,13 @@ impl VirtioVsock {
         while !self.rx_pending.is_empty() {
             let head = match rx_queue.pop_avail(mem) {
                 Ok(Some(h)) => h,
-                _ => break, // No available RX buffers.
+                _ => {
+                    log::debug!(
+                        "vsock inject_rx: no available RX buffers, {} packets pending",
+                        self.rx_pending.len()
+                    );
+                    break;
+                }
             };
 
             let chain = match rx_queue.read_desc_chain(head, mem) {
@@ -542,7 +612,14 @@ impl VirtioDeviceBackend for VirtioVsock {
 
         // Inject any pending data into the RX queue.
         if queues.len() > RX_QUEUE {
-            self.inject_rx(&mut queues[RX_QUEUE], mem)
+            let injected = self.inject_rx(&mut queues[RX_QUEUE], mem);
+            if injected {
+                log::debug!(
+                    "vsock poll: injected data into RX queue, conns={}",
+                    self.connections.len()
+                );
+            }
+            injected
         } else {
             false
         }

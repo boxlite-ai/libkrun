@@ -14,8 +14,11 @@ pub const FIRST_MMIO_IRQ: u8 = 5;
 /// eliminating ~36K VM exits per boot (~26K serial + ~10K i8042). This reduces
 /// WHPX boot time from ~5s to ~1-2s.
 ///
+/// - `console=ttyS0`: Route kernel console to serial port (required — no VGA).
 /// - `quiet loglevel=1`: Suppress kernel printk to console.
 /// - `i8042.nokbd i8042.noaux`: Skip PS/2 keyboard/mouse probe (10K+ exits).
+/// - `noapic nolapic nosmp`: Use legacy PIC mode (no APIC/SMP). Required for
+///   our 8259 PIC emulation.
 /// - `nohyperv`: Disable Hyper-V guest enlightenments. WHPX exposes Hyper-V
 ///   CPUID leaves but doesn't fully support synthetic timers/SynIC, causing
 ///   clock stalls if the kernel tries to use them.

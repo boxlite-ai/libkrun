@@ -44,8 +44,13 @@ mod imp {
     ///
     /// With ACPI tables, `poweroff` is detected instantly via PM1a_CNT.
     /// MAX_HALTS is a safety fallback for non-ACPI shutdown paths.
-    /// At 1ms per tick, 50 = ~50ms timeout.
-    const MAX_HALTS: u64 = 50;
+    /// At 1ms per tick, 50000 = ~50 second timeout.
+    ///
+    /// Must be high enough to tolerate normal guest idle periods (e.g.
+    /// waiting for gRPC data after boot). The guest HLTs in its idle
+    /// loop whenever there are no interrupts; this is normal and does
+    /// NOT indicate the VM is stuck.
+    const MAX_HALTS: u64 = 50_000;
 
     /// Handle for a running VM, stored in `RUNNING_VMS`.
     struct VmHandle {
@@ -235,12 +240,8 @@ mod imp {
         let mut halt_count: u64 = 0;
         let start_time = Instant::now();
         let mut last_progress = Instant::now();
-        // IO/MMIO access counters for debugging boot stalls.
-        let mut io_read_counts: HashMap<u16, u64> = HashMap::new();
-        let mut io_write_counts: HashMap<u16, u64> = HashMap::new();
         let mut mmio_count: u64 = 0;
-        let mut msr_count: u64 = 0;
-        let mut cpuid_count: u64 = 0;
+        let mut last_exit_reason = "none";
         let exit_code;
 
         loop {
@@ -252,7 +253,7 @@ mod imp {
                 match vcpu.interrupts_enabled() {
                     Ok(true) => {
                         if let Some(vector) = devices.pic.acknowledge() {
-                            log::trace!("Injecting interrupt vector {:#X}", vector);
+                            log::debug!("Injecting interrupt vector {:#X}", vector);
                             vcpu.inject_interrupt(vector)?;
                             devices.set_window_requested(false);
                         }
@@ -263,20 +264,38 @@ mod imp {
                             devices.set_window_requested(true);
                         }
                     }
-                    Err(_) => {}
+                    Err(ref e) => {
+                        log::warn!("interrupts_enabled() error: {:?}", e);
+                    }
                 }
             }
 
-            let exit = vcpu.run()?;
+            let exit = match vcpu.run() {
+                Ok(exit) => exit,
+                Err(e) => {
+                    log::error!(
+                        "vcpu.run() FAILED after {} exits: {:?}",
+                        exit_count,
+                        e
+                    );
+                    eprintln!(
+                        "[WHPX] vcpu.run() FAILED after {} exits: {:?}",
+                        exit_count, e
+                    );
+                    last_exit_reason = "VCPU_RUN_ERROR";
+                    exit_code = 1;
+                    break;
+                }
+            };
             exit_count += 1;
 
             match exit {
                 VcpuExit::IoOut { port, size, data } => {
                     halt_count = 0;
-                    *io_write_counts.entry(port).or_insert(0) += 1;
                     devices.handle_io_out(port, size, data);
                     if devices.shutdown_requested() {
                         log::info!("ACPI shutdown detected after {} exits", exit_count);
+                        last_exit_reason = "ACPI_SHUTDOWN";
                         exit_code = 0;
                         break;
                     }
@@ -284,7 +303,6 @@ mod imp {
                 }
                 VcpuExit::IoIn { port, size } => {
                     halt_count = 0;
-                    *io_read_counts.entry(port).or_insert(0) += 1;
                     let data = devices.handle_io_in(port, size);
                     vcpu.complete_io_in(data, size)?;
                 }
@@ -305,14 +323,40 @@ mod imp {
                     vcpu.skip_instruction()?;
                 }
                 VcpuExit::InterruptWindow => {
+                    halt_count = 0;
                     devices.set_window_requested(false);
                 }
                 VcpuExit::Halt => {
                     if !run_config.should_run() {
                         log::info!("VM stop requested, exiting on Halt");
+                        last_exit_reason = "HALT_STOP_REQUESTED";
                         exit_code = 0;
                         break;
                     }
+
+                    // Active HLT wake: poll devices before sleeping.
+                    // If an interrupt arrived (e.g. vsock data) while the guest
+                    // was halted, clear the HLT suspend state so the vCPU resumes
+                    // immediately. This prevents lost wakeups where the guest
+                    // sleeps through pending interrupts. Matches QEMU's WHPX
+                    // HLT handling strategy.
+                    devices.tick_and_poll(&mem_adapter);
+
+                    if devices.pic.has_pending() {
+                        log::debug!(
+                            "HLT with pending interrupt, clearing halt (exits={})",
+                            exit_count
+                        );
+                        if let Err(e) = vcpu.clear_halt() {
+                            log::warn!("clear_halt failed: {:?}", e);
+                            // Fall through to sleep (graceful degradation).
+                        } else {
+                            halt_count = 0;
+                            continue;
+                        }
+                    }
+
+                    // No pending interrupts — guest is genuinely idle.
                     halt_count += 1;
                     if halt_count > MAX_HALTS {
                         log::warn!(
@@ -320,6 +364,7 @@ mod imp {
                             halt_count,
                             exit_count
                         );
+                        last_exit_reason = "HALT_MAX_REACHED";
                         exit_code = 0;
                         break;
                     }
@@ -327,6 +372,7 @@ mod imp {
                 }
                 VcpuExit::Shutdown => {
                     log::info!("VM shutdown after {} exits", exit_count);
+                    last_exit_reason = "VM_SHUTDOWN";
                     exit_code = 0;
                     break;
                 }
@@ -334,6 +380,7 @@ mod imp {
                     // Timer thread or stop() cancelled vCPU. Check if we should exit.
                     if !run_config.should_run() {
                         log::info!("VM stop requested, exiting on Cancelled");
+                        last_exit_reason = "CANCELLED_STOP";
                         exit_code = 0;
                         break;
                     }
@@ -344,36 +391,8 @@ mod imp {
                             let console_len = devices::get_console_output(ctx_id)
                                 .map(|b| b.len())
                                 .unwrap_or(0);
-                            // Sort IO ports by frequency (descending), show all.
-                            let mut reads: Vec<_> = io_read_counts.iter().collect();
-                            reads.sort_by(|a, b| b.1.cmp(a.1));
-                            let top_reads: Vec<String> = reads
-                                .iter()
-                                .map(|(p, c)| format!("{:#X}:{}", p, c))
-                                .collect();
-                            let mut writes: Vec<_> = io_write_counts.iter().collect();
-                            writes.sort_by(|a, b| b.1.cmp(a.1));
-                            let top_writes: Vec<String> = writes
-                                .iter()
-                                .map(|(p, c)| format!("{:#X}:{}", p, c))
-                                .collect();
                             log::info!(
-                                "Progress @ {:.1}s: exits={} RIP={:#X} RSP={:#X} RFLAGS={:#X} console={}B \
-                                 mmio={} msr={} cpuid={}",
-                                start_time.elapsed().as_secs_f64(),
-                                exit_count,
-                                regs.rip,
-                                regs.rsp,
-                                regs.rflags,
-                                console_len,
-                                mmio_count,
-                                msr_count,
-                                cpuid_count,
-                            );
-                            log::info!("  IO_reads=[{}]", top_reads.join(", "));
-                            log::info!("  IO_writes=[{}]", top_writes.join(", "));
-                            eprintln!(
-                                "[WHPX] {:.1}s: exits={} RIP={:#X} console={}B mmio={}",
+                                "Progress @ {:.1}s: exits={} RIP={:#X} console={}B mmio={}",
                                 start_time.elapsed().as_secs_f64(),
                                 exit_count,
                                 regs.rip,
@@ -390,7 +409,6 @@ mod imp {
                     rdx,
                 } => {
                     halt_count = 0;
-                    msr_count += 1;
                     if is_write {
                         log::trace!(
                             "MSR write: 0x{:08X} <- 0x{:016X}",
@@ -412,7 +430,6 @@ mod imp {
                     default_rdx,
                 } => {
                     halt_count = 0;
-                    cpuid_count += 1;
                     let leaf = rax as u32;
                     // Mask hypervisor-related CPUID leaves to prevent the Linux
                     // guest from detecting Hyper-V and trying to use enlightenments
@@ -456,6 +473,7 @@ mod imp {
                         exit_count,
                         regs.as_ref().map_or(0, |r| r.rip),
                     );
+                    last_exit_reason = "TRIPLE_FAULT";
                     exit_code = -1;
                     break;
                 }
@@ -465,6 +483,7 @@ mod imp {
                         reason,
                         exit_count
                     );
+                    last_exit_reason = "UNKNOWN_EXIT";
                     exit_code = -1;
                     break;
                 }
@@ -472,6 +491,7 @@ mod imp {
 
             if exit_count >= MAX_EXITS {
                 log::warn!("Reached {} exit limit", MAX_EXITS);
+                last_exit_reason = "MAX_EXITS";
                 exit_code = -1;
                 break;
             }
@@ -481,8 +501,20 @@ mod imp {
         run_config.request_stop();
         let _ = timer_thread.join();
 
-        log::info!("VM exited with code {} ({} exits)", exit_code, exit_count);
-        eprintln!("[WHPX] VM exited, code={} exits={}", exit_code, exit_count);
+        log::info!(
+            "VM exited with code {} ({} exits), reason={}",
+            exit_code,
+            exit_count,
+            last_exit_reason
+        );
+        eprintln!(
+            "[WHPX] VM exited, code={} exits={} reason={} elapsed={:.1}s",
+            exit_code,
+            exit_count,
+            last_exit_reason,
+            start_time.elapsed().as_secs_f64(),
+        );
+
         Ok(exit_code)
     }
 

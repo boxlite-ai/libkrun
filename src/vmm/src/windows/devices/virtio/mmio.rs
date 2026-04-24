@@ -97,6 +97,7 @@ pub trait VirtioDeviceBackend {
     fn poll(&mut self, _queues: &mut [Virtqueue], _mem: &dyn GuestMemoryAccessor) -> bool {
         false
     }
+
 }
 
 /// Virtio-MMIO device wrapping a backend.

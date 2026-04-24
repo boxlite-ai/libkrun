@@ -147,6 +147,10 @@ impl VsockConnection {
         self.peer_buf_alloc = hdr.buf_alloc;
         self.peer_fwd_cnt = hdr.fwd_cnt;
         self.state = ConnState::Connected;
+        log::debug!(
+            "vsock conn ({},{}) → Connected (guest REQUEST, buf_alloc={})",
+            self.local_port, self.peer_port, hdr.buf_alloc
+        );
 
         Some(VsockHeader::new_response(
             self.local_cid,
@@ -184,6 +188,7 @@ impl VsockConnection {
 
     /// Handle a SHUTDOWN from the guest.
     pub fn handle_shutdown(&mut self, flags: u32) {
+        let old_state = self.state;
         match self.state {
             ConnState::Connected => {
                 if flags & (VSOCK_SHUTDOWN_SEND | VSOCK_SHUTDOWN_RECV)
@@ -199,10 +204,20 @@ impl VsockConnection {
             }
             _ => {}
         }
+        if self.state != old_state {
+            log::debug!(
+                "vsock conn ({},{}) → {:?} (SHUTDOWN flags=0x{:x})",
+                self.local_port, self.peer_port, self.state, flags
+            );
+        }
     }
 
     /// Handle a RST from the guest.
     pub fn handle_rst(&mut self) {
+        log::debug!(
+            "vsock conn ({},{}) → Closed (RST)",
+            self.local_port, self.peer_port
+        );
         self.state = ConnState::Closed;
     }
 
@@ -324,6 +339,10 @@ impl VsockConnection {
                     self.peer_buf_alloc = hdr.buf_alloc;
                     self.peer_fwd_cnt = hdr.fwd_cnt;
                     self.state = ConnState::Connected;
+                    log::debug!(
+                        "vsock conn ({},{}) → Connected (guest RESPONSE, buf_alloc={})",
+                        self.local_port, self.peer_port, hdr.buf_alloc
+                    );
                 }
                 (None, None)
             }

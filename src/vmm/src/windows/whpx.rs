@@ -560,7 +560,14 @@ mod imp {
                     std::mem::size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as u32,
                 )
             };
-            check_hresult("WHvRunVirtualProcessor", hr)?;
+            check_hresult("WHvRunVirtualProcessor", hr).map_err(|e| {
+                log::error!(
+                    "WHvRunVirtualProcessor FAILED: {:?} (HRESULT=0x{:08X})",
+                    e,
+                    hr as u32
+                );
+                e
+            })?;
 
             // Cache RIP from the VP context for skip_instruction/complete_io_in.
             self.exit_rip.set(exit_context.VpContext.Rip);
@@ -603,8 +610,31 @@ mod imp {
                 // Decode the faulting instruction to get access size and write data.
                 let byte_count = mem_ctx.InstructionByteCount as usize;
                 let insn_bytes = &mem_ctx.InstructionBytes[..byte_count.min(16)];
-                let regs = self.get_registers()?;
-                let insn = super::super::insn::decode_mmio_insn(insn_bytes, &regs)?;
+                let regs = self.get_registers().map_err(|e| {
+                    log::error!(
+                        "MMIO get_registers FAILED at GPA 0x{:x}: {:?}",
+                        address,
+                        e
+                    );
+                    e
+                })?;
+                let insn = match super::super::insn::decode_mmio_insn(insn_bytes, &regs) {
+                    Ok(insn) => insn,
+                    Err(e) => {
+                        log::error!(
+                            "MMIO decode FAILED at GPA 0x{:x}: {:?}, bytes: {:02x?}, is_write={}",
+                            address,
+                            e,
+                            insn_bytes,
+                            is_write
+                        );
+                        eprintln!(
+                            "[WHPX] MMIO decode FAILED at GPA 0x{:x}, bytes: {:02x?}",
+                            address, insn_bytes
+                        );
+                        return Err(e);
+                    }
+                };
 
                 self.exit_instruction_len.set(insn.len);
                 self.exit_mmio_gpr_index.set(insn.gpr_index);
@@ -903,6 +933,30 @@ mod imp {
                 )
             };
             check_hresult("WHvSetVirtualProcessorRegisters(interrupt_window)", hr)
+        }
+
+        /// Clear the HLT suspend state, waking the vCPU from halt.
+        ///
+        /// Uses `WHvRegisterInternalActivityState` to zero out suspend bits,
+        /// allowing the vCPU to resume execution (e.g., to process a pending
+        /// interrupt that arrived while halted). Matches QEMU's WHPX HLT
+        /// handling strategy.
+        pub fn clear_halt(&self) -> Result<()> {
+            // WHvRegisterInternalActivityState = 0x00040004
+            // Bits: 0=StartupSuspend, 1=HaltSuspend, 2=IdleSuspend
+            // Write 0 to clear all suspend states.
+            let names: [i32; 1] = [0x00040004_i32];
+            let values: Vec<WHV_REGISTER_VALUE> = vec![reg64(0)];
+            let hr = unsafe {
+                WHvSetVirtualProcessorRegisters(
+                    self.partition_handle,
+                    self.index,
+                    names.as_ptr(),
+                    1,
+                    values.as_ptr(),
+                )
+            };
+            check_hresult("WHvSetVirtualProcessorRegisters(clear_halt)", hr)
         }
 
         /// Cancel a running vCPU (causes it to exit with Cancelled).

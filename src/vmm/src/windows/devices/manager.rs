@@ -490,6 +490,7 @@ impl DeviceManager {
 
         // Poll vsock for host-initiated data.
         if self.virtio_vsock.poll(mem) {
+            log::debug!("vsock poll raised IRQ {}", irq_for_slot(1));
             self.pic.raise_irq(irq_for_slot(1));
         }
 
