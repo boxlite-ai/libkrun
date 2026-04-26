@@ -184,7 +184,20 @@ impl<D: VirtioDeviceBackend> VirtioMmioDevice<D> {
             INTERRUPT_STATUS => self.interrupt_status,
             STATUS => self.status,
             CONFIG_GENERATION => 0, // Config doesn't change dynamically.
-            off if off >= CONFIG_SPACE => self.backend.read_config(off - CONFIG_SPACE),
+            off if off >= CONFIG_SPACE => {
+                let config_offset = off - CONFIG_SPACE;
+                let aligned_offset = config_offset & !3;
+                let word = self.backend.read_config(aligned_offset);
+                if size == 4 {
+                    word
+                } else {
+                    // Byte/word access: extract the correct portion.
+                    // Config space is little-endian; byte N within the u32 is
+                    // at bits (N*8)..(N*8+8).
+                    let byte_index = (config_offset & 3) as u32;
+                    (word >> (byte_index * 8)) & ((1u32 << (size as u32 * 8)) - 1)
+                }
+            }
             _ => 0,
         }
     }
@@ -572,6 +585,27 @@ mod tests {
         let dev = VirtioMmioDevice::new(TestBackend::new());
         // Offset 0x100 = config space offset 0 → capacity low = 1024.
         assert_eq!(dev.read(CONFIG_SPACE, 4), 1024);
+    }
+
+    #[test]
+    fn test_config_space_byte_reads() {
+        // Simulates how the Linux virtio-mmio driver reads the MAC: one byte at a time.
+        // TestBackend returns 1024 (= 0x00000400) at config offset 0.
+        let dev = VirtioMmioDevice::new(TestBackend::new());
+        // 1024 as LE bytes: [0x00, 0x04, 0x00, 0x00]
+        assert_eq!(dev.read(CONFIG_SPACE + 0, 1), 0x00); // byte 0
+        assert_eq!(dev.read(CONFIG_SPACE + 1, 1), 0x04); // byte 1
+        assert_eq!(dev.read(CONFIG_SPACE + 2, 1), 0x00); // byte 2
+        assert_eq!(dev.read(CONFIG_SPACE + 3, 1), 0x00); // byte 3
+    }
+
+    #[test]
+    fn test_config_space_word_reads() {
+        let dev = VirtioMmioDevice::new(TestBackend::new());
+        // 1024 = 0x0400. Two-byte read at offset 0 should give 0x0400.
+        assert_eq!(dev.read(CONFIG_SPACE + 0, 2), 0x0400);
+        // Two-byte read at offset 2 should give 0x0000.
+        assert_eq!(dev.read(CONFIG_SPACE + 2, 2), 0x0000);
     }
 
     // --- Non-32-bit access ---

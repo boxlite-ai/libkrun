@@ -82,16 +82,92 @@ const PM1A_CNT_BLK: u16 = 0x604;
 /// Default vsock listen ports (BoxLite: 2695=gRPC, 2696=ready signal).
 const DEFAULT_VSOCK_PORTS: &[u32] = &[2695, 2696];
 
-/// CMOS register read values (static, read-only clock).
+/// Convert a value to BCD (Binary-Coded Decimal).
+/// E.g. 26 → 0x26, 59 → 0x59.
+fn to_bcd(val: u8) -> u8 {
+    ((val / 10) << 4) | (val % 10)
+}
+
+/// Snapshot of host UTC time, captured once at VM start and stored as
+/// BCD values for CMOS register reads.
+struct CmosTime {
+    seconds: u8,
+    minutes: u8,
+    hours: u8,
+    day_of_week: u8,
+    day_of_month: u8,
+    month: u8,
+    year: u8,    // Two-digit year in BCD (e.g. 0x26 for 2026)
+    century: u8, // Century in BCD (e.g. 0x20)
+}
+
+impl CmosTime {
+    /// Capture the current host UTC time.
+    fn now() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Break Unix timestamp into calendar components.
+        // Algorithm from Howard Hinnant's chrono-compatible date library.
+        let days = (secs / 86400) as i64;
+        let time_of_day = secs % 86400;
+
+        // Civil date from days since epoch (March-based, then adjusted).
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u64; // day of era [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+
+        let hour = (time_of_day / 3600) as u8;
+        let minute = ((time_of_day % 3600) / 60) as u8;
+        let second = (time_of_day % 60) as u8;
+
+        // Day of week: 1970-01-01 was Thursday (4). 1=Sun..7=Sat for CMOS.
+        let dow_zero = ((days % 7) + 4) % 7; // 0=Sun..6=Sat
+        let dow = dow_zero as u8 + 1; // 1=Sun..7=Sat
+
+        let year_full = y as u16;
+        let century = (year_full / 100) as u8;
+        let year_2digit = (year_full % 100) as u8;
+
+        Self {
+            seconds: to_bcd(second),
+            minutes: to_bcd(minute),
+            hours: to_bcd(hour),
+            day_of_week: to_bcd(dow),
+            day_of_month: to_bcd(d as u8),
+            month: to_bcd(m as u8),
+            year: to_bcd(year_2digit),
+            century: to_bcd(century),
+        }
+    }
+}
+
+/// Host time snapshot, captured once at process start.
+static CMOS_TIME: LazyLock<CmosTime> = LazyLock::new(CmosTime::now);
+
+/// CMOS register read values. Time fields use the host-UTC snapshot;
+/// everything else is static hardware description.
 fn cmos_read(addr: u8) -> u8 {
+    let t = &*CMOS_TIME;
     match addr {
-        0x00 => 0,    // Seconds
-        0x02 => 0,    // Minutes
-        0x04 => 12,   // Hours (12 noon)
-        0x06 => 3,    // Day of week (Wednesday)
-        0x07 => 1,    // Day of month
-        0x08 => 1,    // Month (January)
-        0x09 => 25,   // Year (2025)
+        0x00 => t.seconds,
+        0x02 => t.minutes,
+        0x04 => t.hours,
+        0x06 => t.day_of_week,
+        0x07 => t.day_of_month,
+        0x08 => t.month,
+        0x09 => t.year,
         0x0A => 0x26, // Status A: no update in progress, 32.768 kHz
         0x0B => 0x02, // Status B: 24-hour, BCD mode
         0x0C => 0x00, // Status C: no interrupt source
@@ -104,7 +180,7 @@ fn cmos_read(addr: u8) -> u8 {
         0x16 => 0x02, // Base memory high byte
         0x17 => 0x00, // Extended memory low (kernel uses E820)
         0x18 => 0x00, // Extended memory high
-        0x32 => 0x20, // Century (20xx)
+        0x32 => t.century,
         _ => 0x00,
     }
 }
@@ -672,13 +748,38 @@ mod tests {
     }
 
     #[test]
+    fn test_to_bcd() {
+        assert_eq!(to_bcd(0), 0x00);
+        assert_eq!(to_bcd(9), 0x09);
+        assert_eq!(to_bcd(10), 0x10);
+        assert_eq!(to_bcd(26), 0x26);
+        assert_eq!(to_bcd(59), 0x59);
+        assert_eq!(to_bcd(99), 0x99);
+    }
+
+    #[test]
+    fn test_cmos_time_now_is_reasonable() {
+        let t = CmosTime::now();
+        // Year should be 2025–2099 in BCD (0x25..0x99).
+        assert!(t.year >= 0x25, "year BCD too low: {:#04x}", t.year);
+        // Month 1..12 in BCD (0x01..0x12).
+        assert!(t.month >= 0x01 && t.month <= 0x12, "month: {:#04x}", t.month);
+        // Day 1..31 in BCD.
+        assert!(t.day_of_month >= 0x01 && t.day_of_month <= 0x31);
+        // Hours 0..23 in BCD.
+        assert!(t.hours <= 0x23);
+        // Century should be 0x20.
+        assert_eq!(t.century, 0x20);
+    }
+
+    #[test]
     fn test_cmos_read_via_io() {
         let mut dm = make_test_devices();
         // Select CMOS register 0x09 (year).
         dm.handle_io_out(0x70, 1, 0x09);
-        // Read CMOS data.
         let year = dm.handle_io_in(0x71, 1);
-        assert_eq!(year, 25); // 2025.
+        // Year must be valid BCD (>= 0x25 for 2025+).
+        assert!(year >= 0x25, "year BCD: {:#04x}", year);
     }
 
     #[test]
