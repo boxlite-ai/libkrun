@@ -181,6 +181,15 @@ impl VirtioVsock {
     /// Handle a packet from the guest.
     fn handle_guest_packet(&mut self, hdr: &VsockHeader, payload: &[u8]) {
         let key = (hdr.src_port, hdr.dst_port);
+        if !payload.is_empty() {
+            log::trace!(
+                "vsock TX: guest→host {} bytes, op={}, key=({},{})",
+                payload.len(),
+                hdr.op,
+                key.0,
+                key.1
+            );
+        }
 
         if hdr.op == VSOCK_OP_REQUEST {
             self.handle_connect_request(hdr);
@@ -420,7 +429,7 @@ impl VirtioVsock {
                 }
             }
 
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 65536];
             let data = if let Some(stream) = self.streams.get_mut(&key) {
                 match stream.read(&mut buf) {
                     Ok(0) => {
@@ -608,7 +617,16 @@ impl VirtioDeviceBackend for VirtioVsock {
         self.poll_tcp_listeners();
 
         // Poll TCP streams for incoming data.
+        let pending_before = self.rx_pending.len();
         self.poll_tcp_streams();
+        let new_data = self.rx_pending.len() - pending_before;
+        if new_data > 0 {
+            log::trace!(
+                "vsock poll: TCP produced {} new packets, total pending={}",
+                new_data,
+                self.rx_pending.len()
+            );
+        }
 
         // Inject any pending data into the RX queue.
         if queues.len() > RX_QUEUE {
