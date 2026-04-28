@@ -98,6 +98,19 @@ pub trait VirtioDeviceBackend {
         false
     }
 
+    /// Drain async I/O completions from a worker thread.
+    ///
+    /// Called from the vCPU run loop for devices with async backends
+    /// (e.g., virtio-blk with a worker thread). Returns `true` if
+    /// completions were processed and an interrupt should be raised.
+    /// Default: no async completions.
+    fn drain_completions(
+        &mut self,
+        _queues: &mut [Virtqueue],
+        _mem: &dyn GuestMemoryAccessor,
+    ) -> bool {
+        false
+    }
 }
 
 /// Virtio-MMIO device wrapping a backend.
@@ -288,6 +301,17 @@ impl<D: VirtioDeviceBackend> VirtioMmioDevice<D> {
     /// Returns `true` if an interrupt should be raised.
     pub fn poll(&mut self, mem: &dyn GuestMemoryAccessor) -> bool {
         let raised = self.backend.poll(&mut self.queues, mem);
+        if raised {
+            self.interrupt_status |= INTERRUPT_USED_RING;
+        }
+        raised
+    }
+
+    /// Drain async I/O completions from the backend's worker thread.
+    ///
+    /// Returns `true` if completions were processed (interrupt should be raised).
+    pub fn poll_backend(&mut self, mem: &dyn GuestMemoryAccessor) -> bool {
+        let raised = self.backend.drain_completions(&mut self.queues, mem);
         if raised {
             self.interrupt_status |= INTERRUPT_USED_RING;
         }

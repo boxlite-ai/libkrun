@@ -17,7 +17,7 @@ pub const DISK_FORMAT_QCOW2: u32 = 1;
 ///
 /// Backends translate guest sector reads/writes to the underlying
 /// storage format (raw file, qcow2 image, etc.).
-pub trait DiskBackend {
+pub trait DiskBackend: Send {
     /// Read `buf.len()` bytes starting at `offset` into `buf`.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
 

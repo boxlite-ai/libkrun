@@ -548,6 +548,35 @@ impl DeviceManager {
         }
     }
 
+    /// Start async block I/O workers for virtio-blk devices.
+    ///
+    /// Must be called after the guest memory is set up, before the vCPU loop.
+    pub fn start_blk_workers<M: GuestMemoryAccessor + Send + Sync + 'static>(
+        &mut self,
+        guest_mem: Arc<M>,
+    ) {
+        if let Some(ref mut dev) = self.virtio_blk {
+            dev.backend_mut()
+                .start_worker(Arc::clone(&guest_mem), "blk-worker-0");
+        }
+        if let Some(ref mut dev) = self.virtio_blk2 {
+            dev.backend_mut()
+                .start_worker(Arc::clone(&guest_mem), "blk-worker-1");
+        }
+    }
+
+    /// Stop async block I/O workers.
+    ///
+    /// Called during shutdown. Also called by Drop if not explicitly called.
+    pub fn stop_blk_workers(&mut self) {
+        if let Some(ref mut dev) = self.virtio_blk {
+            dev.backend_mut().stop_worker();
+        }
+        if let Some(ref mut dev) = self.virtio_blk2 {
+            dev.backend_mut().stop_worker();
+        }
+    }
+
     /// Tick the PIT timer based on wall clock time and poll devices.
     ///
     /// Call this at the top of each vCPU run loop iteration.
@@ -561,6 +590,18 @@ impl DeviceManager {
             let fires = self.pit.tick(elapsed_ns);
             for _ in 0..fires {
                 self.pic.raise_irq(0);
+            }
+        }
+
+        // Drain async block I/O completions.
+        if let Some(ref mut dev) = self.virtio_blk {
+            if dev.poll_backend(mem) {
+                self.pic.raise_irq(irq_for_slot(0));
+            }
+        }
+        if let Some(ref mut dev) = self.virtio_blk2 {
+            if dev.poll_backend(mem) {
+                self.pic.raise_irq(irq_for_slot(4));
             }
         }
 

@@ -8,6 +8,7 @@
 //! - virtio-net: network device (userspace proxy via passt/gvproxy)
 
 pub mod block;
+pub mod block_worker;
 pub mod disk;
 pub mod mmio;
 pub mod net;

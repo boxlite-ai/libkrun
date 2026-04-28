@@ -25,15 +25,16 @@ mod imp {
     use super::super::vcpu::VcpuRunConfig;
     use super::super::whpx::{VcpuCanceller, WhpxPartition, WhpxVcpu};
 
-    /// Adapter to implement GuestMemoryAccessor for GuestMemory.
-    struct GuestMemoryAdapter<'a>(&'a GuestMemory);
-
-    impl GuestMemoryAccessor for GuestMemoryAdapter<'_> {
+    /// Implement GuestMemoryAccessor directly on GuestMemory.
+    ///
+    /// This allows `Arc<GuestMemory>` to be passed to block worker threads
+    /// (GuestMemory is Send+Sync since its regions are Send+Sync).
+    impl GuestMemoryAccessor for GuestMemory {
         fn read_at(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
-            self.0.read_at_addr(addr, buf)
+            self.read_at_addr(addr, buf)
         }
         fn write_at(&self, addr: u64, data: &[u8]) -> Result<()> {
-            self.0.write_at_addr(addr, data)
+            self.write_at_addr(addr, data)
         }
     }
 
@@ -166,14 +167,20 @@ mod imp {
             ));
         }
 
-        // Create partition (no APIC emulation — avoids crash on some Win10 hardware).
+        // Create partition.
         let partition = WhpxPartition::new()?;
         partition.set_processor_count(ctx.num_vcpus as u32)?;
         partition.set_extended_vm_exits(true, true)?;
+
+        // NOTE: Do NOT enable APIC emulation here. On Win10 MBP 2014,
+        // set_local_apic_emulation(true) returns success but then the APIC
+        // doesn't function — no interrupts get delivered and the kernel hangs
+        // before producing any console output. Software PIC is required.
+
         partition.setup()?;
 
-        // Allocate and map guest memory.
-        let guest_mem = GuestMemory::new(ctx.ram_mib)?;
+        // Allocate and map guest memory (Arc for sharing with block worker threads).
+        let guest_mem = Arc::new(GuestMemory::new(ctx.ram_mib)?);
         guest_mem.map_to_partition(&partition)?;
 
         // Create devices from context.
@@ -181,6 +188,13 @@ mod imp {
         let setup = DeviceManager::from_context(&ctx)?;
         devices::store_console_buffer(ctx_id, setup.console_buffer);
         let mut devices = setup.devices;
+
+        // NOTE: Async block workers are NOT started on Windows/WHPX.
+        // The worker thread writes to guest memory from a non-vCPU thread,
+        // which conflicts with WHPX's memory tracking and causes ~60% boot
+        // failure rate on Win10. Sync disk I/O is reliable (100% pass rate)
+        // and sufficient for typical workloads.
+        // devices.start_blk_workers(guest_mem.clone());
 
         // Build kernel command line.
         let cmdline = build_kernel_cmdline(
@@ -234,10 +248,12 @@ mod imp {
             }
         });
 
-        // vCPU run loop.
-        let mem_adapter = GuestMemoryAdapter(&guest_mem);
+        // vCPU run loop — GuestMemory implements GuestMemoryAccessor directly.
+        let mem_ref: &GuestMemory = &guest_mem;
         let mut exit_count: u64 = 0;
         let mut halt_count: u64 = 0;
+        let mut total_halt_exits: u64 = 0;
+        let mut halt_with_irq: u64 = 0;
         let start_time = Instant::now();
         let mut last_progress = Instant::now();
         let mut mmio_count: u64 = 0;
@@ -246,7 +262,7 @@ mod imp {
 
         loop {
             // Tick PIT and poll devices.
-            devices.tick_and_poll(&mem_adapter);
+            devices.tick_and_poll(mem_ref);
 
             // Try to inject pending interrupt.
             if devices.pic.has_pending() {
@@ -319,7 +335,7 @@ mod imp {
                 } => {
                     halt_count = 0;
                     mmio_count += 1;
-                    devices.handle_mmio_write(address, size, data, &mem_adapter);
+                    devices.handle_mmio_write(address, size, data, mem_ref);
                     vcpu.skip_instruction()?;
                 }
                 VcpuExit::InterruptWindow => {
@@ -327,6 +343,7 @@ mod imp {
                     devices.set_window_requested(false);
                 }
                 VcpuExit::Halt => {
+                    total_halt_exits += 1;
                     if !run_config.should_run() {
                         log::info!("VM stop requested, exiting on Halt");
                         last_exit_reason = "HALT_STOP_REQUESTED";
@@ -334,35 +351,58 @@ mod imp {
                         break;
                     }
 
-                    // Active HLT wake: poll devices before sleeping.
-                    // If an interrupt arrived (e.g. vsock data) while the guest
-                    // was halted, clear the HLT suspend state so the vCPU resumes
-                    // immediately. This prevents lost wakeups where the guest
-                    // sleeps through pending interrupts. Matches QEMU's WHPX
-                    // HLT handling strategy.
-                    devices.tick_and_poll(&mem_adapter);
+                    // Poll devices before sleeping — a pending interrupt may
+                    // have arrived (e.g. PIT tick, vsock data) while the guest
+                    // was halted.
+                    devices.tick_and_poll(mem_ref);
 
                     if devices.pic.has_pending() {
-                        log::debug!(
-                            "HLT with pending interrupt, clearing halt (exits={})",
-                            exit_count
-                        );
-                        if let Err(e) = vcpu.clear_halt() {
-                            log::warn!("clear_halt failed: {:?}", e);
-                            // Fall through to sleep (graceful degradation).
-                        } else {
-                            halt_count = 0;
-                            continue;
+                        if let Some(vector) = devices.pic.acknowledge() {
+                            vcpu.inject_interrupt(vector)?;
+                            devices.set_window_requested(false);
                         }
+                        halt_with_irq += 1;
+                        halt_count = 0;
+                        continue;
                     }
 
                     // No pending interrupts — guest is genuinely idle.
                     halt_count += 1;
+
+                    // Log diagnostic info every 1000 consecutive halts
+                    if halt_count % 1000 == 0 {
+                        if let Ok(regs) = vcpu.get_registers() {
+                            let console_len = devices::get_console_output(ctx_id)
+                                .map(|b| b.len())
+                                .unwrap_or(0);
+                            let if_flag = vcpu.interrupts_enabled().unwrap_or(false);
+                            eprintln!(
+                                "[WHPX] HLT stuck: consecutive={} total_halt={} halt_with_irq={} \
+                                 exits={} RIP={:#X} RFLAGS={:#X} IF={} console={}B mmio={}",
+                                halt_count, total_halt_exits, halt_with_irq,
+                                exit_count, regs.rip, regs.rflags,
+                                if_flag, console_len, mmio_count
+                            );
+                        }
+                    }
+
                     if halt_count > MAX_HALTS {
+                        if let Ok(regs) = vcpu.get_registers() {
+                            let console_len = devices::get_console_output(ctx_id)
+                                .map(|b| b.len())
+                                .unwrap_or(0);
+                            eprintln!(
+                                "[WHPX] HALT_MAX: consecutive={} total_halt={} halt_with_irq={} \
+                                 exits={} RIP={:#X} console={}B mmio={}",
+                                halt_count, total_halt_exits, halt_with_irq,
+                                exit_count, regs.rip, console_len, mmio_count
+                            );
+                        }
                         log::warn!(
-                            "vCPU halted {} times consecutively after {} exits",
-                            halt_count,
-                            exit_count
+                            "vCPU halted {} times consecutively after {} exits \
+                             (total_halt={}, halt_with_irq={})",
+                            halt_count, exit_count,
+                            total_halt_exits, halt_with_irq
                         );
                         last_exit_reason = "HALT_MAX_REACHED";
                         exit_code = 0;
@@ -497,8 +537,9 @@ mod imp {
             }
         }
 
-        // Stop the timer thread.
+        // Stop the timer thread and block I/O workers.
         run_config.request_stop();
+        devices.stop_blk_workers();
         let _ = timer_thread.join();
 
         log::info!(

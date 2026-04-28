@@ -904,6 +904,52 @@ mod imp {
             check_hresult("WHvSetVirtualProcessorRegisters(inject_interrupt)", hr)
         }
 
+        /// Deliver an interrupt via the partition-level WHvRequestInterrupt API.
+        ///
+        /// Unlike [`inject_interrupt`] (which sets WHvRegisterPendingInterruption),
+        /// this API delivers the interrupt at the partition level and — critically —
+        /// resets the vCPU's HLT suspend state on platforms where
+        /// WHvRegisterInternalActivityState is inaccessible (Win10).
+        ///
+        /// Uses Fixed delivery, edge-triggered, physical destination mode.
+        /// Returns Ok(true) if the interrupt was delivered, Ok(false) if the
+        /// API returned an error (caller should fall back to inject_interrupt).
+        pub fn request_interrupt(&self, vector: u8) -> Result<bool> {
+            // WHV_INTERRUPT_CONTROL layout (from Hyper-V TLFS / Windows SDK):
+            //   _bitfield (u64):
+            //     bits  0-31: InterruptType (u32) — 0 = Fixed
+            //     bit     32: LevelTriggered — 0 = edge
+            //     bit     33: LogicalDestinationMode — 0 = physical
+            //     bits 34-63: Reserved (0)
+            //   Destination (u32): target vCPU index
+            //   Vector (u32): interrupt vector
+            let interrupt = WHV_INTERRUPT_CONTROL {
+                _bitfield: 0, // Fixed=0, edge-triggered=0, physical=0
+                Destination: self.index,
+                Vector: vector as u32,
+            };
+            let hr = unsafe {
+                WHvRequestInterrupt(
+                    self.partition_handle,
+                    &interrupt,
+                    std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
+                )
+            };
+            if hr == 0 {
+                Ok(true)
+            } else {
+                // Log at warn level (not debug) so it's visible at RUST_LOG=info.
+                // This is a critical diagnostic — if WHvRequestInterrupt fails,
+                // the vCPU may not wake from HLT on Win10.
+                log::warn!(
+                    "WHvRequestInterrupt failed: HRESULT=0x{:08X}, vector={}",
+                    hr as u32,
+                    vector
+                );
+                Ok(false)
+            }
+        }
+
         /// Check if the guest has interrupts enabled (RFLAGS.IF = 1).
         pub fn interrupts_enabled(&self) -> Result<bool> {
             let regs = self.get_registers()?;
@@ -933,30 +979,6 @@ mod imp {
                 )
             };
             check_hresult("WHvSetVirtualProcessorRegisters(interrupt_window)", hr)
-        }
-
-        /// Clear the HLT suspend state, waking the vCPU from halt.
-        ///
-        /// Uses `WHvRegisterInternalActivityState` to zero out suspend bits,
-        /// allowing the vCPU to resume execution (e.g., to process a pending
-        /// interrupt that arrived while halted). Matches QEMU's WHPX HLT
-        /// handling strategy.
-        pub fn clear_halt(&self) -> Result<()> {
-            // WHvRegisterInternalActivityState = 0x00040004
-            // Bits: 0=StartupSuspend, 1=HaltSuspend, 2=IdleSuspend
-            // Write 0 to clear all suspend states.
-            let names: [i32; 1] = [0x00040004_i32];
-            let values: Vec<WHV_REGISTER_VALUE> = vec![reg64(0)];
-            let hr = unsafe {
-                WHvSetVirtualProcessorRegisters(
-                    self.partition_handle,
-                    self.index,
-                    names.as_ptr(),
-                    1,
-                    values.as_ptr(),
-                )
-            };
-            check_hresult("WHvSetVirtualProcessorRegisters(clear_halt)", hr)
         }
 
         /// Cancel a running vCPU (causes it to exit with Cancelled).
