@@ -11,13 +11,14 @@
 mod imp {
     use std::collections::HashMap;
     use std::io::Write as IoWrite;
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     use super::super::boot::loader::load_kernel_with_initrd;
     use super::super::cmdline::build_kernel_cmdline;
     use super::super::context::VmContext;
+    use super::super::devices::lapic::IpiAction;
     use super::super::devices::manager::{self as devices, DeviceManager};
     use super::super::devices::virtio::queue::GuestMemoryAccessor;
     use super::super::error::{Result, WkrunError};
@@ -53,6 +54,32 @@ mod imp {
     /// loop whenever there are no interrupts; this is normal and does
     /// NOT indicate the VM is stuck.
     const MAX_HALTS: u64 = 50_000;
+
+    /// Per-AP (Application Processor) startup state.
+    ///
+    /// Each AP thread waits on its condvar until the BSP delivers an
+    /// INIT-SIPI-SIPI sequence via the LAPIC ICR register.
+    struct ApStartupState {
+        /// Whether this AP has received SIPI and should start executing.
+        started: Mutex<bool>,
+        /// Condvar to wake the AP thread when SIPI arrives.
+        condvar: Condvar,
+        /// SIPI vector — the AP starts executing at `vector * 0x1000`.
+        sipi_vector: Mutex<Option<u8>>,
+        /// Whether INIT has been received (prerequisite for SIPI).
+        init_received: AtomicBool,
+    }
+
+    impl ApStartupState {
+        fn new() -> Self {
+            Self {
+                started: Mutex::new(false),
+                condvar: Condvar::new(),
+                sipi_vector: Mutex::new(None),
+                init_received: AtomicBool::new(false),
+            }
+        }
+    }
 
     /// Handle for a running VM, stored in `RUNNING_VMS`.
     struct VmHandle {
@@ -213,7 +240,7 @@ mod imp {
         let ctx_id = ctx.id;
         let setup = DeviceManager::from_context(&ctx)?;
         devices::store_console_buffer(ctx_id, setup.console_buffer);
-        let mut devices = setup.devices;
+        let devices = setup.devices;
 
         // NOTE: Block I/O workers are started lazily (deferred start) inside
         // the vCPU loop, on the first MMIO write. Starting them here (before
@@ -235,8 +262,14 @@ mod imp {
 
         // Load kernel.
         let initrd_ref = initrd_data.as_deref();
-        let (regs, sregs) =
-            load_kernel_with_initrd(&guest_mem, &kernel_image, &cmdline, ctx.ram_mib, initrd_ref)?;
+        let (regs, sregs) = load_kernel_with_initrd(
+            &guest_mem,
+            &kernel_image,
+            &cmdline,
+            ctx.ram_mib,
+            initrd_ref,
+            ctx.num_vcpus,
+        )?;
 
         log::info!(
             "Kernel loaded at 0x100000, RIP=0x{:X}, cmdline: {}",
@@ -254,272 +287,507 @@ mod imp {
         );
         diag!("Kernel loaded, RIP={:#X}, ram={}MB", regs.rip, ctx.ram_mib);
 
-        // Create vCPU and set registers.
-        let vcpu = WhpxVcpu::new(&partition, 0)?;
-        vcpu.set_registers(&regs)?;
-        vcpu.set_special_registers(&sregs)?;
-
-        // Store canceller so stop() can wake the vCPU.
-        *canceller_slot.lock().unwrap() = Some(vcpu.canceller());
-
-        // Spawn timer thread for PIT interrupt delivery.
-        // Uses run_config.running so that request_stop() stops both the timer
-        // and the vCPU loop.
-        let timer_flag = run_config.running.clone();
-        let canceller = vcpu.canceller();
-        let timer_thread = std::thread::spawn(move || {
-            while timer_flag.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(1));
-                let _ = canceller.cancel();
+        // Create all vCPUs. BSP (index 0) gets the boot registers.
+        // APs (index 1..N-1) are created but start in "wait for SIPI" state.
+        let num_vcpus = ctx.num_vcpus;
+        let mut vcpus = Vec::with_capacity(num_vcpus as usize);
+        for i in 0..num_vcpus as u32 {
+            let vcpu = WhpxVcpu::new(&partition, i)?;
+            if i == 0 {
+                vcpu.set_registers(&regs)?;
+                vcpu.set_special_registers(&sregs)?;
             }
-        });
+            vcpus.push(vcpu);
+        }
 
-        // vCPU run loop — GuestMemory implements GuestMemoryAccessor directly.
-        let mem_ref: &GuestMemory = &guest_mem;
-        let mut exit_count: u64 = 0;
-        let mut halt_count: u64 = 0;
-        let mut total_halt_exits: u64 = 0;
-        let mut halt_with_irq: u64 = 0;
-        let start_time = Instant::now();
-        let mut last_progress = Instant::now();
-        let mut mmio_count: u64 = 0;
+        // Collect cancellers for all vCPUs. The timer thread and stop()
+        // need to be able to wake any vCPU.
+        let cancellers: Vec<VcpuCanceller> = vcpus.iter().map(|v| v.canceller()).collect();
+
+        // Store BSP canceller so stop() can wake the VM.
+        *canceller_slot.lock().unwrap() = Some(cancellers[0].clone());
+
+        // Create per-AP startup state (one per AP, indexed by ap_id - 1).
+        let ap_states: Vec<ApStartupState> = (1..num_vcpus).map(|_| ApStartupState::new()).collect();
+
+        // Shared VM shutdown flag — set by any vCPU to signal all others to exit.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let devices = Arc::new(Mutex::new(devices));
+
+        // Move diag_log into shared state for BSP diagnostics.
+        let diag_log = Arc::new(Mutex::new(diag_log));
+
+        log::info!(
+            "Starting VM with {} vCPU(s), ctx_id={}",
+            num_vcpus,
+            ctx_id,
+        );
+        eprintln!("[WHPX] Starting {} vCPU(s)", num_vcpus);
+
+        let mut exit_code = 1i32;
+
+        // Use thread::scope so all vCPU threads are guaranteed to terminate
+        // before we clean up resources. The BSP runs in the scoped block;
+        // APs are spawned as scoped threads.
+        {
+            let shutdown_ref = &shutdown;
+            let devices_ref = &devices;
+            let ap_states_ref = &ap_states;
+            let cancellers_ref = &cancellers;
+            let run_config_ref = &run_config;
+            let guest_mem_ref: &GuestMemory = &guest_mem;
+            let diag_ref = &diag_log;
+
+            // Spawn timer thread — cancels ALL vCPUs every 1ms.
+            let timer_flag = run_config.running.clone();
+            let timer_cancellers: Vec<VcpuCanceller> = cancellers.clone();
+            let timer_shutdown = shutdown.clone();
+            let timer_thread = std::thread::spawn(move || {
+                while timer_flag.load(Ordering::Relaxed) && !timer_shutdown.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                    for c in &timer_cancellers {
+                        let _ = c.cancel();
+                    }
+                }
+            });
+
+            std::thread::scope(|s| {
+                // Spawn AP threads (vCPU 1..N-1).
+                for ap_idx in 1..num_vcpus as usize {
+                    let vcpu = &vcpus[ap_idx];
+                    s.spawn(move || {
+                        run_ap_loop(
+                            ap_idx as u8,
+                            num_vcpus,
+                            vcpu,
+                            devices_ref,
+                            guest_mem_ref,
+                            shutdown_ref,
+                            run_config_ref,
+                            cancellers_ref,
+                            &ap_states_ref[ap_idx - 1],
+                            ctx_id,
+                        );
+                    });
+                }
+
+                // BSP runs on the current thread.
+                let bsp_vcpu = &vcpus[0];
+                let bsp_code = run_bsp_loop(
+                    bsp_vcpu,
+                    devices_ref,
+                    guest_mem_ref,
+                    shutdown_ref,
+                    run_config_ref,
+                    cancellers_ref,
+                    ap_states_ref,
+                    ctx_id,
+                    diag_ref,
+                    num_vcpus,
+                );
+                // BSP exited — signal all APs to exit.
+                shutdown_ref.store(true, Ordering::Release);
+                for c in cancellers_ref {
+                    let _ = c.cancel();
+                }
+                // Wake any APs still waiting for SIPI.
+                for ap in ap_states_ref {
+                    *ap.started.lock().unwrap() = true;
+                    ap.condvar.notify_one();
+                }
+                exit_code = bsp_code;
+            });
+
+            // Stop the timer thread and block I/O workers.
+            run_config.request_stop();
+            shutdown.store(true, Ordering::Release);
+            devices.lock().unwrap().stop_blk_workers();
+            let _ = timer_thread.join();
+        }
+
+        log::info!("VM exited with code {}", exit_code);
+        eprintln!("[WHPX] VM exited, code={}", exit_code);
+
+        Ok(exit_code)
+    }
+
+    /// Per-vCPU statistics counters.
+    struct VcpuStats {
+        exit_count: u64,
+        halt_count: u64,
+        total_halt_exits: u64,
+        halt_with_irq: u64,
+        mmio_count: u64,
+        serial_out_count: u64,
+        io_out_count: u64,
+        io_in_count: u64,
+        inject_count: u64,
+        last_progress: Instant,
+        start_time: Instant,
+        window_requested: bool,
+    }
+
+    impl VcpuStats {
+        fn new() -> Self {
+            let now = Instant::now();
+            Self {
+                exit_count: 0,
+                halt_count: 0,
+                total_halt_exits: 0,
+                halt_with_irq: 0,
+                mmio_count: 0,
+                serial_out_count: 0,
+                io_out_count: 0,
+                io_in_count: 0,
+                inject_count: 0,
+                last_progress: now,
+                start_time: now,
+                window_requested: false,
+            }
+        }
+    }
+
+    /// Try to inject a pending interrupt into a vCPU.
+    ///
+    /// Returns the number of interrupts injected (0 or 1).
+    fn try_inject_interrupt(
+        vcpu: &WhpxVcpu,
+        vcpu_id: u8,
+        devices: &mut DeviceManager,
+        stats: &mut VcpuStats,
+    ) -> Result<()> {
+        if !devices.irq_chip.has_pending(vcpu_id) {
+            return Ok(());
+        }
+
+        let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
+        if already_pending {
+            return Ok(());
+        }
+
+        match vcpu.interrupts_enabled() {
+            Ok(true) => {
+                if let Some(vector) = devices.irq_chip.acknowledge(vcpu_id) {
+                    log::debug!("vCPU{}: injecting interrupt vector {:#X}", vcpu_id, vector);
+                    vcpu.inject_interrupt(vector)?;
+                    devices.irq_chip.notify_injected(vcpu_id, vector);
+                    stats.window_requested = false;
+                    stats.inject_count += 1;
+                }
+            }
+            Ok(false) => {
+                if !stats.window_requested {
+                    vcpu.request_interrupt_window()?;
+                    stats.window_requested = true;
+                }
+            }
+            Err(ref e) => {
+                log::warn!("vCPU{}: interrupts_enabled() error: {:?}", vcpu_id, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispatch an IPI action from a LAPIC ICR write.
+    fn dispatch_ipi(
+        action: IpiAction,
+        devices: &mut DeviceManager,
+        ap_states: &[ApStartupState],
+        cancellers: &[VcpuCanceller],
+    ) {
+        match action {
+            IpiAction::None => {}
+            IpiAction::SendInit { target_apic_id } => {
+                let ap_idx = target_apic_id as usize;
+                if ap_idx > 0 && ap_idx - 1 < ap_states.len() {
+                    ap_states[ap_idx - 1]
+                        .init_received
+                        .store(true, Ordering::Release);
+                    log::info!("INIT delivered to AP{}", target_apic_id);
+                }
+            }
+            IpiAction::SendSipi {
+                target_apic_id,
+                vector,
+            } => {
+                let ap_idx = target_apic_id as usize;
+                if ap_idx > 0 && ap_idx - 1 < ap_states.len() {
+                    let state = &ap_states[ap_idx - 1];
+                    if state.init_received.load(Ordering::Acquire) {
+                        *state.sipi_vector.lock().unwrap() = Some(vector);
+                        *state.started.lock().unwrap() = true;
+                        state.condvar.notify_one();
+                        log::info!(
+                            "SIPI delivered to AP{}: start at {:#X}",
+                            target_apic_id,
+                            (vector as u64) * 0x1000
+                        );
+                    } else {
+                        log::warn!(
+                            "SIPI to AP{} ignored (no INIT received)",
+                            target_apic_id,
+                        );
+                    }
+                }
+            }
+            IpiAction::SendInterrupt {
+                target_apic_id,
+                vector,
+            } => {
+                devices
+                    .irq_chip
+                    .deliver_ipi_interrupt(target_apic_id, vector);
+                let idx = target_apic_id as usize;
+                if idx < cancellers.len() {
+                    let _ = cancellers[idx].cancel();
+                }
+                log::debug!(
+                    "IPI interrupt vector {:#X} delivered to vCPU{}",
+                    vector,
+                    target_apic_id,
+                );
+            }
+        }
+    }
+
+    /// BSP (Bootstrap Processor, vCPU 0) main loop.
+    ///
+    /// Handles timer ticking, device polling, interrupt injection, block worker
+    /// start, IPI dispatch, and progress diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    fn run_bsp_loop(
+        vcpu: &WhpxVcpu,
+        devices: &Arc<Mutex<DeviceManager>>,
+        guest_mem: &GuestMemory,
+        shutdown: &AtomicBool,
+        run_config: &VcpuRunConfig,
+        cancellers: &[VcpuCanceller],
+        ap_states: &[ApStartupState],
+        ctx_id: u32,
+        diag_log: &Arc<Mutex<Option<std::fs::File>>>,
+        num_vcpus: u8,
+    ) -> i32 {
+        macro_rules! diag {
+            ($($arg:tt)*) => {
+                if let Ok(mut guard) = diag_log.lock() {
+                    if let Some(ref mut f) = *guard {
+                        let _ = writeln!(f, $($arg)*);
+                        let _ = f.flush();
+                    }
+                }
+            };
+        }
+
+        let mut stats = VcpuStats::new();
         let mut blk_workers_started = false;
         let sync_block = std::env::var("BOXLITE_SYNC_BLOCK").is_ok();
-        let mut serial_out_count: u64 = 0;
-        let mut io_out_count: u64 = 0;
-        let mut io_in_count: u64 = 0;
-        let mut inject_count: u64 = 0;
-        let mut last_exit_reason = "none";
-        let exit_code;
+        let mut _last_exit_reason = "none";
 
         loop {
-            // Tick PIT and poll devices.
-            devices.tick_and_poll(mem_ref);
+            if shutdown.load(Ordering::Relaxed) || !run_config.should_run() {
+                _last_exit_reason = "SHUTDOWN_SIGNAL";
+                return 0;
+            }
 
-            // Try to inject pending interrupt.
-            // CRITICAL: Do NOT acknowledge a new PIC interrupt if a previous
-            // injection is still pending in WHPX.  Overwriting the pending
-            // interruption register would lose the old interrupt and leave
-            // its PIC ISR bit permanently stuck (guest never sends EOI).
-            if devices.irq_chip.has_pending() {
-                let already_pending = vcpu
-                    .has_pending_interruption()
-                    .unwrap_or(false);
-                if already_pending {
-                    // Previous interrupt not yet delivered — skip this cycle.
-                } else {
-                    match vcpu.interrupts_enabled() {
-                        Ok(true) => {
-                            if let Some(vector) = devices.irq_chip.acknowledge() {
-                                log::debug!("Injecting interrupt vector {:#X}", vector);
-                                vcpu.inject_interrupt(vector)?;
-                                devices.irq_chip.notify_injected(vector);
-                                devices.set_window_requested(false);
-                                inject_count += 1;
-                            }
-                        }
-                        Ok(false) => {
-                            if !devices.window_requested() {
-                                vcpu.request_interrupt_window()?;
-                                devices.set_window_requested(true);
-                            }
-                        }
-                        Err(ref e) => {
-                            log::warn!("interrupts_enabled() error: {:?}", e);
-                        }
-                    }
+            // Tick PIT and poll devices (BSP only).
+            {
+                let mut dm = devices.lock().unwrap();
+                dm.tick_and_poll(0, guest_mem);
+                // Try to inject pending interrupt.
+                if let Err(e) = try_inject_interrupt(vcpu, 0, &mut dm, &mut stats) {
+                    log::error!("BSP interrupt injection error: {:?}", e);
                 }
             }
 
             let exit = match vcpu.run() {
                 Ok(exit) => exit,
                 Err(e) => {
-                    log::error!(
-                        "vcpu.run() FAILED after {} exits: {:?}",
-                        exit_count,
-                        e
-                    );
-                    eprintln!(
-                        "[WHPX] vcpu.run() FAILED after {} exits: {:?}",
-                        exit_count, e
-                    );
-                    last_exit_reason = "VCPU_RUN_ERROR";
-                    exit_code = 1;
-                    break;
+                    log::error!("BSP vcpu.run() FAILED after {} exits: {:?}", stats.exit_count, e);
+                    eprintln!("[WHPX] BSP vcpu.run() FAILED after {} exits: {:?}", stats.exit_count, e);
+                    return 1;
                 }
             };
-            exit_count += 1;
+            stats.exit_count += 1;
 
             match exit {
                 VcpuExit::IoOut { port, size, data } => {
-                    halt_count = 0;
-                    io_out_count += 1;
+                    stats.halt_count = 0;
+                    stats.io_out_count += 1;
                     if port == 0x3F8 {
-                        serial_out_count += 1;
+                        stats.serial_out_count += 1;
                     }
-                    devices.handle_io_out(port, size, data);
-                    if devices.shutdown_requested() {
-                        log::info!("ACPI shutdown detected after {} exits", exit_count);
-                        last_exit_reason = "ACPI_SHUTDOWN";
-                        exit_code = 0;
-                        break;
+                    let mut dm = devices.lock().unwrap();
+                    dm.handle_io_out(port, size, data);
+                    if dm.shutdown_requested() {
+                        log::info!("ACPI shutdown detected after {} exits", stats.exit_count);
+                        _last_exit_reason = "ACPI_SHUTDOWN";
+                        return 0;
                     }
-                    vcpu.skip_instruction()?;
+                    drop(dm);
+                    if let Err(e) = vcpu.skip_instruction() {
+                        log::error!("BSP skip_instruction error: {:?}", e);
+                        return 1;
+                    }
                 }
                 VcpuExit::IoIn { port, size } => {
-                    halt_count = 0;
-                    io_in_count += 1;
-                    let data = devices.handle_io_in(port, size);
-                    vcpu.complete_io_in(data, size)?;
+                    stats.halt_count = 0;
+                    stats.io_in_count += 1;
+                    let data = devices.lock().unwrap().handle_io_in(port, size);
+                    if let Err(e) = vcpu.complete_io_in(data, size) {
+                        log::error!("BSP complete_io_in error: {:?}", e);
+                        return 1;
+                    }
                 }
                 VcpuExit::MmioRead { address, size } => {
-                    halt_count = 0;
-                    mmio_count += 1;
-                    let data = devices.handle_mmio_read(address, size);
-                    vcpu.complete_mmio_read(data)?;
+                    stats.halt_count = 0;
+                    stats.mmio_count += 1;
+                    let data = devices.lock().unwrap().handle_mmio_read(0, address, size);
+                    if let Err(e) = vcpu.complete_mmio_read(data) {
+                        log::error!("BSP complete_mmio_read error: {:?}", e);
+                        return 1;
+                    }
                 }
                 VcpuExit::MmioWrite {
                     address,
                     size,
                     data,
                 } => {
-                    halt_count = 0;
-                    mmio_count += 1;
-                    // Deferred start: spawn block I/O workers on first MMIO
-                    // write (after vCPU is running). If BOXLITE_SYNC_BLOCK is
-                    // set, skip workers entirely (sync disk I/O for A/B testing).
+                    stats.halt_count = 0;
+                    stats.mmio_count += 1;
+                    let mut dm = devices.lock().unwrap();
                     if !blk_workers_started && !sync_block {
-                        devices.start_blk_workers();
+                        dm.start_blk_workers();
                         blk_workers_started = true;
                         let msg = format!(
                             "Block workers started at exit={} mmio={} elapsed={:.1}ms",
-                            exit_count, mmio_count, start_time.elapsed().as_secs_f64() * 1000.0
+                            stats.exit_count,
+                            stats.mmio_count,
+                            stats.start_time.elapsed().as_secs_f64() * 1000.0
                         );
                         eprintln!("[WHPX] {}", msg);
                         diag!("{}", msg);
                     }
-                    devices.handle_mmio_write(address, size, data, mem_ref);
-                    vcpu.skip_instruction()?;
+                    let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
+                    // Dispatch IPI if this was an ICR write.
+                    if !matches!(ipi_action, IpiAction::None) {
+                        dispatch_ipi(ipi_action, &mut dm, ap_states, cancellers);
+                    }
+                    drop(dm);
+                    if let Err(e) = vcpu.skip_instruction() {
+                        log::error!("BSP skip_instruction error: {:?}", e);
+                        return 1;
+                    }
                 }
                 VcpuExit::InterruptWindow => {
-                    halt_count = 0;
-                    devices.set_window_requested(false);
+                    stats.halt_count = 0;
+                    stats.window_requested = false;
                 }
                 VcpuExit::Halt => {
-                    total_halt_exits += 1;
-                    if !run_config.should_run() {
-                        log::info!("VM stop requested, exiting on Halt");
-                        last_exit_reason = "HALT_STOP_REQUESTED";
-                        exit_code = 0;
-                        break;
+                    stats.total_halt_exits += 1;
+                    if !run_config.should_run() || shutdown.load(Ordering::Relaxed) {
+                        log::info!("BSP: stop requested, exiting on Halt");
+                        return 0;
                     }
 
-                    // Poll devices before sleeping — a pending interrupt may
-                    // have arrived (e.g. PIT tick, vsock data) while the guest
-                    // was halted.
-                    devices.tick_and_poll(mem_ref);
-
-                    if devices.irq_chip.has_pending() {
-                        let already_pending = vcpu
-                            .has_pending_interruption()
-                            .unwrap_or(false);
-                        if !already_pending {
-                            if let Some(vector) = devices.irq_chip.acknowledge() {
-                                vcpu.inject_interrupt(vector)?;
-                                devices.irq_chip.notify_injected(vector);
-                                devices.set_window_requested(false);
-                                inject_count += 1;
+                    // Poll devices before sleeping.
+                    {
+                        let mut dm = devices.lock().unwrap();
+                        dm.tick_and_poll(0, guest_mem);
+                        if dm.irq_chip.has_pending(0) {
+                            let already_pending =
+                                vcpu.has_pending_interruption().unwrap_or(false);
+                            if !already_pending {
+                                if let Some(vector) = dm.irq_chip.acknowledge(0) {
+                                    let _ = vcpu.inject_interrupt(vector);
+                                    dm.irq_chip.notify_injected(0, vector);
+                                    stats.window_requested = false;
+                                    stats.inject_count += 1;
+                                }
                             }
+                            stats.halt_with_irq += 1;
+                            stats.halt_count = 0;
+                            continue;
                         }
-                        halt_with_irq += 1;
-                        halt_count = 0;
-                        continue;
                     }
 
-                    // No pending interrupts — guest is genuinely idle.
-                    halt_count += 1;
+                    stats.halt_count += 1;
 
-                    // Log diagnostic info every 1000 consecutive halts
-                    if halt_count % 1000 == 0 {
+                    if stats.halt_count % 1000 == 0 {
                         if let Ok(regs) = vcpu.get_registers() {
                             let console_len = devices::get_console_output(ctx_id)
                                 .map(|b| b.len())
                                 .unwrap_or(0);
                             let if_flag = vcpu.interrupts_enabled().unwrap_or(false);
                             eprintln!(
-                                "[WHPX] HLT stuck: consecutive={} total_halt={} halt_with_irq={} \
-                                 exits={} RIP={:#X} RFLAGS={:#X} IF={} console={}B mmio={}",
-                                halt_count, total_halt_exits, halt_with_irq,
-                                exit_count, regs.rip, regs.rflags,
-                                if_flag, console_len, mmio_count
+                                "[WHPX] BSP HLT stuck: consecutive={} total_halt={} halt_with_irq={} \
+                                 exits={} RIP={:#X} RFLAGS={:#X} IF={} console={}B mmio={} vcpus={}",
+                                stats.halt_count, stats.total_halt_exits, stats.halt_with_irq,
+                                stats.exit_count, regs.rip, regs.rflags,
+                                if_flag, console_len, stats.mmio_count, num_vcpus
                             );
                         }
                     }
 
-                    if halt_count > MAX_HALTS {
+                    if stats.halt_count > MAX_HALTS {
                         if let Ok(regs) = vcpu.get_registers() {
                             let console_len = devices::get_console_output(ctx_id)
                                 .map(|b| b.len())
                                 .unwrap_or(0);
                             eprintln!(
-                                "[WHPX] HALT_MAX: consecutive={} total_halt={} halt_with_irq={} \
+                                "[WHPX] BSP HALT_MAX: consecutive={} total_halt={} halt_with_irq={} \
                                  exits={} RIP={:#X} console={}B mmio={}",
-                                halt_count, total_halt_exits, halt_with_irq,
-                                exit_count, regs.rip, console_len, mmio_count
+                                stats.halt_count, stats.total_halt_exits, stats.halt_with_irq,
+                                stats.exit_count, regs.rip, console_len, stats.mmio_count
                             );
                         }
                         log::warn!(
-                            "vCPU halted {} times consecutively after {} exits \
-                             (total_halt={}, halt_with_irq={})",
-                            halt_count, exit_count,
-                            total_halt_exits, halt_with_irq
+                            "BSP halted {} times consecutively after {} exits",
+                            stats.halt_count,
+                            stats.exit_count,
                         );
-                        last_exit_reason = "HALT_MAX_REACHED";
-                        exit_code = 0;
-                        break;
+                        _last_exit_reason = "HALT_MAX_REACHED";
+                        return 0;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 VcpuExit::Shutdown => {
-                    log::info!("VM shutdown after {} exits", exit_count);
-                    last_exit_reason = "VM_SHUTDOWN";
-                    exit_code = 0;
-                    break;
+                    log::info!("BSP: VM shutdown after {} exits", stats.exit_count);
+                    return 0;
                 }
                 VcpuExit::Cancelled => {
-                    // Timer thread or stop() cancelled vCPU. Check if we should exit.
-                    if !run_config.should_run() {
-                        log::info!("VM stop requested, exiting on Cancelled");
-                        last_exit_reason = "CANCELLED_STOP";
-                        exit_code = 0;
-                        break;
+                    if !run_config.should_run() || shutdown.load(Ordering::Relaxed) {
+                        log::info!("BSP: stop requested on Cancelled");
+                        return 0;
                     }
-                    // Wall-clock progress report every 2 seconds.
-                    if last_progress.elapsed() >= Duration::from_secs(2) {
-                        last_progress = Instant::now();
+                    if stats.last_progress.elapsed() >= Duration::from_secs(2) {
+                        stats.last_progress = Instant::now();
                         if let Ok(regs) = vcpu.get_registers() {
+                            let dm = devices.lock().unwrap();
                             let console_len = devices::get_console_output(ctx_id)
                                 .map(|b| b.len())
                                 .unwrap_or(0);
-                            let (qn, bc) = devices.blk_stats();
-                            let (ioapic_mmio, lapic_mmio) = devices.apic_mmio_stats();
-                            let (irr, isr, imr, vbase) = devices.irq_chip.pic_master_state();
-                            let (s_irr, s_isr, s_imr, s_vbase) = devices.irq_chip.pic_slave_state();
-                            let apic_mode = devices.irq_chip.apic_mode();
+                            let (qn, bc) = dm.blk_stats();
+                            let (ioapic_mmio, lapic_mmio) = dm.apic_mmio_stats();
+                            let (irr, isr, imr, vbase) = dm.irq_chip.pic_master_state();
+                            let (s_irr, s_isr, s_imr, s_vbase) = dm.irq_chip.pic_slave_state();
+                            let apic_mode = dm.irq_chip.apic_mode();
                             let msg = format!(
-                                "Progress @ {:.1}s: exits={} RIP={:#X} console={}B io_out={} serial={} mmio={} blk_qn={} blk_comp={} halt={}/{} halt_w_irq={} inj={} ioapic_mmio={} lapic_mmio={} pic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} spic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} irq={} mode={}",
-                                start_time.elapsed().as_secs_f64(),
-                                exit_count, regs.rip, console_len,
-                                io_out_count, serial_out_count,
-                                mmio_count, qn, bc,
-                                halt_count, total_halt_exits,
-                                halt_with_irq, inject_count,
+                                "BSP @ {:.1}s: exits={} RIP={:#X} console={}B io_out={} serial={} mmio={} blk_qn={} blk_comp={} halt={}/{} halt_w_irq={} inj={} ioapic_mmio={} lapic_mmio={} pic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} spic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} irq={} mode={} vcpus={}",
+                                stats.start_time.elapsed().as_secs_f64(),
+                                stats.exit_count, regs.rip, console_len,
+                                stats.io_out_count, stats.serial_out_count,
+                                stats.mmio_count, qn, bc,
+                                stats.halt_count, stats.total_halt_exits,
+                                stats.halt_with_irq, stats.inject_count,
                                 ioapic_mmio, lapic_mmio,
                                 irr, isr, imr, vbase,
                                 s_irr, s_isr, s_imr, s_vbase,
                                 if apic_mode { "apic" } else { "pic" },
                                 if sync_block { "sync" } else if blk_workers_started { "async" } else { "pending" },
+                                num_vcpus,
                             );
+                            drop(dm);
                             log::info!("{}", msg);
                             eprintln!("[WHPX] {}", msg);
                             diag!("{}", msg);
@@ -532,17 +800,24 @@ mod imp {
                     rax,
                     rdx,
                 } => {
-                    halt_count = 0;
+                    stats.halt_count = 0;
                     if is_write {
                         log::trace!(
-                            "MSR write: 0x{:08X} <- 0x{:016X}",
+                            "BSP: MSR write 0x{:08X} <- 0x{:016X}",
                             msr_number,
                             (rdx << 32) | (rax & 0xFFFF_FFFF)
                         );
-                        vcpu.skip_instruction()?;
+                        if let Err(e) = vcpu.skip_instruction() {
+                            log::error!("BSP skip_instruction error: {:?}", e);
+                            return 1;
+                        }
                     } else {
-                        log::trace!("MSR read: 0x{:08X} -> 0", msr_number);
-                        vcpu.complete_msr_read(0)?;
+                        let value = super::handle_msr_read(0, msr_number);
+                        log::trace!("BSP: MSR read 0x{:08X} -> 0x{:X}", msr_number, value);
+                        if let Err(e) = vcpu.complete_msr_read(value) {
+                            log::error!("BSP complete_msr_read error: {:?}", e);
+                            return 1;
+                        }
                     }
                 }
                 VcpuExit::CpuidAccess {
@@ -553,39 +828,34 @@ mod imp {
                     default_rcx,
                     default_rdx,
                 } => {
-                    halt_count = 0;
-                    let leaf = rax as u32;
-                    // Mask hypervisor-related CPUID leaves to prevent the Linux
-                    // guest from detecting Hyper-V and trying to use enlightenments
-                    // (synthetic timers, SynIC, TSC page) that our WHPX partition
-                    // doesn't fully support.
-                    let (out_rax, out_rbx, out_rcx, out_rdx) = match leaf {
-                        // Leaf 1: clear "hypervisor present" bit (ECX bit 31).
-                        1 => (
-                            default_rax,
-                            default_rbx,
-                            default_rcx & !(1u64 << 31),
-                            default_rdx,
-                        ),
-                        // Hyper-V CPUID range: return zeros (no hypervisor features).
-                        0x40000000..=0x400000FF => (0, 0, 0, 0),
-                        _ => (default_rax, default_rbx, default_rcx, default_rdx),
-                    };
+                    stats.halt_count = 0;
+                    let (out_rax, out_rbx, out_rcx, out_rdx) = super::handle_cpuid(
+                        0,
+                        num_vcpus,
+                        rax as u32,
+                        default_rax,
+                        default_rbx,
+                        default_rcx,
+                        default_rdx,
+                    );
                     log::trace!(
-                        "CPUID leaf=0x{:X} sub=0x{:X} -> rax=0x{:X}",
+                        "BSP CPUID leaf=0x{:X} sub=0x{:X} -> rax=0x{:X}",
                         rax,
                         rcx,
                         out_rax
                     );
-                    vcpu.complete_cpuid(out_rax, out_rbx, out_rcx, out_rdx)?;
+                    if let Err(e) = vcpu.complete_cpuid(out_rax, out_rbx, out_rcx, out_rdx) {
+                        log::error!("BSP complete_cpuid error: {:?}", e);
+                        return 1;
+                    }
                 }
                 VcpuExit::UnrecoverableException => {
                     let regs = vcpu.get_registers().ok();
                     let sregs = vcpu.get_special_registers().ok();
                     log::error!(
-                        "Unrecoverable exception (triple fault) after {} exits. \
+                        "BSP: Unrecoverable exception after {} exits. \
                          RIP={:#X}, CR0={:#X}, CR3={:#X}, CR4={:#X}, EFER={:#X}",
-                        exit_count,
+                        stats.exit_count,
                         regs.as_ref().map_or(0, |r| r.rip),
                         sregs.as_ref().map_or(0, |s| s.cr0),
                         sregs.as_ref().map_or(0, |s| s.cr3),
@@ -593,56 +863,288 @@ mod imp {
                         sregs.as_ref().map_or(0, |s| s.efer),
                     );
                     eprintln!(
-                        "[WHPX] TRIPLE FAULT after {} exits, RIP={:#X}",
-                        exit_count,
+                        "[WHPX] BSP TRIPLE FAULT after {} exits, RIP={:#X}",
+                        stats.exit_count,
                         regs.as_ref().map_or(0, |r| r.rip),
                     );
-                    last_exit_reason = "TRIPLE_FAULT";
-                    exit_code = -1;
-                    break;
+                    return -1;
                 }
                 VcpuExit::Unknown(reason) => {
-                    log::error!(
-                        "Unknown vCPU exit reason {} after {} exits",
-                        reason,
-                        exit_count
-                    );
-                    last_exit_reason = "UNKNOWN_EXIT";
-                    exit_code = -1;
-                    break;
+                    log::error!("BSP: Unknown exit reason {} after {} exits", reason, stats.exit_count);
+                    return -1;
                 }
             }
 
-            if exit_count >= MAX_EXITS {
-                log::warn!("Reached {} exit limit", MAX_EXITS);
-                last_exit_reason = "MAX_EXITS";
-                exit_code = -1;
-                break;
+            if stats.exit_count >= MAX_EXITS {
+                log::warn!("BSP reached {} exit limit", MAX_EXITS);
+                return -1;
+            }
+        }
+    }
+
+    /// AP (Application Processor, vCPU 1..N-1) loop.
+    ///
+    /// Waits for SIPI, configures initial registers, then runs a vCPU loop
+    /// similar to BSP but without timer ticking or block worker management.
+    #[allow(clippy::too_many_arguments)]
+    fn run_ap_loop(
+        ap_id: u8,
+        num_vcpus: u8,
+        vcpu: &WhpxVcpu,
+        devices: &Arc<Mutex<DeviceManager>>,
+        guest_mem: &GuestMemory,
+        shutdown: &AtomicBool,
+        run_config: &VcpuRunConfig,
+        cancellers: &[VcpuCanceller],
+        startup: &ApStartupState,
+        _ctx_id: u32,
+    ) {
+        // Wait for SIPI from BSP.
+        {
+            let mut started = startup.started.lock().unwrap();
+            while !*started {
+                started = startup.condvar.wait(started).unwrap();
             }
         }
 
-        // Stop the timer thread and block I/O workers.
-        run_config.request_stop();
-        devices.stop_blk_workers();
-        let _ = timer_thread.join();
+        // Check if we were woken for shutdown rather than SIPI.
+        if shutdown.load(Ordering::Relaxed) {
+            log::info!("AP{}: woken for shutdown, not SIPI", ap_id);
+            return;
+        }
 
+        // Configure AP initial register state from SIPI vector.
+        let sipi_vector = startup.sipi_vector.lock().unwrap().unwrap_or(0);
         log::info!(
-            "VM exited with code {} ({} exits), reason={}",
-            exit_code,
-            exit_count,
-            last_exit_reason
+            "AP{}: SIPI received, starting at vector={:#X} ({:#X})",
+            ap_id,
+            sipi_vector,
+            (sipi_vector as u64) * 0x1000
         );
-        let exit_msg = format!(
-            "VM exited, code={} exits={} reason={} io_out={} serial={} io_in={} mmio={} halt={}/{} elapsed={:.1}s",
-            exit_code, exit_count, last_exit_reason,
-            io_out_count, serial_out_count, io_in_count,
-            mmio_count, total_halt_exits, halt_with_irq,
-            start_time.elapsed().as_secs_f64(),
-        );
-        eprintln!("[WHPX] {}", exit_msg);
-        diag!("{}", exit_msg);
 
-        Ok(exit_code)
+        // AP starts in real mode: CS:IP = (sipi_vector * 0x100):0x0000
+        // The Linux kernel SMP trampoline is placed at sipi_vector * 0x1000.
+        if let Err(e) = vcpu.set_ap_initial_regs(sipi_vector, ap_id) {
+            log::error!("AP{}: failed to set initial registers: {:?}", ap_id, e);
+            return;
+        }
+
+        let mut stats = VcpuStats::new();
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) || !run_config.should_run() {
+                log::info!("AP{}: shutdown signal received", ap_id);
+                return;
+            }
+
+            // Try to inject pending interrupt (no timer ticking for APs).
+            {
+                let mut dm = devices.lock().unwrap();
+                if let Err(e) = try_inject_interrupt(vcpu, ap_id, &mut dm, &mut stats) {
+                    log::error!("AP{}: interrupt injection error: {:?}", ap_id, e);
+                }
+            }
+
+            let exit = match vcpu.run() {
+                Ok(exit) => exit,
+                Err(e) => {
+                    log::error!(
+                        "AP{}: vcpu.run() FAILED after {} exits: {:?}",
+                        ap_id,
+                        stats.exit_count,
+                        e
+                    );
+                    return;
+                }
+            };
+            stats.exit_count += 1;
+
+            match exit {
+                VcpuExit::IoOut { port, size, data } => {
+                    stats.halt_count = 0;
+                    stats.io_out_count += 1;
+                    let mut dm = devices.lock().unwrap();
+                    dm.handle_io_out(port, size, data);
+                    if dm.shutdown_requested() {
+                        log::info!("AP{}: ACPI shutdown detected", ap_id);
+                        shutdown.store(true, Ordering::Release);
+                        for c in cancellers {
+                            let _ = c.cancel();
+                        }
+                        return;
+                    }
+                    drop(dm);
+                    let _ = vcpu.skip_instruction();
+                }
+                VcpuExit::IoIn { port, size } => {
+                    stats.halt_count = 0;
+                    stats.io_in_count += 1;
+                    let data = devices.lock().unwrap().handle_io_in(port, size);
+                    let _ = vcpu.complete_io_in(data, size);
+                }
+                VcpuExit::MmioRead { address, size } => {
+                    stats.halt_count = 0;
+                    stats.mmio_count += 1;
+                    let data = devices.lock().unwrap().handle_mmio_read(ap_id, address, size);
+                    let _ = vcpu.complete_mmio_read(data);
+                }
+                VcpuExit::MmioWrite {
+                    address,
+                    size,
+                    data,
+                } => {
+                    stats.halt_count = 0;
+                    stats.mmio_count += 1;
+                    let mut dm = devices.lock().unwrap();
+                    let ipi_action = dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
+                    if !matches!(ipi_action, IpiAction::None) {
+                        // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
+                        dispatch_ipi(ipi_action, &mut dm, &[], cancellers);
+                    }
+                    drop(dm);
+                    let _ = vcpu.skip_instruction();
+                }
+                VcpuExit::InterruptWindow => {
+                    stats.halt_count = 0;
+                    stats.window_requested = false;
+                }
+                VcpuExit::Halt => {
+                    stats.total_halt_exits += 1;
+                    if shutdown.load(Ordering::Relaxed) || !run_config.should_run() {
+                        log::info!("AP{}: stop requested on Halt", ap_id);
+                        return;
+                    }
+
+                    // Check for pending interrupts.
+                    {
+                        let mut dm = devices.lock().unwrap();
+                        if dm.irq_chip.has_pending(ap_id) {
+                            let already_pending =
+                                vcpu.has_pending_interruption().unwrap_or(false);
+                            if !already_pending {
+                                if let Some(vector) = dm.irq_chip.acknowledge(ap_id) {
+                                    let _ = vcpu.inject_interrupt(vector);
+                                    dm.irq_chip.notify_injected(ap_id, vector);
+                                    stats.window_requested = false;
+                                    stats.inject_count += 1;
+                                }
+                            }
+                            stats.halt_with_irq += 1;
+                            stats.halt_count = 0;
+                            continue;
+                        }
+                    }
+
+                    stats.halt_count += 1;
+
+                    if stats.halt_count > MAX_HALTS {
+                        log::info!(
+                            "AP{}: halted {} times, idling (not treated as fatal)",
+                            ap_id,
+                            stats.halt_count,
+                        );
+                        // APs can idle indefinitely — the kernel may park them.
+                        // Don't exit, just keep waiting for interrupts.
+                        stats.halt_count = 0;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                VcpuExit::Shutdown => {
+                    log::info!("AP{}: shutdown after {} exits", ap_id, stats.exit_count);
+                    return;
+                }
+                VcpuExit::Cancelled => {
+                    if shutdown.load(Ordering::Relaxed) || !run_config.should_run() {
+                        log::info!("AP{}: stop requested on Cancelled", ap_id);
+                        return;
+                    }
+                }
+                VcpuExit::MsrAccess {
+                    msr_number,
+                    is_write,
+                    rax,
+                    rdx,
+                } => {
+                    stats.halt_count = 0;
+                    if is_write {
+                        log::trace!(
+                            "AP{}: MSR write 0x{:08X} <- 0x{:016X}",
+                            ap_id,
+                            msr_number,
+                            (rdx << 32) | (rax & 0xFFFF_FFFF)
+                        );
+                        if let Err(e) = vcpu.skip_instruction() {
+                            log::error!("AP{} skip_instruction error: {:?}", ap_id, e);
+                            return;
+                        }
+                    } else {
+                        let value = super::handle_msr_read(ap_id, msr_number);
+                        log::trace!(
+                            "AP{}: MSR read 0x{:08X} -> 0x{:X}",
+                            ap_id,
+                            msr_number,
+                            value
+                        );
+                        if let Err(e) = vcpu.complete_msr_read(value) {
+                            log::error!("AP{} complete_msr_read error: {:?}", ap_id, e);
+                            return;
+                        }
+                    }
+                }
+                VcpuExit::CpuidAccess {
+                    rax,
+                    rcx,
+                    default_rax,
+                    default_rbx,
+                    default_rcx,
+                    default_rdx,
+                } => {
+                    stats.halt_count = 0;
+                    let (out_rax, out_rbx, out_rcx, out_rdx) = super::handle_cpuid(
+                        ap_id,
+                        num_vcpus,
+                        rax as u32,
+                        default_rax,
+                        default_rbx,
+                        default_rcx,
+                        default_rdx,
+                    );
+                    log::trace!(
+                        "AP{} CPUID leaf=0x{:X} sub=0x{:X} -> rax=0x{:X}",
+                        ap_id,
+                        rax,
+                        rcx,
+                        out_rax
+                    );
+                    if let Err(e) = vcpu.complete_cpuid(out_rax, out_rbx, out_rcx, out_rdx) {
+                        log::error!("AP{} complete_cpuid error: {:?}", ap_id, e);
+                        return;
+                    }
+                }
+                VcpuExit::UnrecoverableException => {
+                    log::error!(
+                        "AP{}: triple fault after {} exits",
+                        ap_id,
+                        stats.exit_count
+                    );
+                    return;
+                }
+                VcpuExit::Unknown(reason) => {
+                    log::error!(
+                        "AP{}: unknown exit reason {} after {} exits",
+                        ap_id,
+                        reason,
+                        stats.exit_count
+                    );
+                    return;
+                }
+            }
+
+            if stats.exit_count >= MAX_EXITS {
+                log::warn!("AP{}: reached {} exit limit", ap_id, MAX_EXITS);
+                return;
+            }
+        }
     }
 
     /// Run a VM synchronously on the calling thread (blocking).
@@ -764,6 +1266,59 @@ pub fn stop(_ctx_id: u32) -> super::error::Result<()> {
     Err(super::error::WkrunError::Config(
         "VM runner is only available on Windows".into(),
     ))
+}
+
+/// Handle CPUID exit for any vCPU.
+///
+/// Injects CPU topology info into leaf 1 and masks Hyper-V leaves.
+/// This is a pure function (no side effects) for testability.
+fn handle_cpuid(
+    vcpu_id: u8,
+    num_vcpus: u8,
+    leaf: u32,
+    default_rax: u64,
+    default_rbx: u64,
+    default_rcx: u64,
+    default_rdx: u64,
+) -> (u64, u64, u64, u64) {
+    match leaf {
+        // Leaf 1: feature info + topology.
+        // EBX[23:16] = max number of addressable APIC IDs (num_vcpus)
+        // EBX[31:24] = initial APIC ID (vcpu_id)
+        // ECX bit 31: clear "hypervisor present"
+        1 => {
+            let mut ebx = default_rbx;
+            // Clear bits 31:16, then set topology fields.
+            ebx &= 0xFFFF_FFFF_0000_FFFF;
+            ebx |= (num_vcpus as u64) << 16; // max APIC IDs
+            ebx |= (vcpu_id as u64) << 24; // initial APIC ID
+            (
+                default_rax,
+                ebx,
+                default_rcx & !(1u64 << 31), // clear hypervisor present
+                default_rdx,
+            )
+        }
+        // Hyper-V CPUID range: return zeros.
+        0x40000000..=0x400000FF => (0, 0, 0, 0),
+        _ => (default_rax, default_rbx, default_rcx, default_rdx),
+    }
+}
+
+/// Handle MSR read for any vCPU.
+///
+/// Returns the value to inject for the given MSR.
+/// IA32_APIC_BASE (0x1B) returns the APIC base address with enable + BSP bits.
+fn handle_msr_read(vcpu_id: u8, msr_number: u32) -> u64 {
+    if msr_number == 0x1B {
+        let mut val: u64 = 0xFEE0_0000 | (1 << 11); // APIC base + enable bit
+        if vcpu_id == 0 {
+            val |= 1 << 8; // BSP flag
+        }
+        val
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -903,5 +1458,90 @@ mod tests {
             let result = stop(ctx_id);
             assert!(result.is_err());
         }
+    }
+
+    // --- handle_cpuid tests ---
+
+    #[test]
+    fn test_cpuid_leaf1_topology_bsp() {
+        // BSP (vcpu 0) with 2 vCPUs.
+        let (rax, rbx, rcx, rdx) =
+            super::handle_cpuid(0, 2, 1, 0x1234, 0x0000_0000_0000_5678, 0x8000_0001, 0xABCD);
+        // EBX[23:16] = num_vcpus = 2, EBX[31:24] = vcpu_id = 0
+        assert_eq!(rbx & 0x00FF_0000, 0x0002_0000, "EBX[23:16] should be 2");
+        assert_eq!(rbx & 0xFF00_0000, 0x0000_0000, "EBX[31:24] should be 0 for BSP");
+        // EBX[15:0] preserved from default
+        assert_eq!(rbx & 0xFFFF, 0x5678, "EBX[15:0] should be preserved");
+        // ECX bit 31 (hypervisor present) must be cleared
+        assert_eq!(rcx & (1 << 31), 0, "hypervisor present bit must be cleared");
+        // RAX and RDX pass through
+        assert_eq!(rax, 0x1234);
+        assert_eq!(rdx, 0xABCD);
+    }
+
+    #[test]
+    fn test_cpuid_leaf1_topology_ap() {
+        // AP (vcpu 3) with 4 vCPUs.
+        let (_, rbx, _, _) =
+            super::handle_cpuid(3, 4, 1, 0, 0, 0, 0);
+        assert_eq!(
+            (rbx >> 16) & 0xFF,
+            4,
+            "EBX[23:16] should be num_vcpus=4"
+        );
+        assert_eq!(
+            (rbx >> 24) & 0xFF,
+            3,
+            "EBX[31:24] should be vcpu_id=3"
+        );
+    }
+
+    #[test]
+    fn test_cpuid_hyperv_leaves_zeroed() {
+        // Hyper-V CPUID range should return all zeros.
+        for leaf in [0x40000000u32, 0x40000001, 0x400000FF] {
+            let (rax, rbx, rcx, rdx) =
+                super::handle_cpuid(0, 1, leaf, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D);
+            assert_eq!((rax, rbx, rcx, rdx), (0, 0, 0, 0), "Hyper-V leaf 0x{:X} must be zeroed", leaf);
+        }
+    }
+
+    #[test]
+    fn test_cpuid_passthrough_other_leaves() {
+        // Non-special leaves should pass through defaults unchanged.
+        let (rax, rbx, rcx, rdx) =
+            super::handle_cpuid(0, 2, 0, 0x1111, 0x2222, 0x3333, 0x4444);
+        assert_eq!((rax, rbx, rcx, rdx), (0x1111, 0x2222, 0x3333, 0x4444));
+
+        let (rax, rbx, rcx, rdx) =
+            super::handle_cpuid(0, 2, 7, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
+        assert_eq!((rax, rbx, rcx, rdx), (0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD));
+    }
+
+    // --- handle_msr_read tests ---
+
+    #[test]
+    fn test_msr_apic_base_bsp() {
+        // BSP should have enable + BSP flag.
+        let val = super::handle_msr_read(0, 0x1B);
+        assert_eq!(val & 0xFFFFF000, 0xFEE0_0000, "APIC base address");
+        assert_ne!(val & (1 << 11), 0, "APIC enable bit must be set");
+        assert_ne!(val & (1 << 8), 0, "BSP flag must be set for vcpu 0");
+    }
+
+    #[test]
+    fn test_msr_apic_base_ap() {
+        // AP should have enable but NOT BSP flag.
+        let val = super::handle_msr_read(1, 0x1B);
+        assert_eq!(val & 0xFFFFF000, 0xFEE0_0000, "APIC base address");
+        assert_ne!(val & (1 << 11), 0, "APIC enable bit must be set");
+        assert_eq!(val & (1 << 8), 0, "BSP flag must NOT be set for AP");
+    }
+
+    #[test]
+    fn test_msr_unknown_returns_zero() {
+        // Unknown MSR should return 0.
+        assert_eq!(super::handle_msr_read(0, 0x174), 0);
+        assert_eq!(super::handle_msr_read(1, 0xC000_0080), 0);
     }
 }

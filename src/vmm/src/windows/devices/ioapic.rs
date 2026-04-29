@@ -131,12 +131,12 @@ impl IoApic {
         }
     }
 
-    /// Process an IRQ signal. Returns the vector to deliver if the interrupt
+    /// Process an IRQ signal. Returns `(vector, dest_apic_id)` if the interrupt
     /// is deliverable, or None if masked/blocked.
     ///
     /// - Edge-triggered: deliver if not masked, set pin state.
     /// - Level-triggered: deliver if not masked AND remote_irr not set.
-    pub fn service_irq(&mut self, irq: u8, level: bool) -> Option<u8> {
+    pub fn service_irq(&mut self, irq: u8, level: bool) -> Option<(u8, u8)> {
         if irq as usize >= NUM_PINS {
             return None;
         }
@@ -163,7 +163,7 @@ impl IoApic {
         }
         // Edge-triggered: always deliver (if not masked).
 
-        Some(entry.vector)
+        Some((entry.vector, entry.dest))
     }
 
     /// Handle End-of-Interrupt for a given vector.
@@ -327,26 +327,26 @@ mod tests {
     fn test_ioapic_edge_triggered_delivery() {
         let mut ioapic = IoApic::new();
 
-        // Configure pin 5: edge-triggered, vector 0x25, unmasked.
+        // Configure pin 5: edge-triggered, vector 0x25, dest 0, unmasked.
         ioapic.entries[5].vector = 0x25;
         ioapic.entries[5].mask = false;
         ioapic.entries[5].trigger_mode = false; // Edge
 
-        let vector = ioapic.service_irq(5, true);
-        assert_eq!(vector, Some(0x25));
+        let result = ioapic.service_irq(5, true);
+        assert_eq!(result, Some((0x25, 0)));
     }
 
     #[test]
     fn test_ioapic_level_triggered_delivery() {
         let mut ioapic = IoApic::new();
 
-        // Configure pin 3: level-triggered, vector 0x33, unmasked.
+        // Configure pin 3: level-triggered, vector 0x33, dest 0, unmasked.
         ioapic.entries[3].vector = 0x33;
         ioapic.entries[3].mask = false;
         ioapic.entries[3].trigger_mode = true; // Level
 
-        let vector = ioapic.service_irq(3, true);
-        assert_eq!(vector, Some(0x33));
+        let result = ioapic.service_irq(3, true);
+        assert_eq!(result, Some((0x33, 0)));
         assert!(ioapic.entries[3].remote_irr, "remote_irr should be set");
     }
 
@@ -360,7 +360,7 @@ mod tests {
         ioapic.entries[3].trigger_mode = true;
 
         // First delivery sets remote_irr.
-        assert_eq!(ioapic.service_irq(3, true), Some(0x33));
+        assert_eq!(ioapic.service_irq(3, true), Some((0x33, 0)));
 
         // Second delivery blocked by remote_irr.
         assert_eq!(ioapic.service_irq(3, true), None);
@@ -473,8 +473,8 @@ mod tests {
         ioapic.entries[2].vector = 0x22;
         ioapic.entries[2].mask = false;
 
-        assert_eq!(ioapic.service_irq(1, true), Some(0x21));
-        assert_eq!(ioapic.service_irq(2, true), Some(0x22));
+        assert_eq!(ioapic.service_irq(1, true), Some((0x21, 0)));
+        assert_eq!(ioapic.service_irq(2, true), Some((0x22, 0)));
     }
 
     #[test]
@@ -483,6 +483,19 @@ mod tests {
         // Registers beyond 0x3F should return 0.
         assert_eq!(ioapic.read_register(0x40), 0);
         assert_eq!(ioapic.read_register(0xFF), 0);
+    }
+
+    #[test]
+    fn test_ioapic_service_irq_returns_destination() {
+        let mut ioapic = IoApic::new();
+
+        // Configure pin 4: vector 0x24, dest APIC ID = 1, unmasked.
+        ioapic.entries[4].vector = 0x24;
+        ioapic.entries[4].dest = 1;
+        ioapic.entries[4].mask = false;
+
+        let result = ioapic.service_irq(4, true);
+        assert_eq!(result, Some((0x24, 1)));
     }
 
     #[test]

@@ -224,8 +224,9 @@ pub fn load_kernel(
     kernel_image: &[u8],
     cmdline: &str,
     ram_mib: u32,
+    num_vcpus: u8,
 ) -> Result<(StandardRegisters, SpecialRegisters)> {
-    load_kernel_with_initrd(guest_mem, kernel_image, cmdline, ram_mib, None)
+    load_kernel_with_initrd(guest_mem, kernel_image, cmdline, ram_mib, None, num_vcpus)
 }
 
 /// Load a Linux bzImage kernel with an optional initrd.
@@ -236,6 +237,7 @@ pub fn load_kernel_with_initrd(
     cmdline: &str,
     ram_mib: u32,
     initrd: Option<&[u8]>,
+    num_vcpus: u8,
 ) -> Result<(StandardRegisters, SpecialRegisters)> {
     let header = parse_bzimage(kernel_image)?;
 
@@ -294,7 +296,7 @@ pub fn load_kernel_with_initrd(
     boot_params.set_cmdline_size(cmdline_bytes.len() as u32);
 
     // Write ACPI tables to guest memory.
-    let acpi_data = acpi::build_acpi_tables(ACPI_START);
+    let acpi_data = acpi::build_acpi_tables(ACPI_START, num_vcpus);
     guest_mem.write_at_addr(ACPI_START, &acpi_data)?;
 
     // Set E820 memory map.

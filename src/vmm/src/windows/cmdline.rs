@@ -17,19 +17,19 @@ pub const FIRST_MMIO_IRQ: u8 = 5;
 /// - `console=ttyS0`: Route kernel console to serial port (required — no VGA).
 /// - `quiet loglevel=1`: Suppress kernel printk to console.
 /// - `i8042.nokbd i8042.noaux`: Skip PS/2 keyboard/mouse probe (10K+ exits).
-/// - `nosmp`: Single vCPU mode (multi-vCPU deferred to Iter 3).
 /// - `nohyperv`: Disable Hyper-V guest enlightenments. WHPX exposes Hyper-V
 ///   CPUID leaves but doesn't fully support synthetic timers/SynIC, causing
 ///   clock stalls if the kernel tries to use them.
 /// - `lpj=1000000`: Preset loops_per_jiffy to skip delay calibration, which
 ///   depends on a reliable timer source.
 /// - `nokaslr`: Disable kernel address space randomization for deterministic
-///   boot in our controlled single-vCPU environment.
+///   boot in our controlled environment.
 ///
 /// Note: `noapic` and `nolapic` are NOT present — the MADT table in ACPI
 /// tells the kernel about the IOAPIC and LAPIC for APIC-mode interrupt routing.
+/// Note: `nosmp` is NOT present — multi-vCPU is supported via MADT LAPIC entries.
 const BASE_CMDLINE: &str =
-    "console=ttyS0 quiet loglevel=1 i8042.nokbd i8042.noaux nosmp nohyperv lpj=1000000 nokaslr";
+    "console=ttyS0 quiet loglevel=1 i8042.nokbd i8042.noaux nohyperv lpj=1000000 nokaslr";
 
 /// Serial console parameters appended in verbose mode.
 ///
@@ -71,10 +71,7 @@ pub fn build_kernel_cmdline(
     let mut cmdline = if verbose {
         // Verbose mode: serial console + full i8042 probe for debugging.
         // No noapic/nolapic — APIC mode is enabled via MADT (same as quiet mode).
-        format!(
-            "{} nosmp nohyperv lpj=1000000 nokaslr",
-            VERBOSE_CONSOLE
-        )
+        format!("{} nohyperv lpj=1000000 nokaslr", VERBOSE_CONSOLE)
     } else {
         BASE_CMDLINE.to_string()
     };
@@ -240,6 +237,22 @@ mod tests {
         assert!(cmdline.contains("nokaslr"));
         // noacpi must NOT be present (ACPI tables are provided).
         assert!(!cmdline.contains("noacpi"));
+    }
+
+    #[test]
+    fn test_cmdline_no_nosmp() {
+        // nosmp must NOT be present — multi-vCPU is supported via MADT LAPIC entries.
+        let quiet = build_simple(None, false, &[]);
+        assert!(
+            !quiet.contains("nosmp"),
+            "quiet cmdline must not contain nosmp (multi-vCPU enabled)"
+        );
+
+        let verbose = build_kernel_cmdline(None, false, &[], None, None, None, &[], true);
+        assert!(
+            !verbose.contains("nosmp"),
+            "verbose cmdline must not contain nosmp (multi-vCPU enabled)"
+        );
     }
 
     #[test]

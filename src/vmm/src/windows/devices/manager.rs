@@ -15,6 +15,7 @@ use super::super::context::VmContext;
 use super::super::error::{Result, WkrunError};
 use super::super::vcpu::IoHandler;
 use super::irq_chip::IrqChip;
+use super::lapic::IpiAction;
 use super::pit::Pit;
 use super::serial::{Serial, COM1_BASE};
 use super::virtio::block::VirtioBlock;
@@ -365,7 +366,7 @@ impl DeviceManager {
 
         let devices = DeviceManager {
             serial,
-            irq_chip: IrqChip::new(),
+            irq_chip: IrqChip::new(ctx.num_vcpus),
             pit: Pit::new(),
             cmos_addr: 0,
             virtio_blk,
@@ -473,9 +474,10 @@ impl DeviceManager {
     /// Handle an MMIO read from the guest.
     ///
     /// Returns the data to inject into the destination register.
-    pub fn handle_mmio_read(&mut self, address: u64, size: u8) -> u64 {
+    /// `vcpu_id` selects which LAPIC to read from (each vCPU has its own).
+    pub fn handle_mmio_read(&mut self, vcpu_id: u8, address: u64, size: u8) -> u64 {
         // Check IOAPIC/LAPIC ranges first.
-        if let Some(val) = self.irq_chip.handle_mmio_read(address, size) {
+        if let Some(val) = self.irq_chip.handle_mmio_read(vcpu_id, address, size) {
             use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
             if address >= IOAPIC_MMIO_BASE && address < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
                 self.ioapic_mmio_count += 1;
@@ -524,23 +526,26 @@ impl DeviceManager {
 
     /// Handle an MMIO write from the guest.
     ///
-    /// Returns `true` if an interrupt should be raised.
+    /// `vcpu_id` selects which LAPIC to write to (each vCPU has its own).
+    /// Returns the IPI action if the write was to the LAPIC ICR register.
     pub fn handle_mmio_write(
         &mut self,
+        vcpu_id: u8,
         address: u64,
         size: u8,
         data: u64,
         mem: &dyn GuestMemoryAccessor,
-    ) {
+    ) -> IpiAction {
         // Check IOAPIC/LAPIC ranges first.
-        if self.irq_chip.handle_mmio_write(address, size as u8, data as u32) {
+        let result = self.irq_chip.handle_mmio_write(vcpu_id, address, size as u8, data as u32);
+        if result.handled {
             use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
             if address >= IOAPIC_MMIO_BASE && address < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
                 self.ioapic_mmio_count += 1;
             } else if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
                 self.lapic_mmio_count += 1;
             }
-            return;
+            return result.ipi_action;
         }
 
         let blk_offset = address.wrapping_sub(mmio_base_for_slot(0));
@@ -587,6 +592,7 @@ impl DeviceManager {
                 }
             }
         }
+        IpiAction::None
     }
 
     /// Start async block I/O workers for virtio-blk devices (Plan B: WHPX-safe).
@@ -617,7 +623,8 @@ impl DeviceManager {
     /// Tick the PIT timer based on wall clock time and poll devices.
     ///
     /// Call this at the top of each vCPU run loop iteration.
-    pub fn tick_and_poll(&mut self, mem: &dyn GuestMemoryAccessor) {
+    /// `vcpu_id` selects which LAPIC timer to tick (BSP should be 0).
+    pub fn tick_and_poll(&mut self, vcpu_id: u8, mem: &dyn GuestMemoryAccessor) {
         // Tick PIT.
         let now = Instant::now();
         let elapsed_ns = now.duration_since(self.last_tick).as_nanos() as u64;
@@ -631,7 +638,7 @@ impl DeviceManager {
         }
 
         // Tick LAPIC timer (only fires in APIC mode).
-        self.irq_chip.tick_timer(now);
+        self.irq_chip.tick_timer(vcpu_id, now);
 
         // Drain async block I/O completions.
         if let Some(ref mut dev) = self.virtio_blk {
@@ -726,7 +733,7 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
     let vsock_backend = VirtioVsock::new(GUEST_CID);
     DeviceManager {
         serial,
-        irq_chip: IrqChip::new(),
+        irq_chip: IrqChip::new(1),
         pit: Pit::new(),
         cmos_addr: 0,
         virtio_blk: None,
@@ -891,7 +898,7 @@ mod tests {
     fn test_mmio_read_no_blk_device() {
         let dm = make_test_devices();
         // Read from virtio-blk slot when no device present.
-        let data = dm.handle_mmio_read(mmio_base_for_slot(0), 4);
+        let data = dm.handle_mmio_read(0, mmio_base_for_slot(0), 4);
         assert_eq!(data, 0);
     }
 
@@ -899,7 +906,7 @@ mod tests {
     fn test_mmio_read_vsock_magic() {
         let dm = make_test_devices();
         // Read virtio magic from vsock MMIO slot.
-        let magic = dm.handle_mmio_read(mmio_base_for_slot(1), 4);
+        let magic = dm.handle_mmio_read(0, mmio_base_for_slot(1), 4);
         assert_eq!(magic, 0x7472_6976); // "virt" in LE.
     }
 
@@ -907,7 +914,7 @@ mod tests {
     fn test_mmio_read_vsock_device_id() {
         let dm = make_test_devices();
         // Device ID is at offset 0x008.
-        let device_id = dm.handle_mmio_read(mmio_base_for_slot(1) + 0x008, 4);
+        let device_id = dm.handle_mmio_read(0, mmio_base_for_slot(1) + 0x008, 4);
         assert_eq!(device_id, 19); // vsock device ID.
     }
 
@@ -915,7 +922,7 @@ mod tests {
     fn test_mmio_read_out_of_range() {
         let dm = make_test_devices();
         // Read from an address that doesn't belong to any device.
-        let data = dm.handle_mmio_read(0xE000_0000, 4);
+        let data = dm.handle_mmio_read(0, 0xE000_0000, 4);
         assert_eq!(data, 0);
     }
 
@@ -1020,7 +1027,7 @@ mod tests {
     fn test_mmio_read_no_net_device() {
         let dm = make_test_devices();
         // Read from virtio-net slot when no device present.
-        let data = dm.handle_mmio_read(mmio_base_for_slot(3), 4);
+        let data = dm.handle_mmio_read(0, mmio_base_for_slot(3), 4);
         assert_eq!(data, 0);
     }
 

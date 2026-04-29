@@ -254,7 +254,11 @@ mod imp {
 
     // SAFETY: Each vCPU is operated on by a single thread at a time.
     // The WHPX API permits calling WHvRunVirtualProcessor from a dedicated thread.
+    // Sync is needed because std::thread::scope borrows &WhpxVcpu across threads,
+    // but each &WhpxVcpu is only accessed by its dedicated vCPU thread — no
+    // concurrent access to the Cell fields occurs.
     unsafe impl Send for WhpxVcpu {}
+    unsafe impl Sync for WhpxVcpu {}
 
     impl WhpxVcpu {
         /// Create a new virtual processor in the given partition.
@@ -1023,12 +1027,77 @@ mod imp {
                 index: self.index,
             }
         }
+
+        /// Configure AP initial register state after receiving SIPI.
+        ///
+        /// Sets the AP into real mode with CS:IP pointing to the SIPI trampoline:
+        /// - CS.base = sipi_vector * 0x1000, CS.selector = sipi_vector * 0x100
+        /// - IP = 0
+        /// - DL = APIC ID (Linux convention for AP identification)
+        /// - All other regs = 0 / default real mode values
+        pub fn set_ap_initial_regs(&self, sipi_vector: u8, apic_id: u8) -> Result<()> {
+            use super::super::types::{SegmentRegister, SpecialRegisters, StandardRegisters};
+
+            let cs_base = (sipi_vector as u64) * 0x1000;
+            let cs_selector = (sipi_vector as u16) * 0x100;
+
+            let regs = StandardRegisters {
+                rdx: apic_id as u64, // Linux uses DL for APIC ID on AP startup
+                ..Default::default()
+            };
+
+            let sregs = SpecialRegisters {
+                cs: SegmentRegister {
+                    base: cs_base,
+                    limit: 0xFFFF,
+                    selector: cs_selector,
+                    access_rights: 0x9B, // present, code, readable, accessed
+                },
+                ds: SegmentRegister {
+                    base: 0,
+                    limit: 0xFFFF,
+                    selector: 0,
+                    access_rights: 0x93, // present, data, writable, accessed
+                },
+                es: SegmentRegister {
+                    base: 0,
+                    limit: 0xFFFF,
+                    selector: 0,
+                    access_rights: 0x93,
+                },
+                fs: SegmentRegister {
+                    base: 0,
+                    limit: 0xFFFF,
+                    selector: 0,
+                    access_rights: 0x93,
+                },
+                gs: SegmentRegister {
+                    base: 0,
+                    limit: 0xFFFF,
+                    selector: 0,
+                    access_rights: 0x93,
+                },
+                ss: SegmentRegister {
+                    base: 0,
+                    limit: 0xFFFF,
+                    selector: 0,
+                    access_rights: 0x93,
+                },
+                cr0: 0x10, // ET (Extension Type) — required for real mode on x86
+                ..Default::default()
+            };
+
+            self.set_registers(&regs)?;
+            self.set_special_registers(&sregs)?;
+            Ok(())
+        }
     }
 
     /// Lightweight handle for cancelling a running vCPU from another thread.
     ///
     /// Only supports the cancel operation — safe to use from a timer thread
     /// to preempt the vCPU for interrupt delivery.
+    #[derive(Clone)]
     pub struct VcpuCanceller {
         partition_handle: WHV_PARTITION_HANDLE,
         index: u32,

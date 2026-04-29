@@ -1,6 +1,6 @@
 //! Local APIC (LAPIC) emulation.
 //!
-//! Minimal single-vCPU LAPIC for interrupt priority management.
+//! Per-vCPU LAPIC for interrupt priority management and IPI delivery.
 //! Tracks IRR (Interrupt Request Register) and ISR (In-Service Register)
 //! as 256-bit vectors, and implements priority-based interrupt delivery.
 //!
@@ -12,17 +12,45 @@
 //! - 0x0F0: SVR (Spurious Vector Register)
 //! - 0x100-0x170: ISR (read-only, 256 bits)
 //! - 0x200-0x270: IRR (read-only, 256 bits)
+//! - 0x300: ICR Low (Interrupt Command Register)
+//! - 0x310: ICR High (destination APIC ID)
 //! - 0x320: LVT Timer
 //! - 0x380: Timer Initial Count
 //! - 0x390: Timer Current Count
 //! - 0x3E0: Timer Divide Configuration
-//!
-//! Simplifications for single-vCPU:
-//! - No IPI support (no ICR register)
-//! - No arbitration
-//! - Destination always matches APIC ID 0
 
 use std::time::Instant;
+
+/// Action resulting from an ICR write (Inter-Processor Interrupt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpiAction {
+    /// No IPI action (non-ICR write or unrecognized delivery mode).
+    None,
+    /// Fixed delivery: send interrupt vector to target LAPIC.
+    SendInterrupt { target_apic_id: u8, vector: u8 },
+    /// INIT delivery: reset target processor.
+    SendInit { target_apic_id: u8 },
+    /// Startup IPI (SIPI): start target processor at vector * 0x1000.
+    SendSipi { target_apic_id: u8, vector: u8 },
+}
+
+/// Result of a LAPIC MMIO write operation.
+#[derive(Debug, Clone, Copy)]
+pub struct LapicWriteResult {
+    /// If an EOI was written, the vector that was cleared from ISR.
+    pub eoi_vector: Option<u8>,
+    /// If an ICR was written, the resulting IPI action.
+    pub ipi_action: IpiAction,
+}
+
+impl Default for LapicWriteResult {
+    fn default() -> Self {
+        Self {
+            eoi_vector: None,
+            ipi_action: IpiAction::None,
+        }
+    }
+}
 
 /// LAPIC version: integrated APIC with 6 LVT entries.
 const LAPIC_VERSION: u32 = 0x0005_0014; // version 0x14, max LVT=5
@@ -40,9 +68,9 @@ enum TimerMode {
     Periodic,
 }
 
-/// Minimal single-vCPU Local APIC.
+/// Per-vCPU Local APIC.
 pub struct LocalApic {
-    /// APIC ID (always 0 for single vCPU).
+    /// APIC ID (matches vCPU index).
     id: u8,
     /// 256-bit Interrupt Request Register (8 x 32-bit words).
     irr: [u32; 8],
@@ -52,6 +80,12 @@ pub struct LocalApic {
     tpr: u8,
     /// Spurious Vector Register (bit 8 = APIC enabled).
     svr: u32,
+
+    // ICR (Interrupt Command Register) for IPI support.
+    /// ICR low 32 bits (vector, delivery mode, destination shorthand).
+    icr_low: u32,
+    /// ICR high 32 bits (destination APIC ID in bits 31:24).
+    icr_high: u32,
 
     // Timer state.
     /// Timer mode.
@@ -79,14 +113,22 @@ impl Default for LocalApic {
 }
 
 impl LocalApic {
-    /// Create a new LAPIC with default state (disabled).
+    /// Create a new LAPIC with default state (disabled), APIC ID = 0.
     pub fn new() -> Self {
+        Self::new_with_id(0)
+    }
+
+    /// Create a new LAPIC with a specific APIC ID (disabled by default).
+    pub fn new_with_id(id: u8) -> Self {
         Self {
-            id: 0,
+            id,
             irr: [0; 8],
             isr: [0; 8],
             tpr: 0,
             svr: 0, // APIC disabled by default
+
+            icr_low: 0,
+            icr_high: 0,
 
             timer_mode: TimerMode::OneShot,
             timer_vector: 0,
@@ -97,6 +139,11 @@ impl LocalApic {
             timer_deadline: None,
             timer_period_ns: 0,
         }
+    }
+
+    /// Get the APIC ID.
+    pub fn id(&self) -> u8 {
+        self.id
     }
 
     /// Whether the LAPIC is software-enabled (SVR bit 8).
@@ -204,6 +251,8 @@ impl LocalApic {
                     0
                 }
             }
+            0x300 => self.icr_low,          // ICR Low
+            0x310 => self.icr_high,         // ICR High
             0x320 => self.read_lvt_timer(), // LVT Timer
             0x380 => self.timer_initial,    // Timer Initial Count
             0x390 => 0,                     // Timer Current Count (approximation)
@@ -212,31 +261,118 @@ impl LocalApic {
         }
     }
 
-    /// Write to the LAPIC MMIO region.
+    /// Result of a LAPIC MMIO write.
     ///
-    /// Returns `Some(vector)` if an EOI was written (caller should broadcast
-    /// to IOAPIC).
-    pub fn write_mmio(&mut self, offset: u64, value: u32) -> Option<u8> {
+    /// Contains an optional EOI vector and an IPI action from ICR writes.
+    pub fn write_mmio(&mut self, offset: u64, value: u32) -> LapicWriteResult {
         match offset {
-            0x080 => self.tpr = (value & 0xFF) as u8,
+            0x080 => {
+                self.tpr = (value & 0xFF) as u8;
+                LapicWriteResult::default()
+            }
             0x0B0 => {
                 // EOI: clear highest ISR, return vector for IOAPIC.
-                return self.end_of_interrupt();
+                LapicWriteResult {
+                    eoi_vector: self.end_of_interrupt(),
+                    ipi_action: IpiAction::None,
+                }
             }
             0x0F0 => {
                 self.svr = value;
                 log::debug!(
-                    "LAPIC SVR write: {:#X} (enabled={})",
+                    "LAPIC {} SVR write: {:#X} (enabled={})",
+                    self.id,
                     value,
                     value & SVR_APIC_ENABLE != 0
                 );
+                LapicWriteResult::default()
             }
-            0x320 => self.write_lvt_timer(value),
-            0x380 => self.write_initial_count(value),
-            0x3E0 => self.write_divide_config(value),
-            _ => {}
+            0x300 => {
+                // ICR Low write triggers IPI delivery.
+                self.icr_low = value;
+                let action = self.parse_icr();
+                LapicWriteResult {
+                    eoi_vector: None,
+                    ipi_action: action,
+                }
+            }
+            0x310 => {
+                // ICR High: destination APIC ID (bits 31:24).
+                self.icr_high = value;
+                LapicWriteResult::default()
+            }
+            0x320 => {
+                self.write_lvt_timer(value);
+                LapicWriteResult::default()
+            }
+            0x380 => {
+                self.write_initial_count(value);
+                LapicWriteResult::default()
+            }
+            0x3E0 => {
+                self.write_divide_config(value);
+                LapicWriteResult::default()
+            }
+            _ => LapicWriteResult::default(),
         }
-        None
+    }
+
+    /// Parse the ICR low/high registers to produce an IPI action.
+    ///
+    /// ICR Low bits:
+    /// - [7:0]   Vector
+    /// - [10:8]  Delivery mode: 000=Fixed, 101=INIT, 110=Startup (SIPI)
+    /// - [11]    Destination mode (ignored, always physical)
+    /// - [17:16] Destination shorthand (00=field, others unsupported)
+    ///
+    /// ICR High bits:
+    /// - [31:24] Destination APIC ID
+    fn parse_icr(&self) -> IpiAction {
+        let vector = (self.icr_low & 0xFF) as u8;
+        let delivery_mode = (self.icr_low >> 8) & 0x7;
+        let dest_apic_id = ((self.icr_high >> 24) & 0xFF) as u8;
+
+        match delivery_mode {
+            0b000 => {
+                // Fixed delivery.
+                log::debug!(
+                    "LAPIC {} ICR: Fixed interrupt vector={:#X} → APIC {}",
+                    self.id, vector, dest_apic_id
+                );
+                IpiAction::SendInterrupt {
+                    target_apic_id: dest_apic_id,
+                    vector,
+                }
+            }
+            0b101 => {
+                // INIT delivery.
+                log::debug!(
+                    "LAPIC {} ICR: INIT → APIC {}",
+                    self.id, dest_apic_id
+                );
+                IpiAction::SendInit {
+                    target_apic_id: dest_apic_id,
+                }
+            }
+            0b110 => {
+                // Startup IPI (SIPI).
+                log::debug!(
+                    "LAPIC {} ICR: SIPI vector={:#X} → APIC {} (start at {:#X})",
+                    self.id, vector, dest_apic_id, (vector as u32) * 0x1000
+                );
+                IpiAction::SendSipi {
+                    target_apic_id: dest_apic_id,
+                    vector,
+                }
+            }
+            _ => {
+                log::debug!(
+                    "LAPIC {} ICR: unsupported delivery mode {} → APIC {}",
+                    self.id, delivery_mode, dest_apic_id
+                );
+                IpiAction::None
+            }
+        }
     }
 
     /// Compute Processor Priority Register (PPR).
@@ -477,8 +613,8 @@ mod tests {
         lapic.accept_interrupt(0x30);
         lapic.start_of_interrupt(0x30);
 
-        let vector = lapic.write_mmio(0x0B0, 0);
-        assert_eq!(vector, Some(0x30));
+        let result = lapic.write_mmio(0x0B0, 0);
+        assert_eq!(result.eoi_vector, Some(0x30));
     }
 
     #[test]
@@ -612,7 +748,9 @@ mod tests {
     fn test_lapic_mmio_invalid_offset() {
         let mut lapic = LocalApic::new();
         assert_eq!(lapic.read_mmio(0x400), 0);
-        assert_eq!(lapic.write_mmio(0x400, 0xDEAD), None);
+        let result = lapic.write_mmio(0x400, 0xDEAD);
+        assert_eq!(result.eoi_vector, None);
+        assert_eq!(result.ipi_action, IpiAction::None);
     }
 
     #[test]
@@ -620,5 +758,96 @@ mod tests {
         let lapic = LocalApic::new();
         // Non-16-byte-aligned ISR offset should return 0.
         assert_eq!(lapic.read_mmio(0x104), 0);
+    }
+
+    // ---- ICR / IPI tests ----
+
+    #[test]
+    fn test_lapic_new_with_id() {
+        let lapic = LocalApic::new_with_id(3);
+        assert_eq!(lapic.id(), 3);
+        assert_eq!(lapic.read_mmio(0x020), 3 << 24);
+        assert!(!lapic.is_enabled());
+    }
+
+    #[test]
+    fn test_lapic_icr_read_write_roundtrip() {
+        let mut lapic = LocalApic::new();
+
+        // Write ICR high (destination APIC ID = 1).
+        lapic.write_mmio(0x310, 1 << 24);
+        assert_eq!(lapic.read_mmio(0x310), 1 << 24);
+
+        // Write ICR low (vector=0x40, Fixed delivery).
+        let result = lapic.write_mmio(0x300, 0x40);
+        assert_eq!(lapic.read_mmio(0x300), 0x40);
+
+        match result.ipi_action {
+            IpiAction::SendInterrupt {
+                target_apic_id,
+                vector,
+            } => {
+                assert_eq!(target_apic_id, 1);
+                assert_eq!(vector, 0x40);
+            }
+            other => panic!("expected SendInterrupt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lapic_icr_init_delivery() {
+        let mut lapic = LocalApic::new();
+
+        // Set destination = APIC 2.
+        lapic.write_mmio(0x310, 2 << 24);
+        // ICR low: delivery mode = 0b101 (INIT), vector ignored.
+        let result = lapic.write_mmio(0x300, 0x0500);
+
+        match result.ipi_action {
+            IpiAction::SendInit { target_apic_id } => {
+                assert_eq!(target_apic_id, 2);
+            }
+            other => panic!("expected SendInit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lapic_icr_sipi_delivery() {
+        let mut lapic = LocalApic::new();
+
+        // Set destination = APIC 1.
+        lapic.write_mmio(0x310, 1 << 24);
+        // ICR low: delivery mode = 0b110 (SIPI), vector = 0x10.
+        // Start address = 0x10 * 0x1000 = 0x10000.
+        let result = lapic.write_mmio(0x300, 0x0600 | 0x10);
+
+        match result.ipi_action {
+            IpiAction::SendSipi {
+                target_apic_id,
+                vector,
+            } => {
+                assert_eq!(target_apic_id, 1);
+                assert_eq!(vector, 0x10);
+            }
+            other => panic!("expected SendSipi, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lapic_icr_unsupported_delivery_mode() {
+        let mut lapic = LocalApic::new();
+        lapic.write_mmio(0x310, 1 << 24);
+        // Delivery mode = 0b010 (SMI) — not supported.
+        let result = lapic.write_mmio(0x300, 0x0200);
+        assert_eq!(result.ipi_action, IpiAction::None);
+    }
+
+    #[test]
+    fn test_lapic_non_icr_write_returns_no_ipi() {
+        let mut lapic = LocalApic::new();
+        // SVR write should produce no IPI.
+        let result = lapic.write_mmio(0x0F0, 0x1FF);
+        assert_eq!(result.ipi_action, IpiAction::None);
+        assert_eq!(result.eoi_vector, None);
     }
 }
