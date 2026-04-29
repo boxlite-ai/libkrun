@@ -10,6 +10,7 @@
 #[cfg(target_os = "windows")]
 mod imp {
     use std::collections::HashMap;
+    use std::io::Write as IoWrite;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -27,8 +28,8 @@ mod imp {
 
     /// Implement GuestMemoryAccessor directly on GuestMemory.
     ///
-    /// This allows `Arc<GuestMemory>` to be passed to block worker threads
-    /// (GuestMemory is Send+Sync since its regions are Send+Sync).
+    /// This allows GuestMemory to be used via the GuestMemoryAccessor trait
+    /// in device handling code (virtio queues, block I/O, etc.).
     impl GuestMemoryAccessor for GuestMemory {
         fn read_at(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
             self.read_at_addr(addr, buf)
@@ -137,6 +138,27 @@ mod imp {
         run_config: VcpuRunConfig,
         canceller_slot: Arc<Mutex<Option<VcpuCanceller>>>,
     ) -> Result<i32> {
+        // Open a diagnostic log file for debugging boot failures.
+        // Written to a fixed path that persists across box lifecycle.
+        let mut diag_log: Option<std::fs::File> = None;
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"C:\ws-boxlite\whpx-diag.log")
+        {
+            diag_log = Some(f);
+        }
+
+        macro_rules! diag {
+            ($($arg:tt)*) => {
+                if let Some(ref mut f) = diag_log {
+                    let _ = writeln!(f, $($arg)*);
+                    let _ = f.flush();
+                }
+            };
+        }
+        diag!("\n=== VM START ctx_id={} ===", ctx.id);
+
         // Validate required fields.
         let kernel_path = ctx
             .kernel_path
@@ -179,7 +201,7 @@ mod imp {
 
         partition.setup()?;
 
-        // Allocate and map guest memory (Arc for sharing with block worker threads).
+        // Allocate and map guest memory.
         let guest_mem = Arc::new(GuestMemory::new(ctx.ram_mib)?);
         guest_mem.map_to_partition(&partition)?;
 
@@ -189,12 +211,11 @@ mod imp {
         devices::store_console_buffer(ctx_id, setup.console_buffer);
         let mut devices = setup.devices;
 
-        // NOTE: Async block workers are NOT started on Windows/WHPX.
-        // The worker thread writes to guest memory from a non-vCPU thread,
-        // which conflicts with WHPX's memory tracking and causes ~60% boot
-        // failure rate on Win10. Sync disk I/O is reliable (100% pass rate)
-        // and sufficient for typical workloads.
-        // devices.start_blk_workers(guest_mem.clone());
+        // NOTE: Block I/O workers are started lazily (deferred start) inside
+        // the vCPU loop, on the first MMIO write. Starting them here (before
+        // the vCPU runs) causes ~80% boot failure on WHPX — the worker
+        // thread creation appears to interfere with WHPX partition state
+        // during early boot.
 
         // Build kernel command line.
         let cmdline = build_kernel_cmdline(
@@ -227,6 +248,7 @@ mod imp {
             ctx.ram_mib as u64 * 1024 * 1024 > crate::windows::memory::VIRTIO_MMIO_BASE,
             cmdline.len()
         );
+        diag!("Kernel loaded, RIP={:#X}, ram={}MB", regs.rip, ctx.ram_mib);
 
         // Create vCPU and set registers.
         let vcpu = WhpxVcpu::new(&partition, 0)?;
@@ -257,6 +279,12 @@ mod imp {
         let start_time = Instant::now();
         let mut last_progress = Instant::now();
         let mut mmio_count: u64 = 0;
+        let mut blk_workers_started = false;
+        let sync_block = std::env::var("BOXLITE_SYNC_BLOCK").is_ok();
+        let mut serial_out_count: u64 = 0;
+        let mut io_out_count: u64 = 0;
+        let mut io_in_count: u64 = 0;
+        let mut inject_count: u64 = 0;
         let mut last_exit_reason = "none";
         let exit_code;
 
@@ -265,23 +293,35 @@ mod imp {
             devices.tick_and_poll(mem_ref);
 
             // Try to inject pending interrupt.
+            // CRITICAL: Do NOT acknowledge a new PIC interrupt if a previous
+            // injection is still pending in WHPX.  Overwriting the pending
+            // interruption register would lose the old interrupt and leave
+            // its PIC ISR bit permanently stuck (guest never sends EOI).
             if devices.pic.has_pending() {
-                match vcpu.interrupts_enabled() {
-                    Ok(true) => {
-                        if let Some(vector) = devices.pic.acknowledge() {
-                            log::debug!("Injecting interrupt vector {:#X}", vector);
-                            vcpu.inject_interrupt(vector)?;
-                            devices.set_window_requested(false);
+                let already_pending = vcpu
+                    .has_pending_interruption()
+                    .unwrap_or(false);
+                if already_pending {
+                    // Previous interrupt not yet delivered — skip this cycle.
+                } else {
+                    match vcpu.interrupts_enabled() {
+                        Ok(true) => {
+                            if let Some(vector) = devices.pic.acknowledge() {
+                                log::debug!("Injecting interrupt vector {:#X}", vector);
+                                vcpu.inject_interrupt(vector)?;
+                                devices.set_window_requested(false);
+                                inject_count += 1;
+                            }
                         }
-                    }
-                    Ok(false) => {
-                        if !devices.window_requested() {
-                            vcpu.request_interrupt_window()?;
-                            devices.set_window_requested(true);
+                        Ok(false) => {
+                            if !devices.window_requested() {
+                                vcpu.request_interrupt_window()?;
+                                devices.set_window_requested(true);
+                            }
                         }
-                    }
-                    Err(ref e) => {
-                        log::warn!("interrupts_enabled() error: {:?}", e);
+                        Err(ref e) => {
+                            log::warn!("interrupts_enabled() error: {:?}", e);
+                        }
                     }
                 }
             }
@@ -308,6 +348,10 @@ mod imp {
             match exit {
                 VcpuExit::IoOut { port, size, data } => {
                     halt_count = 0;
+                    io_out_count += 1;
+                    if port == 0x3F8 {
+                        serial_out_count += 1;
+                    }
                     devices.handle_io_out(port, size, data);
                     if devices.shutdown_requested() {
                         log::info!("ACPI shutdown detected after {} exits", exit_count);
@@ -319,6 +363,7 @@ mod imp {
                 }
                 VcpuExit::IoIn { port, size } => {
                     halt_count = 0;
+                    io_in_count += 1;
                     let data = devices.handle_io_in(port, size);
                     vcpu.complete_io_in(data, size)?;
                 }
@@ -335,6 +380,19 @@ mod imp {
                 } => {
                     halt_count = 0;
                     mmio_count += 1;
+                    // Deferred start: spawn block I/O workers on first MMIO
+                    // write (after vCPU is running). If BOXLITE_SYNC_BLOCK is
+                    // set, skip workers entirely (sync disk I/O for A/B testing).
+                    if !blk_workers_started && !sync_block {
+                        devices.start_blk_workers();
+                        blk_workers_started = true;
+                        let msg = format!(
+                            "Block workers started at exit={} mmio={} elapsed={:.1}ms",
+                            exit_count, mmio_count, start_time.elapsed().as_secs_f64() * 1000.0
+                        );
+                        eprintln!("[WHPX] {}", msg);
+                        diag!("{}", msg);
+                    }
                     devices.handle_mmio_write(address, size, data, mem_ref);
                     vcpu.skip_instruction()?;
                 }
@@ -357,9 +415,15 @@ mod imp {
                     devices.tick_and_poll(mem_ref);
 
                     if devices.pic.has_pending() {
-                        if let Some(vector) = devices.pic.acknowledge() {
-                            vcpu.inject_interrupt(vector)?;
-                            devices.set_window_requested(false);
+                        let already_pending = vcpu
+                            .has_pending_interruption()
+                            .unwrap_or(false);
+                        if !already_pending {
+                            if let Some(vector) = devices.pic.acknowledge() {
+                                vcpu.inject_interrupt(vector)?;
+                                devices.set_window_requested(false);
+                                inject_count += 1;
+                            }
                         }
                         halt_with_irq += 1;
                         halt_count = 0;
@@ -424,21 +488,31 @@ mod imp {
                         exit_code = 0;
                         break;
                     }
-                    // Wall-clock progress report every 5 seconds.
-                    if last_progress.elapsed() >= Duration::from_secs(5) {
+                    // Wall-clock progress report every 2 seconds.
+                    if last_progress.elapsed() >= Duration::from_secs(2) {
                         last_progress = Instant::now();
                         if let Ok(regs) = vcpu.get_registers() {
                             let console_len = devices::get_console_output(ctx_id)
                                 .map(|b| b.len())
                                 .unwrap_or(0);
-                            log::info!(
-                                "Progress @ {:.1}s: exits={} RIP={:#X} console={}B mmio={}",
+                            let (qn, bc) = devices.blk_stats();
+                            let (irr, isr, imr, vbase) = devices.pic.master_state();
+                            let (s_irr, s_isr, s_imr, s_vbase) = devices.pic.slave_state();
+                            let msg = format!(
+                                "Progress @ {:.1}s: exits={} RIP={:#X} console={}B io_out={} serial={} mmio={} blk_qn={} blk_comp={} halt={}/{} halt_w_irq={} inj={} pic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} spic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} mode={}",
                                 start_time.elapsed().as_secs_f64(),
-                                exit_count,
-                                regs.rip,
-                                console_len,
-                                mmio_count,
+                                exit_count, regs.rip, console_len,
+                                io_out_count, serial_out_count,
+                                mmio_count, qn, bc,
+                                halt_count, total_halt_exits,
+                                halt_with_irq, inject_count,
+                                irr, isr, imr, vbase,
+                                s_irr, s_isr, s_imr, s_vbase,
+                                if sync_block { "sync" } else if blk_workers_started { "async" } else { "pending" },
                             );
+                            log::info!("{}", msg);
+                            eprintln!("[WHPX] {}", msg);
+                            diag!("{}", msg);
                         }
                     }
                 }
@@ -548,13 +622,15 @@ mod imp {
             exit_count,
             last_exit_reason
         );
-        eprintln!(
-            "[WHPX] VM exited, code={} exits={} reason={} elapsed={:.1}s",
-            exit_code,
-            exit_count,
-            last_exit_reason,
+        let exit_msg = format!(
+            "VM exited, code={} exits={} reason={} io_out={} serial={} io_in={} mmio={} halt={}/{} elapsed={:.1}s",
+            exit_code, exit_count, last_exit_reason,
+            io_out_count, serial_out_count, io_in_count,
+            mmio_count, total_halt_exits, halt_with_irq,
             start_time.elapsed().as_secs_f64(),
         );
+        eprintln!("[WHPX] {}", exit_msg);
+        diag!("{}", exit_msg);
 
         Ok(exit_code)
     }

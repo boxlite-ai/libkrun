@@ -8,7 +8,6 @@
 //! a worker, requests are processed synchronously (fallback mode).
 
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
 use super::block_worker::{BlockCompletion, BlockRequest, BlockWorker, BufferDesc, RequestType};
@@ -90,15 +89,15 @@ impl VirtioBlock {
         self.request_tx.is_some()
     }
 
-    /// Start the async block I/O worker thread.
+    /// Start the async block I/O worker thread (Plan B: WHPX-safe).
     ///
     /// Moves the disk backend to the worker. After this call, `queue_notify`
     /// dispatches requests asynchronously instead of blocking.
-    pub fn start_worker<M: GuestMemoryAccessor + Send + Sync + 'static>(
-        &mut self,
-        guest_mem: Arc<M>,
-        name: &str,
-    ) {
+    ///
+    /// The worker thread never accesses guest memory — all guest memory
+    /// reads/writes happen on the vCPU thread (in queue_notify and
+    /// drain_completions).
+    pub fn start_worker(&mut self, name: &str) {
         let disk = match self.disk.take() {
             Some(d) => d,
             None => {
@@ -110,14 +109,14 @@ impl VirtioBlock {
         let (req_tx, req_rx) = mpsc::channel();
         let (comp_tx, comp_rx) = mpsc::channel();
 
-        let worker = BlockWorker::new(req_rx, comp_tx, disk, guest_mem, self.read_only);
+        let worker = BlockWorker::new(req_rx, comp_tx, disk, self.read_only);
         let handle = worker.run(name);
 
         self.request_tx = Some(req_tx);
         self.completion_rx = Some(comp_rx);
         self.worker_handle = Some(handle);
 
-        log::info!("block worker '{}' started", name);
+        log::info!("block worker '{}' started (Plan B)", name);
     }
 
     /// Stop the worker thread and reclaim resources.
@@ -138,6 +137,9 @@ impl VirtioBlock {
     ///
     /// Called from `tick_and_poll()` in the vCPU loop. Returns `true` if
     /// any completions were processed (interrupt should be raised).
+    ///
+    /// **Plan B**: This method writes read data and status bytes to guest
+    /// memory on the vCPU thread, which is safe for WHPX.
     pub fn drain_completions(
         &mut self,
         queue: &mut Virtqueue,
@@ -150,6 +152,21 @@ impl VirtioBlock {
 
         let mut drained = false;
         while let Ok(comp) = rx.try_recv() {
+            // Write read data to guest memory (scatter to original buffer locations).
+            if let Some(ref read_data) = comp.read_data {
+                let mut data_offset: usize = 0;
+                for target in &comp.read_targets {
+                    let end = data_offset + target.len as usize;
+                    if end <= read_data.len() {
+                        let _ = mem.write_at(target.addr, &read_data[data_offset..end]);
+                    }
+                    data_offset = end;
+                }
+            }
+
+            // Write status byte to guest memory.
+            let _ = mem.write_at(comp.status_addr, &[comp.status]);
+
             let _ = queue.add_used(comp.head_index, comp.bytes_written, mem);
             drained = true;
         }
@@ -157,6 +174,10 @@ impl VirtioBlock {
     }
 
     /// Parse a descriptor chain header and build a BlockRequest.
+    ///
+    /// For write requests (Plan B), pre-reads data from guest memory
+    /// into the request's `write_data` field so the worker thread
+    /// never needs to access guest memory.
     ///
     /// Returns None if the chain is malformed.
     fn parse_request(
@@ -214,12 +235,33 @@ impl VirtioBlock {
             })
             .collect();
 
+        // Plan B: For write requests, pre-read data from guest memory
+        // so the worker thread never needs guest memory access.
+        let write_data = if req_type == RequestType::Write {
+            let mut all_data = Vec::new();
+            for desc in data_descs {
+                if !desc.is_write() {
+                    // Device-readable buffer: contains data to write to disk.
+                    let mut buf = vec![0u8; desc.len as usize];
+                    if mem.read_at(desc.addr, &mut buf).is_err() {
+                        log::debug!("BLK: pre-read write data failed addr=0x{:X}", desc.addr);
+                        return None;
+                    }
+                    all_data.extend_from_slice(&buf);
+                }
+            }
+            Some(all_data)
+        } else {
+            None
+        };
+
         Some(BlockRequest {
             head_index,
             req_type,
             sector,
             data_buffers,
             status_addr: status_desc.addr,
+            write_data,
         })
     }
 

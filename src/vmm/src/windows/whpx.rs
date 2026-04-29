@@ -956,6 +956,30 @@ mod imp {
             Ok(regs.rflags & (1 << 9) != 0)
         }
 
+        /// Check if there is a pending interruption that hasn't been delivered yet.
+        ///
+        /// Returns `true` if `WHvRegisterPendingInterruption` bit 0
+        /// (InterruptionPending) is set.  A new injection must NOT be
+        /// attempted while a previous one is still pending — doing so
+        /// would overwrite the old interrupt, leaving its PIC ISR bit
+        /// permanently stuck.
+        pub fn has_pending_interruption(&self) -> Result<bool> {
+            let names = [WHvRegisterPendingInterruption];
+            let mut values: Vec<WHV_REGISTER_VALUE> = vec![zeroed_reg_value(); 1];
+            let hr = unsafe {
+                WHvGetVirtualProcessorRegisters(
+                    self.partition_handle,
+                    self.index,
+                    names.as_ptr(),
+                    1,
+                    values.as_mut_ptr(),
+                )
+            };
+            check_hresult("WHvGetVirtualProcessorRegisters(pending_interruption)", hr)?;
+            let pending = unsafe { values[0].Reg64 };
+            Ok(pending & 1 != 0)
+        }
+
         /// Request an interrupt window exit.
         ///
         /// The next `run()` call will exit with [`VcpuExit::InterruptWindow`]

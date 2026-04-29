@@ -3,18 +3,20 @@
 //! Moves disk I/O off the vCPU loop into a dedicated thread so that
 //! long-running reads/writes don't starve vsock or net devices.
 //!
-//! The vCPU thread sends `BlockRequest`s (parsed descriptor chains)
-//! via an mpsc channel. The worker performs disk I/O, writes data and
-//! status bytes to guest memory, and sends `BlockCompletion`s back.
-//! The vCPU thread drains completions during `tick_and_poll()` and
-//! updates the used ring.
+//! **Plan B (WHPX-safe)**: The worker thread NEVER accesses guest memory.
+//! - For reads: worker reads disk → Vec, sends Vec in completion.
+//!   The vCPU thread writes the data to guest memory.
+//! - For writes: vCPU thread pre-reads data from guest memory → Vec,
+//!   sends Vec in request. Worker writes Vec to disk.
+//! - Status byte is always written by the vCPU thread.
+//!
+//! This avoids WHPX memory coherence issues where non-vCPU thread
+//! writes to guest memory cause ~60% boot failure on Win10.
 
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
 use super::disk::DiskBackend;
-use super::queue::GuestMemoryAccessor;
 
 /// Block size in bytes (standard sector size).
 const SECTOR_SIZE: u64 = 512;
@@ -34,6 +36,8 @@ pub enum RequestType {
 }
 
 /// A single buffer descriptor from the virtqueue chain.
+///
+/// Used in completions to tell the vCPU thread where to write read data.
 #[derive(Debug, Clone)]
 pub struct BufferDesc {
     /// Guest physical address.
@@ -54,9 +58,14 @@ pub struct BlockRequest {
     /// Starting sector (for read/write).
     pub sector: u64,
     /// Data buffer descriptors (between header and status).
+    /// For reads: describes where vCPU thread should write the returned data.
+    /// For writes: only used for metadata (the actual data is in write_data).
     pub data_buffers: Vec<BufferDesc>,
     /// Guest address of the status byte (last descriptor).
     pub status_addr: u64,
+    /// Pre-read write data from guest memory (only for Write requests).
+    /// The vCPU thread reads this from guest memory before sending.
+    pub write_data: Option<Vec<u8>>,
 }
 
 /// Completion sent from the worker back to the vCPU thread.
@@ -66,31 +75,42 @@ pub struct BlockCompletion {
     pub head_index: u16,
     /// Total bytes written to device-writable descriptors (for used ring).
     pub bytes_written: u32,
+    /// Virtio-blk status byte (OK/IOERR/UNSUPP).
+    pub status: u8,
+    /// Guest address where status byte should be written.
+    pub status_addr: u64,
+    /// Data read from disk (only for Read requests).
+    /// The vCPU thread writes this to guest memory at the addresses
+    /// specified in read_targets.
+    pub read_data: Option<Vec<u8>>,
+    /// Guest memory targets for read data (addr, len pairs from data_buffers).
+    /// The vCPU thread iterates these to scatter read_data into guest memory.
+    pub read_targets: Vec<BufferDesc>,
 }
 
 /// Worker thread that processes block I/O requests.
-pub struct BlockWorker<M: GuestMemoryAccessor + Send + Sync + 'static> {
+///
+/// The worker NEVER accesses guest memory. All guest memory reads/writes
+/// are done by the vCPU thread (Plan B for WHPX safety).
+pub struct BlockWorker {
     request_rx: mpsc::Receiver<BlockRequest>,
     completion_tx: mpsc::Sender<BlockCompletion>,
     disk: Box<dyn DiskBackend>,
-    guest_mem: Arc<M>,
     read_only: bool,
 }
 
-impl<M: GuestMemoryAccessor + Send + Sync + 'static> BlockWorker<M> {
+impl BlockWorker {
     /// Create a new block worker.
     pub fn new(
         request_rx: mpsc::Receiver<BlockRequest>,
         completion_tx: mpsc::Sender<BlockCompletion>,
         disk: Box<dyn DiskBackend>,
-        guest_mem: Arc<M>,
         read_only: bool,
     ) -> Self {
         BlockWorker {
             request_rx,
             completion_tx,
             disk,
-            guest_mem,
             read_only,
         }
     }
@@ -106,18 +126,10 @@ impl<M: GuestMemoryAccessor + Send + Sync + 'static> BlockWorker<M> {
 
     /// Blocking recv loop: process requests until the channel closes.
     fn work(mut self) {
-        log::info!("block worker started");
+        log::info!("block worker started (Plan B: no guest memory access)");
 
         while let Ok(req) = self.request_rx.recv() {
-            let (status, bytes_written) = self.process_request(&req);
-
-            // Write status byte to guest memory.
-            let _ = self.guest_mem.write_at(req.status_addr, &[status]);
-
-            let completion = BlockCompletion {
-                head_index: req.head_index,
-                bytes_written,
-            };
+            let completion = self.process_request(req);
 
             // If the vCPU thread dropped its receiver, the VM is shutting down.
             if self.completion_tx.send(completion).is_err() {
@@ -128,73 +140,162 @@ impl<M: GuestMemoryAccessor + Send + Sync + 'static> BlockWorker<M> {
         log::info!("block worker exiting");
     }
 
-    /// Process a single block request. Returns (status, bytes_written).
-    fn process_request(&mut self, req: &BlockRequest) -> (u8, u32) {
+    /// Process a single block request. Returns a completion with data/status.
+    fn process_request(&mut self, req: BlockRequest) -> BlockCompletion {
         match req.req_type {
-            RequestType::Read => self.handle_read(req.sector, &req.data_buffers),
-            RequestType::Write => self.handle_write(req.sector, &req.data_buffers),
-            RequestType::Flush => (self.handle_flush(), 0),
-            RequestType::Unsupported => (VIRTIO_BLK_S_UNSUPP, 0),
+            RequestType::Read => self.handle_read(req),
+            RequestType::Write => self.handle_write(req),
+            RequestType::Flush => self.handle_flush(req),
+            RequestType::Unsupported => BlockCompletion {
+                head_index: req.head_index,
+                bytes_written: 0,
+                status: VIRTIO_BLK_S_UNSUPP,
+                status_addr: req.status_addr,
+                read_data: None,
+                read_targets: vec![],
+            },
         }
     }
 
-    fn handle_read(&mut self, sector: u64, data_buffers: &[BufferDesc]) -> (u8, u32) {
-        let mut offset = sector * SECTOR_SIZE;
+    fn handle_read(&mut self, req: BlockRequest) -> BlockCompletion {
+        let mut offset = req.sector * SECTOR_SIZE;
+        let mut all_data = Vec::new();
         let mut bytes_written: u32 = 0;
 
-        for buf in data_buffers {
+        for buf in &req.data_buffers {
             if !buf.is_write {
                 log::debug!("BLK worker READ: buffer not device-writable");
-                return (VIRTIO_BLK_S_IOERR, bytes_written);
+                return BlockCompletion {
+                    head_index: req.head_index,
+                    bytes_written,
+                    status: VIRTIO_BLK_S_IOERR,
+                    status_addr: req.status_addr,
+                    read_data: None,
+                    read_targets: vec![],
+                };
             }
             let mut data = vec![0u8; buf.len as usize];
             if let Err(e) = self.disk.read_at(offset, &mut data) {
                 log::debug!("BLK worker READ: disk.read_at failed: {}", e);
-                return (VIRTIO_BLK_S_IOERR, bytes_written);
+                return BlockCompletion {
+                    head_index: req.head_index,
+                    bytes_written,
+                    status: VIRTIO_BLK_S_IOERR,
+                    status_addr: req.status_addr,
+                    read_data: None,
+                    read_targets: vec![],
+                };
             }
-            if let Err(e) = self.guest_mem.write_at(buf.addr, &data) {
-                log::debug!("BLK worker READ: mem.write_at failed: {}", e);
-                return (VIRTIO_BLK_S_IOERR, bytes_written);
-            }
+            all_data.extend_from_slice(&data);
             offset += buf.len as u64;
             bytes_written += buf.len;
         }
 
         // +1 for the status byte (also device-writable).
-        (VIRTIO_BLK_S_OK, bytes_written + 1)
+        BlockCompletion {
+            head_index: req.head_index,
+            bytes_written: bytes_written + 1,
+            status: VIRTIO_BLK_S_OK,
+            status_addr: req.status_addr,
+            read_data: Some(all_data),
+            read_targets: req.data_buffers,
+        }
     }
 
-    fn handle_write(&mut self, sector: u64, data_buffers: &[BufferDesc]) -> (u8, u32) {
+    fn handle_write(&mut self, req: BlockRequest) -> BlockCompletion {
         if self.read_only {
-            return (VIRTIO_BLK_S_IOERR, 0);
+            return BlockCompletion {
+                head_index: req.head_index,
+                bytes_written: 0,
+                status: VIRTIO_BLK_S_IOERR,
+                status_addr: req.status_addr,
+                read_data: None,
+                read_targets: vec![],
+            };
         }
 
-        let mut offset = sector * SECTOR_SIZE;
+        let write_data = match req.write_data {
+            Some(ref data) => data,
+            None => {
+                log::debug!("BLK worker WRITE: no write_data provided");
+                return BlockCompletion {
+                    head_index: req.head_index,
+                    bytes_written: 0,
+                    status: VIRTIO_BLK_S_IOERR,
+                    status_addr: req.status_addr,
+                    read_data: None,
+                    read_targets: vec![],
+                };
+            }
+        };
 
-        for buf in data_buffers {
+        let mut offset = req.sector * SECTOR_SIZE;
+        let mut data_offset: usize = 0;
+
+        for buf in &req.data_buffers {
             if buf.is_write {
                 // Data for write must be device-readable (not device-writable).
-                return (VIRTIO_BLK_S_IOERR, 0);
+                return BlockCompletion {
+                    head_index: req.head_index,
+                    bytes_written: 0,
+                    status: VIRTIO_BLK_S_IOERR,
+                    status_addr: req.status_addr,
+                    read_data: None,
+                    read_targets: vec![],
+                };
             }
-            let mut data = vec![0u8; buf.len as usize];
-            if self.guest_mem.read_at(buf.addr, &mut data).is_err() {
-                return (VIRTIO_BLK_S_IOERR, 0);
+            let end = data_offset + buf.len as usize;
+            if end > write_data.len() {
+                log::debug!("BLK worker WRITE: write_data too short");
+                return BlockCompletion {
+                    head_index: req.head_index,
+                    bytes_written: 0,
+                    status: VIRTIO_BLK_S_IOERR,
+                    status_addr: req.status_addr,
+                    read_data: None,
+                    read_targets: vec![],
+                };
             }
-            if self.disk.write_at(offset, &data).is_err() {
-                return (VIRTIO_BLK_S_IOERR, 0);
+            if self.disk.write_at(offset, &write_data[data_offset..end]).is_err() {
+                return BlockCompletion {
+                    head_index: req.head_index,
+                    bytes_written: 0,
+                    status: VIRTIO_BLK_S_IOERR,
+                    status_addr: req.status_addr,
+                    read_data: None,
+                    read_targets: vec![],
+                };
             }
             offset += buf.len as u64;
+            data_offset = end;
         }
 
         // Only status byte is device-writable for writes.
-        (VIRTIO_BLK_S_OK, 1)
+        BlockCompletion {
+            head_index: req.head_index,
+            bytes_written: 1,
+            status: VIRTIO_BLK_S_OK,
+            status_addr: req.status_addr,
+            read_data: None,
+            read_targets: vec![],
+        }
     }
 
-    fn handle_flush(&mut self) -> u8 {
-        if self.disk.flush().is_err() {
+    fn handle_flush(&mut self, req: BlockRequest) -> BlockCompletion {
+        let status = if self.disk.flush().is_err() {
             VIRTIO_BLK_S_IOERR
         } else {
             VIRTIO_BLK_S_OK
+        };
+        // bytes_written=1 for the status byte (device-writable),
+        // matching the sync path in VirtioBlock::queue_notify.
+        BlockCompletion {
+            head_index: req.head_index,
+            bytes_written: 1,
+            status,
+            status_addr: req.status_addr,
+            read_data: None,
+            read_targets: vec![],
         }
     }
 }
@@ -202,7 +303,6 @@ impl<M: GuestMemoryAccessor + Send + Sync + 'static> BlockWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::sync::mpsc;
 
     /// In-memory disk backend for testing.
@@ -276,65 +376,14 @@ mod tests {
         }
     }
 
-    /// Thread-safe mock guest memory for testing the worker.
-    struct MockMem {
-        data: std::sync::Mutex<Vec<u8>>,
-    }
-
-    impl MockMem {
-        fn new(size: usize) -> Self {
-            MockMem {
-                data: std::sync::Mutex::new(vec![0u8; size]),
-            }
-        }
-
-        fn write_bytes(&self, addr: u64, bytes: &[u8]) {
-            let a = addr as usize;
-            let mut data = self.data.lock().unwrap();
-            data[a..a + bytes.len()].copy_from_slice(bytes);
-        }
-
-        fn read_bytes(&self, addr: u64, len: usize) -> Vec<u8> {
-            let a = addr as usize;
-            let data = self.data.lock().unwrap();
-            data[a..a + len].to_vec()
-        }
-    }
-
-    impl GuestMemoryAccessor for MockMem {
-        fn read_at(&self, addr: u64, buf: &mut [u8]) -> super::super::super::super::error::Result<()> {
-            let a = addr as usize;
-            let data = self.data.lock().unwrap();
-            if a + buf.len() > data.len() {
-                return Err(super::super::super::super::error::WkrunError::Memory(
-                    "out of bounds".into(),
-                ));
-            }
-            buf.copy_from_slice(&data[a..a + buf.len()]);
-            Ok(())
-        }
-        fn write_at(&self, addr: u64, data: &[u8]) -> super::super::super::super::error::Result<()> {
-            let a = addr as usize;
-            let mut mem = self.data.lock().unwrap();
-            if a + data.len() > mem.len() {
-                return Err(super::super::super::super::error::WkrunError::Memory(
-                    "out of bounds".into(),
-                ));
-            }
-            mem[a..a + data.len()].copy_from_slice(data);
-            Ok(())
-        }
-    }
-
     #[test]
     fn test_worker_read_request() {
         let (req_tx, req_rx) = mpsc::channel();
         let (comp_tx, comp_rx) = mpsc::channel();
 
         let disk = MemDisk::with_pattern(4);
-        let mem = Arc::new(MockMem::new(0x10000));
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem.clone(), false);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
         let handle = worker.run("test-blk-read");
 
         // Send a read request for sector 2 (pattern = 0x02).
@@ -349,6 +398,7 @@ mod tests {
                     is_write: true,
                 }],
                 status_addr: 0x3000,
+                write_data: None,
             })
             .unwrap();
 
@@ -360,14 +410,18 @@ mod tests {
         let comp = comp_rx.recv().unwrap();
         assert_eq!(comp.head_index, 42);
         assert_eq!(comp.bytes_written, 513); // 512 data + 1 status
+        assert_eq!(comp.status, VIRTIO_BLK_S_OK);
+        assert_eq!(comp.status_addr, 0x3000);
 
-        // Verify data written to guest memory.
-        let data = mem.read_bytes(0x2000, 512);
-        assert!(data.iter().all(|&b| b == 0x02));
+        // Verify read data is returned in completion (not written to guest mem).
+        let read_data = comp.read_data.unwrap();
+        assert_eq!(read_data.len(), 512);
+        assert!(read_data.iter().all(|&b| b == 0x02));
 
-        // Verify status byte.
-        let status = mem.read_bytes(0x3000, 1);
-        assert_eq!(status[0], VIRTIO_BLK_S_OK);
+        // Verify read targets match the original buffers.
+        assert_eq!(comp.read_targets.len(), 1);
+        assert_eq!(comp.read_targets[0].addr, 0x2000);
+        assert_eq!(comp.read_targets[0].len, 512);
     }
 
     #[test]
@@ -376,12 +430,11 @@ mod tests {
         let (comp_tx, comp_rx) = mpsc::channel();
 
         let disk = MemDisk::new(2048);
-        let mem = Arc::new(MockMem::new(0x10000));
 
-        // Write data to guest memory that the worker will read.
-        mem.write_bytes(0x2000, &vec![0xAB; 512]);
+        // Write data is pre-read from guest memory by the vCPU thread.
+        let write_data = vec![0xAB; 512];
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem.clone(), false);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
         let handle = worker.run("test-blk-write");
 
         req_tx
@@ -395,6 +448,7 @@ mod tests {
                     is_write: false, // Device-readable for writes.
                 }],
                 status_addr: 0x3000,
+                write_data: Some(write_data),
             })
             .unwrap();
 
@@ -404,9 +458,8 @@ mod tests {
         let comp = comp_rx.recv().unwrap();
         assert_eq!(comp.head_index, 7);
         assert_eq!(comp.bytes_written, 1); // Only status byte is writable.
-
-        let status = mem.read_bytes(0x3000, 1);
-        assert_eq!(status[0], VIRTIO_BLK_S_OK);
+        assert_eq!(comp.status, VIRTIO_BLK_S_OK);
+        assert!(comp.read_data.is_none());
     }
 
     #[test]
@@ -415,9 +468,8 @@ mod tests {
         let (comp_tx, comp_rx) = mpsc::channel();
 
         let disk = MemDisk::new(1024);
-        let mem = Arc::new(MockMem::new(0x10000));
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem.clone(), false);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
         let handle = worker.run("test-blk-flush");
 
         req_tx
@@ -427,6 +479,7 @@ mod tests {
                 sector: 0,
                 data_buffers: vec![],
                 status_addr: 0x3000,
+                write_data: None,
             })
             .unwrap();
 
@@ -435,10 +488,8 @@ mod tests {
 
         let comp = comp_rx.recv().unwrap();
         assert_eq!(comp.head_index, 3);
-        assert_eq!(comp.bytes_written, 0);
-
-        let status = mem.read_bytes(0x3000, 1);
-        assert_eq!(status[0], VIRTIO_BLK_S_OK);
+        assert_eq!(comp.bytes_written, 1); // status byte
+        assert_eq!(comp.status, VIRTIO_BLK_S_OK);
     }
 
     #[test]
@@ -447,9 +498,8 @@ mod tests {
         let (comp_tx, comp_rx) = mpsc::channel();
 
         let disk = MemDisk::new(1024);
-        let mem = Arc::new(MockMem::new(0x10000));
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem.clone(), false);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
         let handle = worker.run("test-blk-unsupp");
 
         req_tx
@@ -459,6 +509,7 @@ mod tests {
                 sector: 0,
                 data_buffers: vec![],
                 status_addr: 0x3000,
+                write_data: None,
             })
             .unwrap();
 
@@ -468,9 +519,7 @@ mod tests {
         let comp = comp_rx.recv().unwrap();
         assert_eq!(comp.head_index, 5);
         assert_eq!(comp.bytes_written, 0);
-
-        let status = mem.read_bytes(0x3000, 1);
-        assert_eq!(status[0], VIRTIO_BLK_S_UNSUPP);
+        assert_eq!(comp.status, VIRTIO_BLK_S_UNSUPP);
     }
 
     #[test]
@@ -479,9 +528,8 @@ mod tests {
         let (comp_tx, comp_rx) = mpsc::channel();
 
         let disk = MemDisk::with_pattern(8);
-        let mem = Arc::new(MockMem::new(0x10000));
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem.clone(), false);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
         let handle = worker.run("test-blk-multi");
 
         // Send 3 read requests for sectors 0, 1, 2.
@@ -497,6 +545,7 @@ mod tests {
                         is_write: true,
                     }],
                     status_addr: 0x8000 + i as u64,
+                    write_data: None,
                 })
                 .unwrap();
         }
@@ -511,13 +560,14 @@ mod tests {
         }
         assert_eq!(completions.len(), 3);
 
-        // Verify each sector's data.
-        for i in 0..3u16 {
-            let data = mem.read_bytes(0x2000 + (i as u64) * 0x1000, 512);
+        // Verify each sector's data is in the completion.
+        for (idx, comp) in completions.iter().enumerate() {
+            let data = comp.read_data.as_ref().unwrap();
+            assert_eq!(data.len(), 512);
             assert!(
-                data.iter().all(|&b| b == i as u8),
+                data.iter().all(|&b| b == idx as u8),
                 "sector {} data mismatch",
-                i
+                idx
             );
         }
     }
@@ -528,9 +578,8 @@ mod tests {
         let (comp_tx, comp_rx) = mpsc::channel();
 
         let disk = MemDisk::new(1024);
-        let mem = Arc::new(MockMem::new(0x10000));
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem.clone(), true);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), true);
         let handle = worker.run("test-blk-ro");
 
         req_tx
@@ -544,6 +593,7 @@ mod tests {
                     is_write: false,
                 }],
                 status_addr: 0x3000,
+                write_data: Some(vec![0xAB; 512]),
             })
             .unwrap();
 
@@ -552,9 +602,7 @@ mod tests {
 
         let comp = comp_rx.recv().unwrap();
         assert_eq!(comp.bytes_written, 0);
-
-        let status = mem.read_bytes(0x3000, 1);
-        assert_eq!(status[0], VIRTIO_BLK_S_IOERR);
+        assert_eq!(comp.status, VIRTIO_BLK_S_IOERR);
     }
 
     #[test]
@@ -563,13 +611,45 @@ mod tests {
         let (comp_tx, _comp_rx) = mpsc::channel();
 
         let disk = MemDisk::new(1024);
-        let mem = Arc::new(MockMem::new(0x1000));
 
-        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), mem, false);
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
         let handle = worker.run("test-blk-shutdown");
 
         // Drop the sender — worker should exit gracefully.
         drop(req_tx);
         handle.join().unwrap(); // Should not hang or panic.
+    }
+
+    #[test]
+    fn test_worker_write_missing_data_returns_error() {
+        let (req_tx, req_rx) = mpsc::channel();
+        let (comp_tx, comp_rx) = mpsc::channel();
+
+        let disk = MemDisk::new(2048);
+
+        let worker = BlockWorker::new(req_rx, comp_tx, Box::new(disk), false);
+        let handle = worker.run("test-blk-write-nodata");
+
+        // Write request without write_data should fail.
+        req_tx
+            .send(BlockRequest {
+                head_index: 1,
+                req_type: RequestType::Write,
+                sector: 0,
+                data_buffers: vec![BufferDesc {
+                    addr: 0x2000,
+                    len: 512,
+                    is_write: false,
+                }],
+                status_addr: 0x3000,
+                write_data: None, // Missing!
+            })
+            .unwrap();
+
+        drop(req_tx);
+        handle.join().unwrap();
+
+        let comp = comp_rx.recv().unwrap();
+        assert_eq!(comp.status, VIRTIO_BLK_S_IOERR);
     }
 }

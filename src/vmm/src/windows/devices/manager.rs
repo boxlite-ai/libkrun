@@ -215,6 +215,11 @@ pub struct DeviceManager {
     /// Second virtio-blk device (slot 4) — optional, for guest rootfs.
     virtio_blk2: Option<VirtioMmioDevice<VirtioBlock>>,
 
+    /// Diagnostic: count QUEUE_NOTIFY writes to blk devices.
+    blk_queue_notify_count: u64,
+    /// Diagnostic: count block I/O completions drained.
+    blk_completion_count: u64,
+
     /// Track whether we've requested an interrupt window.
     window_requested: bool,
     /// Last PIT tick timestamp.
@@ -364,6 +369,8 @@ impl DeviceManager {
             virtio_9p,
             virtio_net,
             virtio_blk2,
+            blk_queue_notify_count: 0,
+            blk_completion_count: 0,
             window_requested: false,
             last_tick: Instant::now(),
             port61_toggle: false,
@@ -515,6 +522,9 @@ impl DeviceManager {
         let blk2_offset = address.wrapping_sub(mmio_base_for_slot(4));
 
         if blk_offset < MMIO_SLOT_SIZE {
+            if blk_offset == 0x050 {
+                self.blk_queue_notify_count += 1;
+            }
             if let Some(ref mut dev) = self.virtio_blk {
                 if dev.write(blk_offset, data as u32, size, mem) {
                     self.pic.raise_irq(irq_for_slot(0));
@@ -540,6 +550,9 @@ impl DeviceManager {
                 }
             }
         } else if blk2_offset < MMIO_SLOT_SIZE {
+            if blk2_offset == 0x050 {
+                self.blk_queue_notify_count += 1;
+            }
             if let Some(ref mut dev) = self.virtio_blk2 {
                 if dev.write(blk2_offset, data as u32, size, mem) {
                     self.pic.raise_irq(irq_for_slot(4));
@@ -548,20 +561,16 @@ impl DeviceManager {
         }
     }
 
-    /// Start async block I/O workers for virtio-blk devices.
+    /// Start async block I/O workers for virtio-blk devices (Plan B: WHPX-safe).
     ///
-    /// Must be called after the guest memory is set up, before the vCPU loop.
-    pub fn start_blk_workers<M: GuestMemoryAccessor + Send + Sync + 'static>(
-        &mut self,
-        guest_mem: Arc<M>,
-    ) {
+    /// Workers never access guest memory — all guest memory I/O happens
+    /// on the vCPU thread (in queue_notify and drain_completions).
+    pub fn start_blk_workers(&mut self) {
         if let Some(ref mut dev) = self.virtio_blk {
-            dev.backend_mut()
-                .start_worker(Arc::clone(&guest_mem), "blk-worker-0");
+            dev.backend_mut().start_worker("blk-worker-0");
         }
         if let Some(ref mut dev) = self.virtio_blk2 {
-            dev.backend_mut()
-                .start_worker(Arc::clone(&guest_mem), "blk-worker-1");
+            dev.backend_mut().start_worker("blk-worker-1");
         }
     }
 
@@ -596,11 +605,13 @@ impl DeviceManager {
         // Drain async block I/O completions.
         if let Some(ref mut dev) = self.virtio_blk {
             if dev.poll_backend(mem) {
+                self.blk_completion_count += 1;
                 self.pic.raise_irq(irq_for_slot(0));
             }
         }
         if let Some(ref mut dev) = self.virtio_blk2 {
             if dev.poll_backend(mem) {
+                self.blk_completion_count += 1;
                 self.pic.raise_irq(irq_for_slot(4));
             }
         }
@@ -653,6 +664,11 @@ impl DeviceManager {
         }
     }
 
+    /// Return block I/O diagnostic counters: (queue_notify_count, completion_count).
+    pub fn blk_stats(&self) -> (u64, u64) {
+        (self.blk_queue_notify_count, self.blk_completion_count)
+    }
+
     /// Whether an ACPI S5 shutdown was detected.
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
@@ -682,6 +698,8 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
         virtio_9p: None,
         virtio_net: None,
         virtio_blk2: None,
+        blk_queue_notify_count: 0,
+        blk_completion_count: 0,
         window_requested: false,
         last_tick: Instant::now(),
         port61_toggle: false,

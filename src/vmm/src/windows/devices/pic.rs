@@ -268,12 +268,20 @@ impl Pic {
     pub fn acknowledge(&mut self) -> Option<u8> {
         if let Some(master_irq) = self.master.pending_irq() {
             if master_irq == CASCADE_IRQ {
-                // Cascade: acknowledge slave first.
+                // Cascade: try to acknowledge slave first.
                 let vector = self.slave.acknowledge();
-                // Acknowledge cascade on master.
-                self.master.acknowledge();
-                // If no more slave IRQs, clear cascade.
-                if self.slave.pending_irq().is_none() {
+                if vector.is_some() {
+                    // Slave had a real IRQ — acknowledge cascade on master.
+                    self.master.acknowledge();
+                    // If no more slave IRQs pending, clear cascade IRR.
+                    if self.slave.pending_irq().is_none() {
+                        self.master.clear_irq(CASCADE_IRQ);
+                    }
+                } else {
+                    // Spurious cascade: slave has no deliverable IRQ.
+                    // Clear cascade IRR without setting ISR — otherwise
+                    // ISR bit 2 would be permanently stuck (guest never
+                    // sends EOI for an interrupt it didn't receive).
                     self.master.clear_irq(CASCADE_IRQ);
                 }
                 vector
@@ -292,6 +300,16 @@ impl Pic {
             self.master.isr,
             self.master.imr,
             self.master.vector_base,
+        )
+    }
+
+    /// Get slave PIC state for diagnostics: (IRR, ISR, IMR, vector_base).
+    pub fn slave_state(&self) -> (u8, u8, u8, u8) {
+        (
+            self.slave.irr,
+            self.slave.isr,
+            self.slave.imr,
+            self.slave.vector_base,
         )
     }
 
