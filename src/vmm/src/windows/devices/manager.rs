@@ -14,7 +14,7 @@ use super::super::cmdline::{irq_for_slot, mmio_base_for_slot, MmioSlot, MMIO_SLO
 use super::super::context::VmContext;
 use super::super::error::{Result, WkrunError};
 use super::super::vcpu::IoHandler;
-use super::pic::Pic;
+use super::irq_chip::IrqChip;
 use super::pit::Pit;
 use super::serial::{Serial, COM1_BASE};
 use super::virtio::block::VirtioBlock;
@@ -200,7 +200,7 @@ pub struct DeviceSetup {
 /// Centralized device manager for all emulated devices.
 pub struct DeviceManager {
     serial: Serial,
-    pub pic: Pic,
+    pub irq_chip: IrqChip,
     pit: Pit,
     cmos_addr: u8,
 
@@ -219,6 +219,10 @@ pub struct DeviceManager {
     blk_queue_notify_count: u64,
     /// Diagnostic: count block I/O completions drained.
     blk_completion_count: u64,
+    /// Diagnostic: count MMIO accesses to IOAPIC range.
+    ioapic_mmio_count: u64,
+    /// Diagnostic: count MMIO accesses to LAPIC range.
+    lapic_mmio_count: u64,
 
     /// Track whether we've requested an interrupt window.
     window_requested: bool,
@@ -361,7 +365,7 @@ impl DeviceManager {
 
         let devices = DeviceManager {
             serial,
-            pic: Pic::new(),
+            irq_chip: IrqChip::new(),
             pit: Pit::new(),
             cmos_addr: 0,
             virtio_blk,
@@ -371,6 +375,8 @@ impl DeviceManager {
             virtio_blk2,
             blk_queue_notify_count: 0,
             blk_completion_count: 0,
+            ioapic_mmio_count: 0,
+            lapic_mmio_count: 0,
             window_requested: false,
             last_tick: Instant::now(),
             port61_toggle: false,
@@ -392,11 +398,11 @@ impl DeviceManager {
         if self.serial.handles_port(port) {
             self.serial.io_write(port, size, data);
             if self.serial.has_interrupt() {
-                self.pic.raise_irq(4);
+                self.irq_chip.raise_irq(4);
             }
-        } else if self.pic.handles_port(port) {
+        } else if self.irq_chip.pic.handles_port(port) {
             log::trace!("PIC write: port={:#X} data={:#X}", port, data as u8);
-            self.pic.write_port(port, data as u8);
+            self.irq_chip.pic.write_port(port, data as u8);
         } else if self.pit.handles_port(port) {
             log::trace!("PIT write: port={:#X} data={:#X}", port, data as u8);
             self.pit.write_port(port, data as u8);
@@ -422,11 +428,11 @@ impl DeviceManager {
         if self.serial.handles_port(port) {
             let val = self.serial.io_read(port, size);
             if self.serial.has_interrupt() {
-                self.pic.raise_irq(4);
+                self.irq_chip.raise_irq(4);
             }
             val
-        } else if self.pic.handles_port(port) {
-            self.pic.read_port(port) as u32
+        } else if self.irq_chip.pic.handles_port(port) {
+            self.irq_chip.pic.read_port(port) as u32
         } else if self.pit.handles_port(port) {
             self.pit.read_port(port) as u32
         } else if port == 0x71 {
@@ -467,7 +473,18 @@ impl DeviceManager {
     /// Handle an MMIO read from the guest.
     ///
     /// Returns the data to inject into the destination register.
-    pub fn handle_mmio_read(&self, address: u64, size: u8) -> u64 {
+    pub fn handle_mmio_read(&mut self, address: u64, size: u8) -> u64 {
+        // Check IOAPIC/LAPIC ranges first.
+        if let Some(val) = self.irq_chip.handle_mmio_read(address, size) {
+            use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
+            if address >= IOAPIC_MMIO_BASE && address < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
+                self.ioapic_mmio_count += 1;
+            } else if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
+                self.lapic_mmio_count += 1;
+            }
+            return val as u64;
+        }
+
         let blk_offset = address.wrapping_sub(mmio_base_for_slot(0));
         let vsock_offset = address.wrapping_sub(mmio_base_for_slot(1));
         let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
@@ -515,6 +532,17 @@ impl DeviceManager {
         data: u64,
         mem: &dyn GuestMemoryAccessor,
     ) {
+        // Check IOAPIC/LAPIC ranges first.
+        if self.irq_chip.handle_mmio_write(address, size as u8, data as u32) {
+            use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
+            if address >= IOAPIC_MMIO_BASE && address < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
+                self.ioapic_mmio_count += 1;
+            } else if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
+                self.lapic_mmio_count += 1;
+            }
+            return;
+        }
+
         let blk_offset = address.wrapping_sub(mmio_base_for_slot(0));
         let vsock_offset = address.wrapping_sub(mmio_base_for_slot(1));
         let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
@@ -527,7 +555,7 @@ impl DeviceManager {
             }
             if let Some(ref mut dev) = self.virtio_blk {
                 if dev.write(blk_offset, data as u32, size, mem) {
-                    self.pic.raise_irq(irq_for_slot(0));
+                    self.irq_chip.raise_irq(irq_for_slot(0));
                 }
             }
         } else if vsock_offset < MMIO_SLOT_SIZE {
@@ -535,18 +563,18 @@ impl DeviceManager {
                 .virtio_vsock
                 .write(vsock_offset, data as u32, size, mem)
             {
-                self.pic.raise_irq(irq_for_slot(1));
+                self.irq_chip.raise_irq(irq_for_slot(1));
             }
         } else if p9_offset < MMIO_SLOT_SIZE {
             if let Some(ref mut dev) = self.virtio_9p {
                 if dev.write(p9_offset, data as u32, size, mem) {
-                    self.pic.raise_irq(irq_for_slot(2));
+                    self.irq_chip.raise_irq(irq_for_slot(2));
                 }
             }
         } else if net_offset < MMIO_SLOT_SIZE {
             if let Some(ref mut dev) = self.virtio_net {
                 if dev.write(net_offset, data as u32, size, mem) {
-                    self.pic.raise_irq(irq_for_slot(3));
+                    self.irq_chip.raise_irq(irq_for_slot(3));
                 }
             }
         } else if blk2_offset < MMIO_SLOT_SIZE {
@@ -555,7 +583,7 @@ impl DeviceManager {
             }
             if let Some(ref mut dev) = self.virtio_blk2 {
                 if dev.write(blk2_offset, data as u32, size, mem) {
-                    self.pic.raise_irq(irq_for_slot(4));
+                    self.irq_chip.raise_irq(irq_for_slot(4));
                 }
             }
         }
@@ -598,34 +626,37 @@ impl DeviceManager {
         if elapsed_ns > 0 {
             let fires = self.pit.tick(elapsed_ns);
             for _ in 0..fires {
-                self.pic.raise_irq(0);
+                self.irq_chip.raise_irq(0);
             }
         }
+
+        // Tick LAPIC timer (only fires in APIC mode).
+        self.irq_chip.tick_timer(now);
 
         // Drain async block I/O completions.
         if let Some(ref mut dev) = self.virtio_blk {
             if dev.poll_backend(mem) {
                 self.blk_completion_count += 1;
-                self.pic.raise_irq(irq_for_slot(0));
+                self.irq_chip.raise_irq(irq_for_slot(0));
             }
         }
         if let Some(ref mut dev) = self.virtio_blk2 {
             if dev.poll_backend(mem) {
                 self.blk_completion_count += 1;
-                self.pic.raise_irq(irq_for_slot(4));
+                self.irq_chip.raise_irq(irq_for_slot(4));
             }
         }
 
         // Poll vsock for host-initiated data.
         if self.virtio_vsock.poll(mem) {
             log::debug!("vsock poll raised IRQ {}", irq_for_slot(1));
-            self.pic.raise_irq(irq_for_slot(1));
+            self.irq_chip.raise_irq(irq_for_slot(1));
         }
 
         // Poll net for incoming frames.
         if let Some(ref mut dev) = self.virtio_net {
             if dev.poll(mem) {
-                self.pic.raise_irq(irq_for_slot(3));
+                self.irq_chip.raise_irq(irq_for_slot(3));
             }
         }
     }
@@ -669,6 +700,11 @@ impl DeviceManager {
         (self.blk_queue_notify_count, self.blk_completion_count)
     }
 
+    /// Get IOAPIC/LAPIC MMIO access counts for diagnostics.
+    pub fn apic_mmio_stats(&self) -> (u64, u64) {
+        (self.ioapic_mmio_count, self.lapic_mmio_count)
+    }
+
     /// Whether an ACPI S5 shutdown was detected.
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
@@ -690,7 +726,7 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
     let vsock_backend = VirtioVsock::new(GUEST_CID);
     DeviceManager {
         serial,
-        pic: Pic::new(),
+        irq_chip: IrqChip::new(),
         pit: Pit::new(),
         cmos_addr: 0,
         virtio_blk: None,
@@ -700,6 +736,8 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
         virtio_blk2: None,
         blk_queue_notify_count: 0,
         blk_completion_count: 0,
+        ioapic_mmio_count: 0,
+        lapic_mmio_count: 0,
         window_requested: false,
         last_tick: Instant::now(),
         port61_toggle: false,

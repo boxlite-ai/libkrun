@@ -1,23 +1,34 @@
 //! Minimal ACPI table generation for WHPX guest boot.
 //!
-//! Generates RSDP, RSDT, FADT, and DSDT tables so the Linux kernel can
-//! discover the PM1a_CNT register and perform clean ACPI S5 shutdown
-//! instead of falling back to an HLT loop.
+//! Generates RSDP, RSDT, FADT, DSDT, and MADT tables so the Linux kernel can:
+//! - Discover the PM1a_CNT register for clean ACPI S5 shutdown
+//! - Discover the IOAPIC and LAPIC for APIC-mode interrupt routing
 
 /// Total size of the ACPI region in guest memory.
-pub const ACPI_REGION_SIZE: u64 = 0x200; // 512 bytes
+pub const ACPI_REGION_SIZE: u64 = 0x400; // 1024 bytes
 
 // Table offsets within the ACPI region.
 const RSDP_OFFSET: usize = 0x00;
 const RSDT_OFFSET: usize = 0x20;
 const FADT_OFFSET: usize = 0x60;
 const DSDT_OFFSET: usize = 0x100;
+const MADT_OFFSET: usize = 0x140;
 
 // Table sizes.
 const RSDP_SIZE: usize = 20;
-const RSDT_SIZE: usize = 40; // 36-byte header + 4-byte entry
+const RSDT_HEADER_SIZE: usize = 36;
+const RSDT_ENTRIES: usize = 2; // FADT + MADT
+const RSDT_SIZE: usize = RSDT_HEADER_SIZE + RSDT_ENTRIES * 4; // 36 + 8 = 44
 const FADT_SIZE: usize = 116;
 const DSDT_HEADER_SIZE: usize = 36;
+
+/// MADT structure sizes.
+const MADT_HEADER_SIZE: usize = 44; // 36-byte ACPI header + 4-byte Local APIC Address + 4-byte Flags
+const MADT_LAPIC_ENTRY_SIZE: usize = 8; // Type 0: Processor Local APIC
+const MADT_IOAPIC_ENTRY_SIZE: usize = 12; // Type 1: I/O APIC
+const MADT_ISO_ENTRY_SIZE: usize = 10; // Type 2: Interrupt Source Override
+const MADT_SIZE: usize =
+    MADT_HEADER_SIZE + MADT_LAPIC_ENTRY_SIZE + MADT_IOAPIC_ENTRY_SIZE + MADT_ISO_ENTRY_SIZE;
 
 // ACPI PM1a I/O port addresses (must match manager.rs constants).
 const PM1A_EVT_BLK: u32 = 0x600;
@@ -28,6 +39,12 @@ const PM1A_CNT_BLK: u32 = 0x604;
 /// Must not conflict with timer (IRQ 0), serial (IRQ 4), or
 /// virtio-MMIO devices (IRQ 5-9). IRQ 11 is unused.
 const SCI_INT: u16 = 11;
+
+/// IOAPIC base address (must match memory.rs).
+const IOAPIC_BASE: u32 = 0xFEC0_0000;
+
+/// LAPIC base address (must match memory.rs).
+const LAPIC_BASE: u32 = 0xFEE0_0000;
 
 /// AML bytecode for the `\_S5_` sleep package.
 ///
@@ -43,7 +60,7 @@ const S5_AML: &[u8] = &[
     0x08, 0x5C, 0x5F, 0x53, 0x35, 0x5F, 0x12, 0x0A, 0x04, 0x0A, 0x05, 0x0A, 0x05, 0x00, 0x00,
 ];
 
-/// Build ACPI tables (RSDP, RSDT, FADT, DSDT) for the given base address.
+/// Build ACPI tables (RSDP, RSDT, FADT, DSDT, MADT) for the given base address.
 ///
 /// Returns a `Vec<u8>` of exactly `ACPI_REGION_SIZE` bytes. The caller
 /// writes this to guest memory at `acpi_base`.
@@ -53,6 +70,7 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     let rsdt_addr = acpi_base + RSDT_OFFSET as u64;
     let fadt_addr = acpi_base + FADT_OFFSET as u64;
     let dsdt_addr = acpi_base + DSDT_OFFSET as u64;
+    let madt_addr = acpi_base + MADT_OFFSET as u64;
 
     // ---- RSDP (20 bytes at offset 0x00) ----
     let rsdp = &mut region[RSDP_OFFSET..RSDP_OFFSET + RSDP_SIZE];
@@ -63,7 +81,7 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     rsdp[16..20].copy_from_slice(&(rsdt_addr as u32).to_le_bytes()); // RsdtAddress
     acpi_checksum(&mut region[RSDP_OFFSET..RSDP_OFFSET + RSDP_SIZE], 8);
 
-    // ---- RSDT (40 bytes at offset 0x20) ----
+    // ---- RSDT (44 bytes at offset 0x20) ----
     let rsdt = &mut region[RSDT_OFFSET..RSDT_OFFSET + RSDT_SIZE];
     rsdt[0..4].copy_from_slice(b"RSDT"); // Signature
     rsdt[4..8].copy_from_slice(&(RSDT_SIZE as u32).to_le_bytes()); // Length
@@ -76,6 +94,8 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     rsdt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
                                                        // Entry[0]: pointer to FADT
     rsdt[36..40].copy_from_slice(&(fadt_addr as u32).to_le_bytes());
+    // Entry[1]: pointer to MADT
+    rsdt[40..44].copy_from_slice(&(madt_addr as u32).to_le_bytes());
     acpi_checksum(&mut region[RSDT_OFFSET..RSDT_OFFSET + RSDT_SIZE], 9);
 
     // ---- FADT (116 bytes at offset 0x60) ----
@@ -120,7 +140,67 @@ pub fn build_acpi_tables(acpi_base: u64) -> Vec<u8> {
     dsdt[DSDT_HEADER_SIZE..DSDT_HEADER_SIZE + S5_AML.len()].copy_from_slice(S5_AML);
     acpi_checksum(&mut region[DSDT_OFFSET..DSDT_OFFSET + dsdt_size], 9);
 
+    // ---- MADT (Multiple APIC Description Table) at offset 0x140 ----
+    build_madt(&mut region[MADT_OFFSET..MADT_OFFSET + MADT_SIZE]);
+
     region
+}
+
+/// Build the MADT (Multiple APIC Description Table).
+///
+/// Tells the Linux kernel about the Local APIC and I/O APIC.
+///
+/// Structure:
+/// - Header (44 bytes): standard ACPI header + LAPIC address + flags
+/// - Entry 0 - Local APIC (type 0, 8 bytes): Processor 0, APIC ID 0
+/// - Entry 1 - I/O APIC (type 1, 12 bytes): IOAPIC ID 0, base 0xFEC00000
+/// - Entry 2 - Interrupt Source Override (type 2, 10 bytes): IRQ 0 → GSI 2
+fn build_madt(madt: &mut [u8]) {
+    // ACPI header.
+    madt[0..4].copy_from_slice(b"APIC"); // Signature
+    madt[4..8].copy_from_slice(&(MADT_SIZE as u32).to_le_bytes()); // Length
+    madt[8] = 1; // Revision
+                 // madt[9] = checksum (computed below)
+    madt[10..16].copy_from_slice(b"BOXLTE"); // OEMID
+    madt[16..24].copy_from_slice(b"BOXLITEV"); // OEM Table ID
+    madt[24..28].copy_from_slice(&1u32.to_le_bytes()); // OEM Revision
+    madt[28..32].copy_from_slice(b"BXLT"); // Creator ID
+    madt[32..36].copy_from_slice(&1u32.to_le_bytes()); // Creator Revision
+
+    // Local APIC Address (offset 36, 4 bytes).
+    madt[36..40].copy_from_slice(&LAPIC_BASE.to_le_bytes());
+
+    // Flags (offset 40, 4 bytes): PCAT_COMPAT = 1 (dual 8259 PICs present).
+    madt[40..44].copy_from_slice(&1u32.to_le_bytes());
+
+    // --- Entry 0: Processor Local APIC (type 0, 8 bytes) ---
+    let mut off = MADT_HEADER_SIZE;
+    madt[off] = 0; // Entry type: Processor Local APIC
+    madt[off + 1] = MADT_LAPIC_ENTRY_SIZE as u8; // Length
+    madt[off + 2] = 0; // ACPI Processor ID
+    madt[off + 3] = 0; // APIC ID
+    madt[off + 4..off + 8].copy_from_slice(&1u32.to_le_bytes()); // Flags: enabled
+    off += MADT_LAPIC_ENTRY_SIZE;
+
+    // --- Entry 1: I/O APIC (type 1, 12 bytes) ---
+    madt[off] = 1; // Entry type: I/O APIC
+    madt[off + 1] = MADT_IOAPIC_ENTRY_SIZE as u8; // Length
+    madt[off + 2] = 0; // I/O APIC ID
+    madt[off + 3] = 0; // Reserved
+    madt[off + 4..off + 8].copy_from_slice(&IOAPIC_BASE.to_le_bytes()); // I/O APIC Address
+    madt[off + 8..off + 12].copy_from_slice(&0u32.to_le_bytes()); // Global System Interrupt Base
+    off += MADT_IOAPIC_ENTRY_SIZE;
+
+    // --- Entry 2: Interrupt Source Override (type 2, 10 bytes) ---
+    // Standard x86 convention: PIT timer (IRQ 0) routes to IOAPIC pin 2.
+    madt[off] = 2; // Entry type: Interrupt Source Override
+    madt[off + 1] = MADT_ISO_ENTRY_SIZE as u8; // Length
+    madt[off + 2] = 0; // Bus: ISA
+    madt[off + 3] = 0; // Source: IRQ 0 (PIT timer)
+    madt[off + 4..off + 8].copy_from_slice(&2u32.to_le_bytes()); // Global System Interrupt: 2
+    madt[off + 8..off + 10].copy_from_slice(&0u16.to_le_bytes()); // Flags: conforming
+
+    acpi_checksum(madt, 9);
 }
 
 /// Compute ACPI checksum and store it at `checksum_offset`.
@@ -161,6 +241,20 @@ mod tests {
 
         let sum: u8 = rsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0, "RSDT checksum must be zero");
+    }
+
+    #[test]
+    fn test_rsdt_has_two_entries() {
+        let region = build_acpi_tables(TEST_BASE);
+        let rsdt = &region[RSDT_OFFSET..RSDT_OFFSET + RSDT_SIZE];
+
+        // Entry[0]: FADT pointer.
+        let fadt_ptr = u32::from_le_bytes(rsdt[36..40].try_into().unwrap());
+        assert_eq!(fadt_ptr, (TEST_BASE + FADT_OFFSET as u64) as u32);
+
+        // Entry[1]: MADT pointer.
+        let madt_ptr = u32::from_le_bytes(rsdt[40..44].try_into().unwrap());
+        assert_eq!(madt_ptr, (TEST_BASE + MADT_OFFSET as u64) as u32);
     }
 
     #[test]
@@ -227,5 +321,126 @@ mod tests {
         let fadt = &region[FADT_OFFSET..FADT_OFFSET + FADT_SIZE];
         let dsdt_addr = u32::from_le_bytes(fadt[40..44].try_into().unwrap());
         assert_eq!(dsdt_addr, (TEST_BASE + DSDT_OFFSET as u64) as u32);
+    }
+
+    // ---- MADT tests ----
+
+    #[test]
+    fn test_madt_signature_and_checksum() {
+        let region = build_acpi_tables(TEST_BASE);
+        let madt = &region[MADT_OFFSET..MADT_OFFSET + MADT_SIZE];
+
+        assert_eq!(&madt[0..4], b"APIC");
+
+        let length = u32::from_le_bytes(madt[4..8].try_into().unwrap());
+        assert_eq!(length, MADT_SIZE as u32);
+
+        let sum: u8 = madt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0, "MADT checksum must be zero");
+    }
+
+    #[test]
+    fn test_madt_lapic_address() {
+        let region = build_acpi_tables(TEST_BASE);
+        let madt = &region[MADT_OFFSET..MADT_OFFSET + MADT_SIZE];
+
+        let lapic_addr = u32::from_le_bytes(madt[36..40].try_into().unwrap());
+        assert_eq!(lapic_addr, LAPIC_BASE);
+    }
+
+    #[test]
+    fn test_madt_pcat_compat_flag() {
+        let region = build_acpi_tables(TEST_BASE);
+        let madt = &region[MADT_OFFSET..MADT_OFFSET + MADT_SIZE];
+
+        let flags = u32::from_le_bytes(madt[40..44].try_into().unwrap());
+        assert_eq!(flags, 1, "PCAT_COMPAT flag must be set");
+    }
+
+    #[test]
+    fn test_madt_lapic_entry() {
+        let region = build_acpi_tables(TEST_BASE);
+        let off = MADT_OFFSET + MADT_HEADER_SIZE;
+
+        assert_eq!(region[off], 0, "entry type: Local APIC");
+        assert_eq!(region[off + 1], 8, "entry length");
+        assert_eq!(region[off + 2], 0, "ACPI Processor ID");
+        assert_eq!(region[off + 3], 0, "APIC ID");
+        let flags = u32::from_le_bytes(region[off + 4..off + 8].try_into().unwrap());
+        assert_eq!(flags, 1, "enabled flag");
+    }
+
+    #[test]
+    fn test_madt_ioapic_entry() {
+        let region = build_acpi_tables(TEST_BASE);
+        let off = MADT_OFFSET + MADT_HEADER_SIZE + MADT_LAPIC_ENTRY_SIZE;
+
+        assert_eq!(region[off], 1, "entry type: I/O APIC");
+        assert_eq!(region[off + 1], 12, "entry length");
+        assert_eq!(region[off + 2], 0, "I/O APIC ID");
+        let ioapic_addr = u32::from_le_bytes(region[off + 4..off + 8].try_into().unwrap());
+        assert_eq!(ioapic_addr, IOAPIC_BASE);
+        let gsi_base = u32::from_le_bytes(region[off + 8..off + 12].try_into().unwrap());
+        assert_eq!(gsi_base, 0, "GSI base must be 0");
+    }
+
+    #[test]
+    fn test_madt_interrupt_source_override() {
+        let region = build_acpi_tables(TEST_BASE);
+        let off =
+            MADT_OFFSET + MADT_HEADER_SIZE + MADT_LAPIC_ENTRY_SIZE + MADT_IOAPIC_ENTRY_SIZE;
+
+        assert_eq!(region[off], 2, "entry type: Interrupt Source Override");
+        assert_eq!(region[off + 1], 10, "entry length");
+        assert_eq!(region[off + 2], 0, "bus: ISA");
+        assert_eq!(region[off + 3], 0, "source: IRQ 0");
+        let gsi = u32::from_le_bytes(region[off + 4..off + 8].try_into().unwrap());
+        assert_eq!(gsi, 2, "GSI: IRQ 0 → pin 2");
+        let flags = u16::from_le_bytes(region[off + 8..off + 10].try_into().unwrap());
+        assert_eq!(flags, 0, "conforming polarity/trigger");
+    }
+
+    #[test]
+    fn test_tables_do_not_overlap() {
+        // Verify no ACPI tables overlap each other.
+        let dsdt_size = DSDT_HEADER_SIZE + S5_AML.len();
+        let tables = [
+            ("RSDP", RSDP_OFFSET, RSDP_OFFSET + RSDP_SIZE),
+            ("RSDT", RSDT_OFFSET, RSDT_OFFSET + RSDT_SIZE),
+            ("FADT", FADT_OFFSET, FADT_OFFSET + FADT_SIZE),
+            ("DSDT", DSDT_OFFSET, DSDT_OFFSET + dsdt_size),
+            ("MADT", MADT_OFFSET, MADT_OFFSET + MADT_SIZE),
+        ];
+
+        for i in 0..tables.len() {
+            for j in (i + 1)..tables.len() {
+                let (name_a, start_a, end_a) = tables[i];
+                let (name_b, start_b, end_b) = tables[j];
+                assert!(
+                    end_a <= start_b || end_b <= start_a,
+                    "{} [{:#X}..{:#X}) overlaps {} [{:#X}..{:#X})",
+                    name_a,
+                    start_a,
+                    end_a,
+                    name_b,
+                    start_b,
+                    end_b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_tables_fit_in_region() {
+        let dsdt_size = DSDT_HEADER_SIZE + S5_AML.len();
+        let last_table_end = MADT_OFFSET + MADT_SIZE;
+        assert!(
+            last_table_end <= ACPI_REGION_SIZE as usize,
+            "tables extend beyond region: {} > {}",
+            last_table_end,
+            ACPI_REGION_SIZE
+        );
+        // Also verify DSDT doesn't extend into MADT.
+        assert!(DSDT_OFFSET + dsdt_size <= MADT_OFFSET);
     }
 }

@@ -47,6 +47,18 @@ pub const VIRTIO_MMIO_BASE: u64 = 0xD000_0000;
 /// 2MB provides room for many devices and aligns with 2MB page table granularity.
 pub const MMIO_REGION_SIZE: u64 = 0x20_0000;
 
+/// IOAPIC MMIO base address.
+pub const IOAPIC_MMIO_BASE: u64 = 0xFEC0_0000;
+
+/// IOAPIC MMIO region size (4 KB).
+pub const IOAPIC_MMIO_SIZE: u64 = 0x1000;
+
+/// LAPIC MMIO base address.
+pub const LAPIC_MMIO_BASE: u64 = 0xFEE0_0000;
+
+/// LAPIC MMIO region size (4 KB).
+pub const LAPIC_MMIO_SIZE: u64 = 0x1000;
+
 // Windows-specific guest memory allocation and mapping.
 #[cfg(target_os = "windows")]
 mod imp {

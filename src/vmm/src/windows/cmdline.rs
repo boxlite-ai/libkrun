@@ -17,8 +17,7 @@ pub const FIRST_MMIO_IRQ: u8 = 5;
 /// - `console=ttyS0`: Route kernel console to serial port (required — no VGA).
 /// - `quiet loglevel=1`: Suppress kernel printk to console.
 /// - `i8042.nokbd i8042.noaux`: Skip PS/2 keyboard/mouse probe (10K+ exits).
-/// - `noapic nolapic nosmp`: Use legacy PIC mode (no APIC/SMP). Required for
-///   our 8259 PIC emulation.
+/// - `nosmp`: Single vCPU mode (multi-vCPU deferred to Iter 3).
 /// - `nohyperv`: Disable Hyper-V guest enlightenments. WHPX exposes Hyper-V
 ///   CPUID leaves but doesn't fully support synthetic timers/SynIC, causing
 ///   clock stalls if the kernel tries to use them.
@@ -26,8 +25,11 @@ pub const FIRST_MMIO_IRQ: u8 = 5;
 ///   depends on a reliable timer source.
 /// - `nokaslr`: Disable kernel address space randomization for deterministic
 ///   boot in our controlled single-vCPU environment.
+///
+/// Note: `noapic` and `nolapic` are NOT present — the MADT table in ACPI
+/// tells the kernel about the IOAPIC and LAPIC for APIC-mode interrupt routing.
 const BASE_CMDLINE: &str =
-    "console=ttyS0 quiet loglevel=1 i8042.nokbd i8042.noaux noapic nolapic nosmp nohyperv lpj=1000000 nokaslr";
+    "console=ttyS0 quiet loglevel=1 i8042.nokbd i8042.noaux nosmp nohyperv lpj=1000000 nokaslr";
 
 /// Serial console parameters appended in verbose mode.
 ///
@@ -68,8 +70,9 @@ pub fn build_kernel_cmdline(
 ) -> String {
     let mut cmdline = if verbose {
         // Verbose mode: serial console + full i8042 probe for debugging.
+        // No noapic/nolapic — APIC mode is enabled via MADT (same as quiet mode).
         format!(
-            "{} noapic nolapic nosmp nohyperv lpj=1000000 nokaslr",
+            "{} nosmp nohyperv lpj=1000000 nokaslr",
             VERBOSE_CONSOLE
         )
     } else {
@@ -240,12 +243,21 @@ mod tests {
     }
 
     #[test]
-    fn test_cmdline_no_noacpi() {
-        // Verify neither quiet nor verbose mode includes noacpi.
+    fn test_cmdline_no_noacpi_no_noapic() {
+        // Verify neither quiet nor verbose mode includes noacpi or noapic.
+        // APIC mode is enabled via MADT; noapic/nolapic would disable it.
         let quiet = build_simple(None, false, &[]);
         assert!(
             !quiet.contains("noacpi"),
             "quiet cmdline must not contain noacpi"
+        );
+        assert!(
+            !quiet.contains("noapic"),
+            "quiet cmdline must not contain noapic (APIC enabled via MADT)"
+        );
+        assert!(
+            !quiet.contains("nolapic"),
+            "quiet cmdline must not contain nolapic"
         );
 
         let verbose = build_kernel_cmdline(None, false, &[], None, None, None, &[], true);
@@ -253,10 +265,14 @@ mod tests {
             !verbose.contains("noacpi"),
             "verbose cmdline must not contain noacpi"
         );
-
-        // Ensure noapic (APIC disable) is still present — it's different from noacpi.
-        assert!(quiet.contains("noapic"));
-        assert!(verbose.contains("noapic"));
+        assert!(
+            !verbose.contains("noapic"),
+            "verbose cmdline must not contain noapic (APIC enabled via MADT)"
+        );
+        assert!(
+            !verbose.contains("nolapic"),
+            "verbose cmdline must not contain nolapic"
+        );
     }
 
     #[test]

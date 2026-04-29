@@ -139,12 +139,16 @@ mod imp {
         canceller_slot: Arc<Mutex<Option<VcpuCanceller>>>,
     ) -> Result<i32> {
         // Open a diagnostic log file for debugging boot failures.
-        // Written to a fixed path that persists across box lifecycle.
+        // Uses TEMP directory so it works on any Windows machine.
         let mut diag_log: Option<std::fs::File> = None;
+        let diag_path = format!(
+            "{}\\whpx-diag.log",
+            std::env::var("TEMP").unwrap_or_else(|_| r"C:\Temp".to_string())
+        );
         if let Ok(f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(r"C:\ws-boxlite\whpx-diag.log")
+            .open(&diag_path)
         {
             diag_log = Some(f);
         }
@@ -297,7 +301,7 @@ mod imp {
             // injection is still pending in WHPX.  Overwriting the pending
             // interruption register would lose the old interrupt and leave
             // its PIC ISR bit permanently stuck (guest never sends EOI).
-            if devices.pic.has_pending() {
+            if devices.irq_chip.has_pending() {
                 let already_pending = vcpu
                     .has_pending_interruption()
                     .unwrap_or(false);
@@ -306,9 +310,10 @@ mod imp {
                 } else {
                     match vcpu.interrupts_enabled() {
                         Ok(true) => {
-                            if let Some(vector) = devices.pic.acknowledge() {
+                            if let Some(vector) = devices.irq_chip.acknowledge() {
                                 log::debug!("Injecting interrupt vector {:#X}", vector);
                                 vcpu.inject_interrupt(vector)?;
+                                devices.irq_chip.notify_injected(vector);
                                 devices.set_window_requested(false);
                                 inject_count += 1;
                             }
@@ -414,13 +419,14 @@ mod imp {
                     // was halted.
                     devices.tick_and_poll(mem_ref);
 
-                    if devices.pic.has_pending() {
+                    if devices.irq_chip.has_pending() {
                         let already_pending = vcpu
                             .has_pending_interruption()
                             .unwrap_or(false);
                         if !already_pending {
-                            if let Some(vector) = devices.pic.acknowledge() {
+                            if let Some(vector) = devices.irq_chip.acknowledge() {
                                 vcpu.inject_interrupt(vector)?;
+                                devices.irq_chip.notify_injected(vector);
                                 devices.set_window_requested(false);
                                 inject_count += 1;
                             }
@@ -496,18 +502,22 @@ mod imp {
                                 .map(|b| b.len())
                                 .unwrap_or(0);
                             let (qn, bc) = devices.blk_stats();
-                            let (irr, isr, imr, vbase) = devices.pic.master_state();
-                            let (s_irr, s_isr, s_imr, s_vbase) = devices.pic.slave_state();
+                            let (ioapic_mmio, lapic_mmio) = devices.apic_mmio_stats();
+                            let (irr, isr, imr, vbase) = devices.irq_chip.pic_master_state();
+                            let (s_irr, s_isr, s_imr, s_vbase) = devices.irq_chip.pic_slave_state();
+                            let apic_mode = devices.irq_chip.apic_mode();
                             let msg = format!(
-                                "Progress @ {:.1}s: exits={} RIP={:#X} console={}B io_out={} serial={} mmio={} blk_qn={} blk_comp={} halt={}/{} halt_w_irq={} inj={} pic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} spic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} mode={}",
+                                "Progress @ {:.1}s: exits={} RIP={:#X} console={}B io_out={} serial={} mmio={} blk_qn={} blk_comp={} halt={}/{} halt_w_irq={} inj={} ioapic_mmio={} lapic_mmio={} pic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} spic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} irq={} mode={}",
                                 start_time.elapsed().as_secs_f64(),
                                 exit_count, regs.rip, console_len,
                                 io_out_count, serial_out_count,
                                 mmio_count, qn, bc,
                                 halt_count, total_halt_exits,
                                 halt_with_irq, inject_count,
+                                ioapic_mmio, lapic_mmio,
                                 irr, isr, imr, vbase,
                                 s_irr, s_isr, s_imr, s_vbase,
+                                if apic_mode { "apic" } else { "pic" },
                                 if sync_block { "sync" } else if blk_workers_started { "async" } else { "pending" },
                             );
                             log::info!("{}", msg);
