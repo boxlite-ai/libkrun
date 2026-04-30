@@ -72,7 +72,7 @@ use device_manager::shm::ShmManager;
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
-#[cfg(not(any(feature = "tee", feature = "nitro")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::{fs::ExportTable, VirtioShmRegion};
 use flate2::read::GzDecoder;
 #[cfg(feature = "gpu")]
@@ -90,7 +90,7 @@ use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
 #[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
 use vm_memory::mmap::MmapRegion;
-#[cfg(not(any(feature = "tee", feature = "nitro")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vm_memory::Address;
 use vm_memory::Bytes;
 #[cfg(not(feature = "aws-nitro"))]

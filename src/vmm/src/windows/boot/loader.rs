@@ -7,7 +7,9 @@ use super::super::error::{Result, WkrunError};
 use super::params::HDRS_MAGIC;
 
 #[cfg(any(target_os = "windows", test))]
-use super::super::memory::{MMIO_REGION_SIZE, VIRTIO_MMIO_BASE};
+use super::super::memory::{
+    IOAPIC_MMIO_BASE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE, MMIO_REGION_SIZE, VIRTIO_MMIO_BASE,
+};
 #[cfg(any(target_os = "windows", test))]
 use super::params::{E820Entry, E820_ACPI, E820_RAM, E820_RESERVED};
 
@@ -161,13 +163,20 @@ fn build_e820_map(ram_mib: u32, acpi_base: u64, acpi_size: u64) -> Vec<E820Entry
     });
 
     // High memory: 1MB to end of RAM.
-    // When RAM extends past the MMIO region, split around the reserved hole
+    // When RAM extends past device MMIO regions, split around reserved holes
     // so the kernel doesn't try to use MMIO addresses as regular RAM.
+    //
+    // Two MMIO holes may exist:
+    // 1. Virtio MMIO:  0xD000_0000 .. 0xD020_0000
+    // 2. APIC MMIO:    0xFEC0_0000 .. 0xFEE0_1000 (IOAPIC + LAPIC)
     if ram_bytes > 0x100000 {
+        let apic_start = IOAPIC_MMIO_BASE;
+        let apic_end = LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE;
+
         if ram_bytes > VIRTIO_MMIO_BASE {
             let mmio_end = VIRTIO_MMIO_BASE + MMIO_REGION_SIZE;
 
-            // High memory below MMIO.
+            // High memory below Virtio MMIO.
             entries.push(E820Entry {
                 addr: 0x100000,
                 size: VIRTIO_MMIO_BASE - 0x100000,
@@ -175,7 +184,7 @@ fn build_e820_map(ram_mib: u32, acpi_base: u64, acpi_size: u64) -> Vec<E820Entry
                 _pad: 0,
             });
 
-            // MMIO region (reserved).
+            // Virtio MMIO region (reserved).
             entries.push(E820Entry {
                 addr: VIRTIO_MMIO_BASE,
                 size: MMIO_REGION_SIZE,
@@ -183,8 +192,35 @@ fn build_e820_map(ram_mib: u32, acpi_base: u64, acpi_size: u64) -> Vec<E820Entry
                 _pad: 0,
             });
 
-            // High memory above MMIO.
-            if ram_bytes > mmio_end {
+            if ram_bytes > apic_start {
+                // RAM extends past APIC region — add APIC hole.
+                // RAM between Virtio MMIO end and APIC start.
+                entries.push(E820Entry {
+                    addr: mmio_end,
+                    size: apic_start - mmio_end,
+                    entry_type: E820_RAM,
+                    _pad: 0,
+                });
+
+                // APIC MMIO region (reserved: IOAPIC + LAPIC).
+                entries.push(E820Entry {
+                    addr: apic_start,
+                    size: apic_end - apic_start,
+                    entry_type: E820_RESERVED,
+                    _pad: 0,
+                });
+
+                // RAM above APIC region.
+                if ram_bytes > apic_end {
+                    entries.push(E820Entry {
+                        addr: apic_end,
+                        size: ram_bytes - apic_end,
+                        entry_type: E820_RAM,
+                        _pad: 0,
+                    });
+                }
+            } else if ram_bytes > mmio_end {
+                // RAM between Virtio MMIO and APIC — no APIC hole needed.
                 entries.push(E820Entry {
                     addr: mmio_end,
                     size: ram_bytes - mmio_end,
@@ -295,9 +331,17 @@ pub fn load_kernel_with_initrd(
     boot_params.set_cmdline_ptr(CMDLINE_START as u32);
     boot_params.set_cmdline_size(cmdline_bytes.len() as u32);
 
-    // Write ACPI tables to guest memory.
+    // Write ACPI tables to guest memory and tell the kernel where to find them.
     let acpi_data = acpi::build_acpi_tables(ACPI_START, num_vcpus);
     guest_mem.write_at_addr(ACPI_START, &acpi_data)?;
+    boot_params.set_acpi_rsdp_addr(ACPI_START);
+
+    // Write Intel MP table for SMP CPU discovery.
+    // The kernel (CONFIG_X86_MPPARSE=y) scans 0x9FC00-0x9FFFF for the MP
+    // Floating Pointer Structure. This is needed because CONFIG_ACPI is not
+    // enabled in the kernel, so the MADT-based CPU discovery doesn't work.
+    let mp_data = super::mp_table::build_mp_tables(num_vcpus);
+    guest_mem.write_at_addr(super::mp_table::MP_FPS_ADDR, &mp_data)?;
 
     // Set E820 memory map.
     let e820_map = build_e820_map(ram_mib, ACPI_START, acpi::ACPI_REGION_SIZE);
@@ -514,10 +558,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_e820_map_4096mb_has_mmio_hole() {
+    fn test_build_e820_map_4096mb_has_mmio_and_apic_holes() {
         let map = build_e820_map(4096, TEST_ACPI_BASE, TEST_ACPI_SIZE);
-        // Low + BIOS reserved + ACPI + high1 + MMIO reserved + high2 = 6 entries.
-        assert_eq!(map.len(), 6, "4GB RAM should have MMIO hole: {:?}", map);
+        // Low + BIOS reserved + ACPI + high1 + VIRTIO reserved + high2
+        // + APIC reserved + high3 = 8 entries.
+        assert_eq!(
+            map.len(),
+            8,
+            "4GB RAM should have VIRTIO + APIC holes: {:?}",
+            map
+        );
 
         // Low memory.
         assert_eq!(map[0].addr, 0);
@@ -532,21 +582,32 @@ mod tests {
         assert_eq!(map[2].size, TEST_ACPI_SIZE);
         assert_eq!(map[2].entry_type, E820_ACPI);
 
-        // High memory below MMIO.
+        // High memory below Virtio MMIO.
         assert_eq!(map[3].addr, 0x100000);
         assert_eq!(map[3].size, VIRTIO_MMIO_BASE - 0x100000);
         assert_eq!(map[3].entry_type, E820_RAM);
 
-        // MMIO reserved region.
+        // Virtio MMIO reserved region.
         assert_eq!(map[4].addr, VIRTIO_MMIO_BASE);
         assert_eq!(map[4].size, MMIO_REGION_SIZE);
         assert_eq!(map[4].entry_type, E820_RESERVED);
 
-        // High memory above MMIO.
+        // High memory between Virtio MMIO and APIC.
         let mmio_end = VIRTIO_MMIO_BASE + MMIO_REGION_SIZE;
         assert_eq!(map[5].addr, mmio_end);
-        assert_eq!(map[5].size, 4096 * 1024 * 1024 - mmio_end);
+        assert_eq!(map[5].size, IOAPIC_MMIO_BASE - mmio_end);
         assert_eq!(map[5].entry_type, E820_RAM);
+
+        // APIC reserved region (IOAPIC + LAPIC).
+        let apic_end = LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE;
+        assert_eq!(map[6].addr, IOAPIC_MMIO_BASE);
+        assert_eq!(map[6].size, apic_end - IOAPIC_MMIO_BASE);
+        assert_eq!(map[6].entry_type, E820_RESERVED);
+
+        // High memory above APIC.
+        assert_eq!(map[7].addr, apic_end);
+        assert_eq!(map[7].size, 4096 * 1024 * 1024 - apic_end);
+        assert_eq!(map[7].entry_type, E820_RAM);
     }
 
     #[test]

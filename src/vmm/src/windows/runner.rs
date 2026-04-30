@@ -308,7 +308,8 @@ mod imp {
         *canceller_slot.lock().unwrap() = Some(cancellers[0].clone());
 
         // Create per-AP startup state (one per AP, indexed by ap_id - 1).
-        let ap_states: Vec<ApStartupState> = (1..num_vcpus).map(|_| ApStartupState::new()).collect();
+        let ap_states: Vec<ApStartupState> =
+            (1..num_vcpus).map(|_| ApStartupState::new()).collect();
 
         // Shared VM shutdown flag — set by any vCPU to signal all others to exit.
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -317,11 +318,7 @@ mod imp {
         // Move diag_log into shared state for BSP diagnostics.
         let diag_log = Arc::new(Mutex::new(diag_log));
 
-        log::info!(
-            "Starting VM with {} vCPU(s), ctx_id={}",
-            num_vcpus,
-            ctx_id,
-        );
+        log::info!("Starting VM with {} vCPU(s), ctx_id={}", num_vcpus, ctx_id,);
         eprintln!("[WHPX] Starting {} vCPU(s)", num_vcpus);
 
         let mut exit_code = 1i32;
@@ -368,6 +365,7 @@ mod imp {
                             cancellers_ref,
                             &ap_states_ref[ap_idx - 1],
                             ctx_id,
+                            diag_ref,
                         );
                     });
                 }
@@ -495,7 +493,18 @@ mod imp {
         devices: &mut DeviceManager,
         ap_states: &[ApStartupState],
         cancellers: &[VcpuCanceller],
+        diag_log: &Arc<Mutex<Option<std::fs::File>>>,
     ) {
+        macro_rules! ipi_diag {
+            ($($arg:tt)*) => {
+                if let Ok(mut guard) = diag_log.lock() {
+                    if let Some(ref mut f) = *guard {
+                        let _ = writeln!(f, $($arg)*);
+                        let _ = f.flush();
+                    }
+                }
+            };
+        }
         match action {
             IpiAction::None => {}
             IpiAction::SendInit { target_apic_id } => {
@@ -504,7 +513,13 @@ mod imp {
                     ap_states[ap_idx - 1]
                         .init_received
                         .store(true, Ordering::Release);
-                    log::info!("INIT delivered to AP{}", target_apic_id);
+                    ipi_diag!("IPI: INIT delivered to AP{}", target_apic_id);
+                } else {
+                    ipi_diag!(
+                        "IPI: INIT target AP{} out of range (max={})",
+                        target_apic_id,
+                        ap_states.len()
+                    );
                 }
             }
             IpiAction::SendSipi {
@@ -518,14 +533,15 @@ mod imp {
                         *state.sipi_vector.lock().unwrap() = Some(vector);
                         *state.started.lock().unwrap() = true;
                         state.condvar.notify_one();
-                        log::info!(
-                            "SIPI delivered to AP{}: start at {:#X}",
+                        ipi_diag!(
+                            "IPI: SIPI delivered to AP{}, vector={:#X}, start_addr={:#X}",
                             target_apic_id,
+                            vector,
                             (vector as u64) * 0x1000
                         );
                     } else {
-                        log::warn!(
-                            "SIPI to AP{} ignored (no INIT received)",
+                        ipi_diag!(
+                            "IPI: SIPI to AP{} IGNORED (no INIT received)",
                             target_apic_id,
                         );
                     }
@@ -542,8 +558,8 @@ mod imp {
                 if idx < cancellers.len() {
                     let _ = cancellers[idx].cancel();
                 }
-                log::debug!(
-                    "IPI interrupt vector {:#X} delivered to vCPU{}",
+                ipi_diag!(
+                    "IPI: interrupt vector={:#X} → vCPU{}",
                     vector,
                     target_apic_id,
                 );
@@ -603,8 +619,15 @@ mod imp {
             let exit = match vcpu.run() {
                 Ok(exit) => exit,
                 Err(e) => {
-                    log::error!("BSP vcpu.run() FAILED after {} exits: {:?}", stats.exit_count, e);
-                    eprintln!("[WHPX] BSP vcpu.run() FAILED after {} exits: {:?}", stats.exit_count, e);
+                    log::error!(
+                        "BSP vcpu.run() FAILED after {} exits: {:?}",
+                        stats.exit_count,
+                        e
+                    );
+                    eprintln!(
+                        "[WHPX] BSP vcpu.run() FAILED after {} exits: {:?}",
+                        stats.exit_count, e
+                    );
                     return 1;
                 }
             };
@@ -669,9 +692,26 @@ mod imp {
                         diag!("{}", msg);
                     }
                     let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
+                    // Log LAPIC ICR writes for diagnostics.
+                    if address >= crate::windows::memory::LAPIC_MMIO_BASE {
+                        let offset = address - crate::windows::memory::LAPIC_MMIO_BASE;
+                        if offset == 0x300 || offset == 0x310 {
+                            diag!(
+                                "LAPIC ICR write: offset={:#X} data={:#X}",
+                                offset,
+                                data
+                            );
+                        }
+                    }
                     // Dispatch IPI if this was an ICR write.
                     if !matches!(ipi_action, IpiAction::None) {
-                        dispatch_ipi(ipi_action, &mut dm, ap_states, cancellers);
+                        dispatch_ipi(
+                            ipi_action,
+                            &mut dm,
+                            ap_states,
+                            cancellers,
+                            diag_log,
+                        );
                     }
                     drop(dm);
                     if let Err(e) = vcpu.skip_instruction() {
@@ -695,8 +735,7 @@ mod imp {
                         let mut dm = devices.lock().unwrap();
                         dm.tick_and_poll(0, guest_mem);
                         if dm.irq_chip.has_pending(0) {
-                            let already_pending =
-                                vcpu.has_pending_interruption().unwrap_or(false);
+                            let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
                             if !already_pending {
                                 if let Some(vector) = dm.irq_chip.acknowledge(0) {
                                     let _ = vcpu.inject_interrupt(vector);
@@ -870,7 +909,11 @@ mod imp {
                     return -1;
                 }
                 VcpuExit::Unknown(reason) => {
-                    log::error!("BSP: Unknown exit reason {} after {} exits", reason, stats.exit_count);
+                    log::error!(
+                        "BSP: Unknown exit reason {} after {} exits",
+                        reason,
+                        stats.exit_count
+                    );
                     return -1;
                 }
             }
@@ -898,7 +941,21 @@ mod imp {
         cancellers: &[VcpuCanceller],
         startup: &ApStartupState,
         _ctx_id: u32,
+        diag_log: &Arc<Mutex<Option<std::fs::File>>>,
     ) {
+        macro_rules! diag {
+            ($($arg:tt)*) => {
+                if let Ok(mut guard) = diag_log.lock() {
+                    if let Some(ref mut f) = *guard {
+                        let _ = writeln!(f, $($arg)*);
+                        let _ = f.flush();
+                    }
+                }
+            };
+        }
+
+        diag!("AP{}: thread started, waiting for SIPI", ap_id);
+
         // Wait for SIPI from BSP.
         {
             let mut started = startup.started.lock().unwrap();
@@ -909,25 +966,41 @@ mod imp {
 
         // Check if we were woken for shutdown rather than SIPI.
         if shutdown.load(Ordering::Relaxed) {
-            log::info!("AP{}: woken for shutdown, not SIPI", ap_id);
+            diag!("AP{}: woken for shutdown, not SIPI", ap_id);
             return;
         }
 
         // Configure AP initial register state from SIPI vector.
         let sipi_vector = startup.sipi_vector.lock().unwrap().unwrap_or(0);
-        log::info!(
-            "AP{}: SIPI received, starting at vector={:#X} ({:#X})",
+        diag!(
+            "AP{}: SIPI received, vector={:#X}, CS:IP={:#X}:0000",
             ap_id,
             sipi_vector,
             (sipi_vector as u64) * 0x1000
         );
 
+        // Dump WHPX default registers before modification for diagnostics.
+        if let Ok(sregs) = vcpu.get_special_registers() {
+            diag!(
+                "AP{}: WHPX defaults TR=sel:{:#X}/base:{:#X}/lim:{:#X}/ar:{:#X} \
+                 LDT=sel:{:#X}/base:{:#X}/lim:{:#X}/ar:{:#X} \
+                 GDT=base:{:#X}/lim:{:#X} IDT=base:{:#X}/lim:{:#X} \
+                 CR0={:#X} CR4={:#X} EFER={:#X}",
+                ap_id,
+                sregs.tr.selector, sregs.tr.base, sregs.tr.limit, sregs.tr.access_rights,
+                sregs.ldt.selector, sregs.ldt.base, sregs.ldt.limit, sregs.ldt.access_rights,
+                sregs.gdt.base, sregs.gdt.limit, sregs.idt.base, sregs.idt.limit,
+                sregs.cr0, sregs.cr4, sregs.efer
+            );
+        }
+
         // AP starts in real mode: CS:IP = (sipi_vector * 0x100):0x0000
         // The Linux kernel SMP trampoline is placed at sipi_vector * 0x1000.
         if let Err(e) = vcpu.set_ap_initial_regs(sipi_vector, ap_id) {
-            log::error!("AP{}: failed to set initial registers: {:?}", ap_id, e);
+            diag!("AP{}: FAILED to set initial registers: {:?}", ap_id, e);
             return;
         }
+        diag!("AP{}: initial regs set, entering run loop", ap_id);
 
         let mut stats = VcpuStats::new();
 
@@ -948,7 +1021,7 @@ mod imp {
             let exit = match vcpu.run() {
                 Ok(exit) => exit,
                 Err(e) => {
-                    log::error!(
+                    diag!(
                         "AP{}: vcpu.run() FAILED after {} exits: {:?}",
                         ap_id,
                         stats.exit_count,
@@ -958,6 +1031,29 @@ mod imp {
                 }
             };
             stats.exit_count += 1;
+
+            // Log first few AP exits for diagnostics.
+            if stats.exit_count <= 10 {
+                let desc = match &exit {
+                    VcpuExit::IoOut { port, .. } => format!("IoOut(port={:#X})", port),
+                    VcpuExit::IoIn { port, .. } => format!("IoIn(port={:#X})", port),
+                    VcpuExit::MmioRead { address, .. } => format!("MmioRead({:#X})", address),
+                    VcpuExit::MmioWrite { address, .. } => format!("MmioWrite({:#X})", address),
+                    VcpuExit::Halt => "Halt".into(),
+                    VcpuExit::Cancelled => "Cancelled".into(),
+                    VcpuExit::InterruptWindow => "InterruptWindow".into(),
+                    VcpuExit::Shutdown => "Shutdown".into(),
+                    VcpuExit::UnrecoverableException => "UnrecoverableException".into(),
+                    VcpuExit::MsrAccess {
+                        msr_number,
+                        is_write,
+                        ..
+                    } => format!("MSR({:#X}, write={})", msr_number, is_write),
+                    VcpuExit::CpuidAccess { rax, .. } => format!("CPUID({:#X})", rax),
+                    VcpuExit::Unknown(r) => format!("Unknown({})", r),
+                };
+                diag!("AP{}: exit #{} = {}", ap_id, stats.exit_count, desc);
+            }
 
             match exit {
                 VcpuExit::IoOut { port, size, data } => {
@@ -985,7 +1081,10 @@ mod imp {
                 VcpuExit::MmioRead { address, size } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    let data = devices.lock().unwrap().handle_mmio_read(ap_id, address, size);
+                    let data = devices
+                        .lock()
+                        .unwrap()
+                        .handle_mmio_read(ap_id, address, size);
                     let _ = vcpu.complete_mmio_read(data);
                 }
                 VcpuExit::MmioWrite {
@@ -999,7 +1098,7 @@ mod imp {
                     let ipi_action = dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
                     if !matches!(ipi_action, IpiAction::None) {
                         // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
-                        dispatch_ipi(ipi_action, &mut dm, &[], cancellers);
+                        dispatch_ipi(ipi_action, &mut dm, &[], cancellers, diag_log);
                     }
                     drop(dm);
                     let _ = vcpu.skip_instruction();
@@ -1019,8 +1118,7 @@ mod imp {
                     {
                         let mut dm = devices.lock().unwrap();
                         if dm.irq_chip.has_pending(ap_id) {
-                            let already_pending =
-                                vcpu.has_pending_interruption().unwrap_or(false);
+                            let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
                             if !already_pending {
                                 if let Some(vector) = dm.irq_chip.acknowledge(ap_id) {
                                     let _ = vcpu.inject_interrupt(vector);
@@ -1122,19 +1220,23 @@ mod imp {
                     }
                 }
                 VcpuExit::UnrecoverableException => {
-                    log::error!(
-                        "AP{}: triple fault after {} exits",
+                    let regs = vcpu.get_registers().ok();
+                    let sregs = vcpu.get_special_registers().ok();
+                    diag!(
+                        "AP{}: TRIPLE FAULT after {} exits, RIP={:#X}, CR0={:#X}, CR3={:#X}, EFER={:#X}",
                         ap_id,
-                        stats.exit_count
+                        stats.exit_count,
+                        regs.as_ref().map_or(0, |r| r.rip),
+                        sregs.as_ref().map_or(0, |s| s.cr0),
+                        sregs.as_ref().map_or(0, |s| s.cr3),
+                        sregs.as_ref().map_or(0, |s| s.efer),
                     );
                     return;
                 }
                 VcpuExit::Unknown(reason) => {
-                    log::error!(
+                    diag!(
                         "AP{}: unknown exit reason {} after {} exits",
-                        ap_id,
-                        reason,
-                        stats.exit_count
+                        ap_id, reason, stats.exit_count
                     );
                     return;
                 }
@@ -1469,7 +1571,11 @@ mod tests {
             super::handle_cpuid(0, 2, 1, 0x1234, 0x0000_0000_0000_5678, 0x8000_0001, 0xABCD);
         // EBX[23:16] = num_vcpus = 2, EBX[31:24] = vcpu_id = 0
         assert_eq!(rbx & 0x00FF_0000, 0x0002_0000, "EBX[23:16] should be 2");
-        assert_eq!(rbx & 0xFF00_0000, 0x0000_0000, "EBX[31:24] should be 0 for BSP");
+        assert_eq!(
+            rbx & 0xFF00_0000,
+            0x0000_0000,
+            "EBX[31:24] should be 0 for BSP"
+        );
         // EBX[15:0] preserved from default
         assert_eq!(rbx & 0xFFFF, 0x5678, "EBX[15:0] should be preserved");
         // ECX bit 31 (hypervisor present) must be cleared
@@ -1482,18 +1588,9 @@ mod tests {
     #[test]
     fn test_cpuid_leaf1_topology_ap() {
         // AP (vcpu 3) with 4 vCPUs.
-        let (_, rbx, _, _) =
-            super::handle_cpuid(3, 4, 1, 0, 0, 0, 0);
-        assert_eq!(
-            (rbx >> 16) & 0xFF,
-            4,
-            "EBX[23:16] should be num_vcpus=4"
-        );
-        assert_eq!(
-            (rbx >> 24) & 0xFF,
-            3,
-            "EBX[31:24] should be vcpu_id=3"
-        );
+        let (_, rbx, _, _) = super::handle_cpuid(3, 4, 1, 0, 0, 0, 0);
+        assert_eq!((rbx >> 16) & 0xFF, 4, "EBX[23:16] should be num_vcpus=4");
+        assert_eq!((rbx >> 24) & 0xFF, 3, "EBX[31:24] should be vcpu_id=3");
     }
 
     #[test]
@@ -1502,19 +1599,22 @@ mod tests {
         for leaf in [0x40000000u32, 0x40000001, 0x400000FF] {
             let (rax, rbx, rcx, rdx) =
                 super::handle_cpuid(0, 1, leaf, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D);
-            assert_eq!((rax, rbx, rcx, rdx), (0, 0, 0, 0), "Hyper-V leaf 0x{:X} must be zeroed", leaf);
+            assert_eq!(
+                (rax, rbx, rcx, rdx),
+                (0, 0, 0, 0),
+                "Hyper-V leaf 0x{:X} must be zeroed",
+                leaf
+            );
         }
     }
 
     #[test]
     fn test_cpuid_passthrough_other_leaves() {
         // Non-special leaves should pass through defaults unchanged.
-        let (rax, rbx, rcx, rdx) =
-            super::handle_cpuid(0, 2, 0, 0x1111, 0x2222, 0x3333, 0x4444);
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 2, 0, 0x1111, 0x2222, 0x3333, 0x4444);
         assert_eq!((rax, rbx, rcx, rdx), (0x1111, 0x2222, 0x3333, 0x4444));
 
-        let (rax, rbx, rcx, rdx) =
-            super::handle_cpuid(0, 2, 7, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 2, 7, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
         assert_eq!((rax, rbx, rcx, rdx), (0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD));
     }
 

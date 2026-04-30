@@ -217,27 +217,56 @@ mod imp {
     }
 
     impl GuestMemory {
-        /// Create guest memory, leaving a hole for the MMIO region if RAM exceeds it.
+        /// Create guest memory, leaving holes for device MMIO regions.
         ///
-        /// When `size_mib` is large enough that RAM overlaps `VIRTIO_MMIO_BASE`,
-        /// the memory is split into two regions with an unmapped gap so that WHPX
-        /// generates MMIO exits (instead of treating device accesses as RAM reads).
+        /// When guest RAM overlaps device MMIO addresses, the memory is split
+        /// into multiple regions with unmapped gaps so that WHPX generates MMIO
+        /// exits (instead of treating device accesses as RAM reads).
+        ///
+        /// Holes are created for:
+        /// - Virtio MMIO (0xD000_0000 .. 0xD020_0000) — virtio device registers
+        /// - APIC MMIO (0xFEC0_0000 .. 0xFEE0_1000) — IOAPIC + LAPIC registers
         pub fn new(size_mib: u32) -> Result<Self> {
             let size = (size_mib as u64) * 1024 * 1024;
 
             if size > super::VIRTIO_MMIO_BASE {
-                // RAM extends past MMIO region — split into two regions.
-                // Region 1: GPA 0 .. VIRTIO_MMIO_BASE
-                // (hole):   VIRTIO_MMIO_BASE .. VIRTIO_MMIO_BASE + MMIO_REGION_SIZE
-                // Region 2: VIRTIO_MMIO_BASE + MMIO_REGION_SIZE .. ram_end
                 let mmio_base = super::VIRTIO_MMIO_BASE;
                 let mmio_end = mmio_base + super::MMIO_REGION_SIZE;
                 let region1 = GuestMemoryRegion::new(0, mmio_base)?;
-                let region2 = GuestMemoryRegion::new(mmio_end, size - mmio_end)?;
-                Ok(GuestMemory {
-                    regions: vec![region1, region2],
-                    total_size: size,
-                })
+
+                // Check if RAM extends into the APIC MMIO region.
+                // IOAPIC at 0xFEC0_0000 and LAPIC at 0xFEE0_0000 must be
+                // unmapped so WHPX generates MMIO exits for APIC accesses.
+                let apic_start = super::IOAPIC_MMIO_BASE;
+                let apic_end = super::LAPIC_MMIO_BASE + super::LAPIC_MMIO_SIZE;
+
+                if size > apic_start {
+                    // RAM extends past APIC region — 3 regions with 2 holes.
+                    // Region 1: 0 .. VIRTIO_MMIO_BASE
+                    // (hole):   VIRTIO MMIO
+                    // Region 2: VIRTIO_MMIO_END .. IOAPIC_MMIO_BASE
+                    // (hole):   APIC MMIO (IOAPIC + LAPIC)
+                    // Region 3: APIC_END .. ram_end
+                    let region2 = GuestMemoryRegion::new(mmio_end, apic_start - mmio_end)?;
+                    let mut regions = vec![region1, region2];
+
+                    if size > apic_end {
+                        let region3 = GuestMemoryRegion::new(apic_end, size - apic_end)?;
+                        regions.push(region3);
+                    }
+
+                    Ok(GuestMemory {
+                        regions,
+                        total_size: size,
+                    })
+                } else {
+                    // RAM between VIRTIO and APIC — 2 regions with 1 hole.
+                    let region2 = GuestMemoryRegion::new(mmio_end, size - mmio_end)?;
+                    Ok(GuestMemory {
+                        regions: vec![region1, region2],
+                        total_size: size,
+                    })
+                }
             } else {
                 // RAM fits below MMIO — single contiguous region.
                 let region = GuestMemoryRegion::new(0, size)?;

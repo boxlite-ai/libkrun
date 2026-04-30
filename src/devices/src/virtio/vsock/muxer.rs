@@ -4,10 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
-use super::VsockError;
 use super::defs;
 use super::defs::uapi;
-use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
+use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};

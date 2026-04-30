@@ -156,7 +156,8 @@ pub fn build_acpi_tables(acpi_base: u64, num_vcpus: u8) -> Vec<u8> {
     assert!(
         MADT_OFFSET + madt_sz <= ACPI_REGION_SIZE as usize,
         "MADT ({} bytes for {} vCPUs) exceeds ACPI region",
-        madt_sz, num_vcpus,
+        madt_sz,
+        num_vcpus,
     );
     build_madt(&mut region[MADT_OFFSET..MADT_OFFSET + madt_sz], num_vcpus);
 
@@ -408,8 +409,7 @@ mod tests {
     #[test]
     fn test_madt_interrupt_source_override() {
         let region = build_acpi_tables(TEST_BASE, 1);
-        let off =
-            MADT_OFFSET + MADT_HEADER_SIZE + MADT_LAPIC_ENTRY_SIZE + MADT_IOAPIC_ENTRY_SIZE;
+        let off = MADT_OFFSET + MADT_HEADER_SIZE + MADT_LAPIC_ENTRY_SIZE + MADT_IOAPIC_ENTRY_SIZE;
 
         assert_eq!(region[off], 2, "entry type: Interrupt Source Override");
         assert_eq!(region[off + 1], 10, "entry length");

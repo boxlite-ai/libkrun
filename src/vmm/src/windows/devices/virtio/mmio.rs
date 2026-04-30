@@ -72,6 +72,13 @@ pub trait VirtioDeviceBackend {
     /// Read a 32-bit value from the device config space at the given offset.
     fn read_config(&self, offset: u64) -> u32;
 
+    /// Write a 32-bit value to the device config space at the given offset.
+    ///
+    /// Default: no-op (most devices have read-only config space).
+    /// Devices with writable config fields (e.g., virtio-balloon `actual`)
+    /// should override this.
+    fn write_config(&mut self, _offset: u64, _value: u32) {}
+
     /// Handle a queue notification (guest made buffers available).
     ///
     /// Returns `true` if the device processed buffers and an interrupt
@@ -290,6 +297,10 @@ impl<D: VirtioDeviceBackend> VirtioMmioDevice<D> {
             }
             QUEUE_USED_HIGH => {
                 // High bits for used ring address (typically 0).
+            }
+            off if off >= CONFIG_SPACE => {
+                let config_offset = off - CONFIG_SPACE;
+                self.backend.write_config(config_offset, value);
             }
             _ => {}
         }

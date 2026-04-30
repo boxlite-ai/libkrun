@@ -146,6 +146,15 @@ impl BootParams {
         self.data[0x218..0x21C].copy_from_slice(&addr.to_le_bytes());
         self.data[0x21C..0x220].copy_from_slice(&size.to_le_bytes());
     }
+
+    /// Set the ACPI RSDP physical address (boot protocol 2.14+, offset 0x070).
+    ///
+    /// When set, the kernel uses this address directly instead of scanning
+    /// the BIOS ROM area (0xE0000-0xFFFFF) for the RSDP signature.
+    /// For older kernels (protocol < 2.14), this field is padding and ignored.
+    pub fn set_acpi_rsdp_addr(&mut self, addr: u64) {
+        self.data[0x070..0x078].copy_from_slice(&addr.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +250,21 @@ mod tests {
         let size = u32::from_le_bytes(params.data[0x21C..0x220].try_into().unwrap());
         assert_eq!(addr, 0x1000000);
         assert_eq!(size, 0x500000);
+    }
+
+    #[test]
+    fn test_boot_params_acpi_rsdp_addr() {
+        let mut params = BootParams::new();
+        params.set_acpi_rsdp_addr(0xE0000);
+
+        let addr = u64::from_le_bytes(params.data[0x070..0x078].try_into().unwrap());
+        assert_eq!(addr, 0xE0000);
+    }
+
+    #[test]
+    fn test_boot_params_acpi_rsdp_addr_default_zero() {
+        let params = BootParams::new();
+        let addr = u64::from_le_bytes(params.data[0x070..0x078].try_into().unwrap());
+        assert_eq!(addr, 0, "acpi_rsdp_addr should be 0 by default");
     }
 }

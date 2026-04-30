@@ -12,10 +12,10 @@
 
 use std::time::Instant;
 
+use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
 use super::ioapic::IoApic;
 use super::lapic::{IpiAction, LocalApic};
 use super::pic::Pic;
-use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
 
 /// Result of an IrqChip MMIO write operation.
 #[derive(Debug)]
@@ -56,7 +56,9 @@ impl Default for IrqChip {
 impl IrqChip {
     /// Create a new IrqChip in PIC mode (legacy boot) with N LAPICs.
     pub fn new(num_vcpus: u8) -> Self {
-        let lapics = (0..num_vcpus).map(|id| LocalApic::new_with_id(id)).collect();
+        let lapics = (0..num_vcpus)
+            .map(|id| LocalApic::new_with_id(id))
+            .collect();
         Self {
             pic: Pic::new(),
             ioapic: IoApic::new(),
@@ -117,7 +119,9 @@ impl IrqChip {
     /// Check if there are any pending interrupts for a specific vCPU.
     pub fn has_pending(&self, vcpu_id: u8) -> bool {
         if self.apic_mode {
-            self.lapics[vcpu_id as usize].get_highest_injectable().is_some()
+            self.lapics[vcpu_id as usize]
+                .get_highest_injectable()
+                .is_some()
         } else if vcpu_id == 0 {
             self.pic.has_pending()
         } else {
@@ -199,7 +203,13 @@ impl IrqChip {
     ///
     /// Returns an `IrqChipWriteResult` indicating whether the address was handled
     /// and any IPI action from an ICR write.
-    pub fn handle_mmio_write(&mut self, vcpu_id: u8, addr: u64, _size: u8, data: u32) -> IrqChipWriteResult {
+    pub fn handle_mmio_write(
+        &mut self,
+        vcpu_id: u8,
+        addr: u64,
+        _size: u8,
+        data: u32,
+    ) -> IrqChipWriteResult {
         if addr >= IOAPIC_MMIO_BASE && addr < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
             let offset = addr - IOAPIC_MMIO_BASE;
             self.ioapic.write_mmio(offset, data);
@@ -256,9 +266,7 @@ impl IrqChip {
         }
         let any_lapic_enabled = self.lapics.iter().any(|l| l.is_enabled());
         if any_lapic_enabled && self.ioapic.has_unmasked_entries() {
-            log::info!(
-                "APIC mode enabled — LAPIC active + IOAPIC has unmasked entries"
-            );
+            log::info!("APIC mode enabled — LAPIC active + IOAPIC has unmasked entries");
             self.apic_mode = true;
         }
     }
@@ -414,9 +422,15 @@ mod tests {
     fn test_irq_chip_mmio_read_lapic_id_per_vcpu() {
         let chip = IrqChip::new(2);
         // vCPU 0 reads its own LAPIC ID.
-        assert_eq!(chip.handle_mmio_read(0, LAPIC_MMIO_BASE + 0x020, 4), Some(0 << 24));
+        assert_eq!(
+            chip.handle_mmio_read(0, LAPIC_MMIO_BASE + 0x020, 4),
+            Some(0 << 24)
+        );
         // vCPU 1 reads its own LAPIC ID.
-        assert_eq!(chip.handle_mmio_read(1, LAPIC_MMIO_BASE + 0x020, 4), Some(1 << 24));
+        assert_eq!(
+            chip.handle_mmio_read(1, LAPIC_MMIO_BASE + 0x020, 4),
+            Some(1 << 24)
+        );
     }
 
     #[test]

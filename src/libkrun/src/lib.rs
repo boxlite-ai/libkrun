@@ -91,7 +91,7 @@ const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
 
-#[cfg(feature = "nitro")]
+#[cfg(feature = "aws-nitro")]
 static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 
 const INIT_PATH: &str = "/init.krun";
@@ -2792,7 +2792,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 }
 
-#[cfg(feature = "nitro")]
+#[cfg(feature = "aws-nitro")]
 #[no_mangle]
 fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
     let ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {

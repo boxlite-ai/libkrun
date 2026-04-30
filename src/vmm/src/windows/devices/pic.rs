@@ -424,7 +424,11 @@ mod tests {
         assert_eq!(vector, Some(0x21)); // 0x20 + 1
 
         // IRQ 3 is blocked while IRQ 1 is in-service (lower priority).
-        assert_eq!(chip.pending_irq(), None, "IRQ 3 blocked while IRQ 1 in-service");
+        assert_eq!(
+            chip.pending_irq(),
+            None,
+            "IRQ 3 blocked while IRQ 1 in-service"
+        );
 
         // After EOI for IRQ 1, IRQ 3 becomes deliverable.
         chip.write_command(0x61); // Specific EOI for IRQ 1.
@@ -444,7 +448,11 @@ mod tests {
         // With proper 8259A priority masking, IRQ 1 is blocked while
         // IRQ 0 is in-service (all equal-or-lower priority blocked).
         chip.raise_irq(1);
-        assert_eq!(chip.pending_irq(), None, "IRQ 1 must be blocked while IRQ 0 is in-service");
+        assert_eq!(
+            chip.pending_irq(),
+            None,
+            "IRQ 1 must be blocked while IRQ 0 is in-service"
+        );
 
         // After EOI for IRQ 0, IRQ 1 becomes deliverable.
         chip.write_command(0x60); // Specific EOI for IRQ 0.

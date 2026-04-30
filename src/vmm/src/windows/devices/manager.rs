@@ -18,12 +18,14 @@ use super::irq_chip::IrqChip;
 use super::lapic::IpiAction;
 use super::pit::Pit;
 use super::serial::{Serial, COM1_BASE};
+use super::virtio::balloon::VirtioBalloon;
 use super::virtio::block::VirtioBlock;
 use super::virtio::disk::open_disk_backend;
 use super::virtio::mmio::VirtioMmioDevice;
 use super::virtio::net::VirtioNet;
 use super::virtio::p9::Virtio9p;
 use super::virtio::queue::GuestMemoryAccessor;
+use super::virtio::rng::VirtioRng;
 use super::virtio::vsock::VirtioVsock;
 
 /// Shared console output buffer.
@@ -215,6 +217,10 @@ pub struct DeviceManager {
     virtio_net: Option<VirtioMmioDevice<VirtioNet>>,
     /// Second virtio-blk device (slot 4) — optional, for guest rootfs.
     virtio_blk2: Option<VirtioMmioDevice<VirtioBlock>>,
+    /// Virtio-rng device (slot 5) — always present.
+    virtio_rng: VirtioMmioDevice<VirtioRng>,
+    /// Virtio-balloon device (slot 6) — always present.
+    virtio_balloon: VirtioMmioDevice<VirtioBalloon>,
 
     /// Diagnostic: count QUEUE_NOTIFY writes to blk devices.
     blk_queue_notify_count: u64,
@@ -340,6 +346,12 @@ impl DeviceManager {
             None
         };
 
+        // Virtio-rng (slot 5) — always present.
+        let virtio_rng = VirtioMmioDevice::new(VirtioRng::new());
+
+        // Virtio-balloon (slot 6) — always present.
+        let virtio_balloon = VirtioMmioDevice::new(VirtioBalloon::new());
+
         // Build MMIO slots for kernel cmdline.
         let mmio_slots = vec![
             MmioSlot {
@@ -362,6 +374,14 @@ impl DeviceManager {
                 index: 4,
                 active: virtio_blk2.is_some(),
             },
+            MmioSlot {
+                index: 5,
+                active: true,
+            }, // rng always active
+            MmioSlot {
+                index: 6,
+                active: true,
+            }, // balloon always active
         ];
 
         let devices = DeviceManager {
@@ -374,6 +394,8 @@ impl DeviceManager {
             virtio_9p,
             virtio_net,
             virtio_blk2,
+            virtio_rng,
+            virtio_balloon,
             blk_queue_notify_count: 0,
             blk_completion_count: 0,
             ioapic_mmio_count: 0,
@@ -478,7 +500,9 @@ impl DeviceManager {
     pub fn handle_mmio_read(&mut self, vcpu_id: u8, address: u64, size: u8) -> u64 {
         // Check IOAPIC/LAPIC ranges first.
         if let Some(val) = self.irq_chip.handle_mmio_read(vcpu_id, address, size) {
-            use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
+            use super::super::memory::{
+                IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE,
+            };
             if address >= IOAPIC_MMIO_BASE && address < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
                 self.ioapic_mmio_count += 1;
             } else if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
@@ -492,6 +516,8 @@ impl DeviceManager {
         let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
         let net_offset = address.wrapping_sub(mmio_base_for_slot(3));
         let blk2_offset = address.wrapping_sub(mmio_base_for_slot(4));
+        let rng_offset = address.wrapping_sub(mmio_base_for_slot(5));
+        let balloon_offset = address.wrapping_sub(mmio_base_for_slot(6));
 
         if blk_offset < MMIO_SLOT_SIZE {
             if let Some(ref dev) = self.virtio_blk {
@@ -519,6 +545,10 @@ impl DeviceManager {
             } else {
                 0
             }
+        } else if rng_offset < MMIO_SLOT_SIZE {
+            self.virtio_rng.read(rng_offset, size) as u64
+        } else if balloon_offset < MMIO_SLOT_SIZE {
+            self.virtio_balloon.read(balloon_offset, size) as u64
         } else {
             0
         }
@@ -537,9 +567,13 @@ impl DeviceManager {
         mem: &dyn GuestMemoryAccessor,
     ) -> IpiAction {
         // Check IOAPIC/LAPIC ranges first.
-        let result = self.irq_chip.handle_mmio_write(vcpu_id, address, size as u8, data as u32);
+        let result = self
+            .irq_chip
+            .handle_mmio_write(vcpu_id, address, size as u8, data as u32);
         if result.handled {
-            use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
+            use super::super::memory::{
+                IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE,
+            };
             if address >= IOAPIC_MMIO_BASE && address < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE {
                 self.ioapic_mmio_count += 1;
             } else if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
@@ -553,6 +587,8 @@ impl DeviceManager {
         let p9_offset = address.wrapping_sub(mmio_base_for_slot(2));
         let net_offset = address.wrapping_sub(mmio_base_for_slot(3));
         let blk2_offset = address.wrapping_sub(mmio_base_for_slot(4));
+        let rng_offset = address.wrapping_sub(mmio_base_for_slot(5));
+        let balloon_offset = address.wrapping_sub(mmio_base_for_slot(6));
 
         if blk_offset < MMIO_SLOT_SIZE {
             if blk_offset == 0x050 {
@@ -590,6 +626,17 @@ impl DeviceManager {
                 if dev.write(blk2_offset, data as u32, size, mem) {
                     self.irq_chip.raise_irq(irq_for_slot(4));
                 }
+            }
+        } else if rng_offset < MMIO_SLOT_SIZE {
+            if self.virtio_rng.write(rng_offset, data as u32, size, mem) {
+                self.irq_chip.raise_irq(irq_for_slot(5));
+            }
+        } else if balloon_offset < MMIO_SLOT_SIZE {
+            if self
+                .virtio_balloon
+                .write(balloon_offset, data as u32, size, mem)
+            {
+                self.irq_chip.raise_irq(irq_for_slot(6));
             }
         }
         IpiAction::None
@@ -637,8 +684,14 @@ impl DeviceManager {
             }
         }
 
-        // Tick LAPIC timer (only fires in APIC mode).
-        self.irq_chip.tick_timer(vcpu_id, now);
+        // Tick LAPIC timers for ALL vCPUs (only fires in APIC mode).
+        // Each AP's LAPIC timer must advance so the kernel scheduler can preempt
+        // tasks on all CPUs. Without this, AP LAPIC timer calibration hangs.
+        for i in 0..self.irq_chip.num_vcpus() {
+            self.irq_chip.tick_timer(i, now);
+        }
+        // Suppress unused variable — vcpu_id was the original single-vCPU target.
+        let _ = vcpu_id;
 
         // Drain async block I/O completions.
         if let Some(ref mut dev) = self.virtio_blk {
@@ -741,6 +794,8 @@ pub fn device_manager_with_serial(serial: Serial) -> DeviceManager {
         virtio_9p: None,
         virtio_net: None,
         virtio_blk2: None,
+        virtio_rng: VirtioMmioDevice::new(VirtioRng::new()),
+        virtio_balloon: VirtioMmioDevice::new(VirtioBalloon::new()),
         blk_queue_notify_count: 0,
         blk_completion_count: 0,
         ioapic_mmio_count: 0,
@@ -867,7 +922,11 @@ mod tests {
         // Year should be 2025–2099 in BCD (0x25..0x99).
         assert!(t.year >= 0x25, "year BCD too low: {:#04x}", t.year);
         // Month 1..12 in BCD (0x01..0x12).
-        assert!(t.month >= 0x01 && t.month <= 0x12, "month: {:#04x}", t.month);
+        assert!(
+            t.month >= 0x01 && t.month <= 0x12,
+            "month: {:#04x}",
+            t.month
+        );
         // Day 1..31 in BCD.
         assert!(t.day_of_month >= 0x01 && t.day_of_month <= 0x31);
         // Hours 0..23 in BCD.
@@ -1064,5 +1123,46 @@ mod tests {
     fn test_acpi_pm1a_cnt_read_zero() {
         let mut dm = make_test_devices();
         assert_eq!(dm.handle_io_in(0x604, 2), 0x00);
+    }
+
+    // --- virtio-rng (slot 5) ---
+
+    #[test]
+    fn test_mmio_read_rng_magic() {
+        let dm = make_test_devices();
+        let magic = dm.handle_mmio_read(0, mmio_base_for_slot(5), 4);
+        assert_eq!(magic, 0x7472_6976); // "virt" in LE.
+    }
+
+    #[test]
+    fn test_mmio_read_rng_device_id() {
+        let dm = make_test_devices();
+        let device_id = dm.handle_mmio_read(0, mmio_base_for_slot(5) + 0x008, 4);
+        assert_eq!(device_id, 4); // VIRTIO_ID_RNG
+    }
+
+    // --- virtio-balloon (slot 6) ---
+
+    #[test]
+    fn test_mmio_read_balloon_magic() {
+        let dm = make_test_devices();
+        let magic = dm.handle_mmio_read(0, mmio_base_for_slot(6), 4);
+        assert_eq!(magic, 0x7472_6976); // "virt" in LE.
+    }
+
+    #[test]
+    fn test_mmio_read_balloon_device_id() {
+        let dm = make_test_devices();
+        let device_id = dm.handle_mmio_read(0, mmio_base_for_slot(6) + 0x008, 4);
+        assert_eq!(device_id, 5); // VIRTIO_ID_BALLOON
+    }
+
+    #[test]
+    fn test_from_context_rng_and_balloon_always_active() {
+        let ctx = VmContext::default_for_test();
+        let setup = DeviceManager::from_context(&ctx).unwrap();
+        // Slots 5 (rng) and 6 (balloon) should always be active.
+        assert!(setup.mmio_slots[5].active, "rng slot should be active");
+        assert!(setup.mmio_slots[6].active, "balloon slot should be active");
     }
 }

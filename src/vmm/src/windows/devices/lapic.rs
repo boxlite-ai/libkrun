@@ -197,6 +197,26 @@ impl LocalApic {
         Some(highest)
     }
 
+    /// Compute the LAPIC timer current count register value.
+    ///
+    /// Returns the remaining count based on elapsed time since the timer was
+    /// armed. The kernel reads this during timer calibration and busy-waits.
+    fn current_count(&self) -> u32 {
+        if let Some(deadline) = self.timer_deadline {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining_ns = deadline.duration_since(now).as_nanos() as u64;
+                let tick_ns = 100 * self.timer_divisor as u64;
+                let remaining_ticks = remaining_ns / tick_ns;
+                (remaining_ticks as u32).min(self.timer_initial)
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+
     /// Tick the LAPIC timer. Returns the timer vector if it fired.
     pub fn tick_timer(&mut self, now: Instant) -> Option<u8> {
         if self.timer_masked || self.timer_initial == 0 {
@@ -229,10 +249,10 @@ impl LocalApic {
     pub fn read_mmio(&self, offset: u64) -> u32 {
         match offset {
             0x020 => (self.id as u32) << 24, // LAPIC ID
-            0x030 => LAPIC_VERSION,           // Version
-            0x080 => self.tpr as u32,         // TPR
-            0x0B0 => 0,                       // EOI (write-only)
-            0x0F0 => self.svr,                // SVR
+            0x030 => LAPIC_VERSION,          // Version
+            0x080 => self.tpr as u32,        // TPR
+            0x0B0 => 0,                      // EOI (write-only)
+            0x0F0 => self.svr,               // SVR
             // ISR: 0x100, 0x110, 0x120, ..., 0x170
             0x100..=0x170 if offset & 0x0F == 0 => {
                 let idx = ((offset - 0x100) / 0x10) as usize;
@@ -255,7 +275,7 @@ impl LocalApic {
             0x310 => self.icr_high,         // ICR High
             0x320 => self.read_lvt_timer(), // LVT Timer
             0x380 => self.timer_initial,    // Timer Initial Count
-            0x390 => 0,                     // Timer Current Count (approximation)
+            0x390 => self.current_count(),   // Timer Current Count
             0x3E0 => self.timer_divide_reg, // Timer Divide Configuration
             _ => 0,
         }
@@ -337,7 +357,9 @@ impl LocalApic {
                 // Fixed delivery.
                 log::debug!(
                     "LAPIC {} ICR: Fixed interrupt vector={:#X} → APIC {}",
-                    self.id, vector, dest_apic_id
+                    self.id,
+                    vector,
+                    dest_apic_id
                 );
                 IpiAction::SendInterrupt {
                     target_apic_id: dest_apic_id,
@@ -346,10 +368,7 @@ impl LocalApic {
             }
             0b101 => {
                 // INIT delivery.
-                log::debug!(
-                    "LAPIC {} ICR: INIT → APIC {}",
-                    self.id, dest_apic_id
-                );
+                log::debug!("LAPIC {} ICR: INIT → APIC {}", self.id, dest_apic_id);
                 IpiAction::SendInit {
                     target_apic_id: dest_apic_id,
                 }
@@ -358,7 +377,10 @@ impl LocalApic {
                 // Startup IPI (SIPI).
                 log::debug!(
                     "LAPIC {} ICR: SIPI vector={:#X} → APIC {} (start at {:#X})",
-                    self.id, vector, dest_apic_id, (vector as u32) * 0x1000
+                    self.id,
+                    vector,
+                    dest_apic_id,
+                    (vector as u32) * 0x1000
                 );
                 IpiAction::SendSipi {
                     target_apic_id: dest_apic_id,
@@ -368,7 +390,9 @@ impl LocalApic {
             _ => {
                 log::debug!(
                     "LAPIC {} ICR: unsupported delivery mode {} → APIC {}",
-                    self.id, delivery_mode, dest_apic_id
+                    self.id,
+                    delivery_mode,
+                    dest_apic_id
                 );
                 IpiAction::None
             }
@@ -380,9 +404,7 @@ impl LocalApic {
     /// PPR = max(TPR, highest ISR priority class) — determines the minimum
     /// priority class that can be delivered.
     fn processor_priority(&self) -> u8 {
-        let isr_class = Self::highest_bit(&self.isr)
-            .map(|v| v & 0xF0)
-            .unwrap_or(0);
+        let isr_class = Self::highest_bit(&self.isr).map(|v| v & 0xF0).unwrap_or(0);
         let tpr_class = self.tpr & 0xF0;
         std::cmp::max(isr_class, tpr_class)
     }
@@ -443,9 +465,9 @@ impl LocalApic {
     /// Write the Timer Divide Configuration register.
     fn write_divide_config(&mut self, value: u32) {
         self.timer_divide_reg = value & 0x0B; // Only bits 0,1,3 are used.
-        // Decode divisor: bits [3,1,0] encode the divisor.
-        // 0b000=2, 0b001=4, 0b010=8, 0b011=16,
-        // 0b100=32, 0b101=64, 0b110=128, 0b111=1
+                                              // Decode divisor: bits [3,1,0] encode the divisor.
+                                              // 0b000=2, 0b001=4, 0b010=8, 0b011=16,
+                                              // 0b100=32, 0b101=64, 0b110=128, 0b111=1
         let div_bits = ((value & 0x08) >> 1) | (value & 0x03);
         self.timer_divisor = match div_bits {
             0b000 => 2,
@@ -723,7 +745,7 @@ mod tests {
         assert_eq!(LocalApic::highest_bit(&reg), Some(255));
 
         reg[3] = 1 << 16; // bit 112
-        // Highest should still be 255.
+                          // Highest should still be 255.
         assert_eq!(LocalApic::highest_bit(&reg), Some(255));
     }
 

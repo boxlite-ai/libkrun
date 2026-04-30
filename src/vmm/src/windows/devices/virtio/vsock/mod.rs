@@ -222,7 +222,11 @@ impl VirtioVsock {
                             Err(e) => {
                                 log::warn!(
                                     "vsock write failed: {}/{} bytes, err={}, key=({},{})",
-                                    written, data.len(), e, key.0, key.1
+                                    written,
+                                    data.len(),
+                                    e,
+                                    key.0,
+                                    key.1
                                 );
                                 break;
                             }
@@ -377,16 +381,10 @@ impl VirtioVsock {
                 match listener.accept() {
                     Ok((stream, addr)) => {
                         if let Err(e) = stream.set_nonblocking(true) {
-                            log::warn!(
-                                "vsock set_nonblocking failed: {} (addr={:?})",
-                                e, addr
-                            );
+                            log::warn!("vsock set_nonblocking failed: {} (addr={:?})", e, addr);
                         }
                         if let Err(e) = stream.set_nodelay(true) {
-                            log::warn!(
-                                "vsock set_nodelay failed: {} (addr={:?})",
-                                e, addr
-                            );
+                            log::warn!("vsock set_nodelay failed: {} (addr={:?})", e, addr);
                         }
                         stream
                     }
@@ -406,7 +404,8 @@ impl VirtioVsock {
             if let Some(req) = conn.initiate_connect() {
                 log::debug!(
                     "host-initiated CONNECT: vsock_port={}, host_port={}, queuing REQUEST",
-                    vsock_port, host_port
+                    vsock_port,
+                    host_port
                 );
                 self.rx_pending.push((req, Vec::new()));
                 self.connections.insert(key, conn);
@@ -457,14 +456,15 @@ impl VirtioVsock {
                         log::trace!("TCP read {} bytes, key=({},{})", n, key.0, key.1);
                         Some(buf[..n].to_vec())
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        None
-                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => None,
                     Err(ref e) => {
                         // I/O error on TCP stream. RST the vsock connection.
                         log::warn!(
                             "vsock TCP read error: {} (raw={:?}), key=({},{})",
-                            e, e.raw_os_error(), key.0, key.1
+                            e,
+                            e.raw_os_error(),
+                            key.0,
+                            key.1
                         );
                         if let Some(conn) = self.connections.get(&key) {
                             let rst = conn.make_rst();
@@ -486,7 +486,11 @@ impl VirtioVsock {
                     if enqueued < data.len() {
                         log::debug!(
                             "vsock enqueue_tx partial: {}/{} bytes, credit={}, key=({},{})",
-                            enqueued, data.len(), conn.peer_credit(), key.0, key.1
+                            enqueued,
+                            data.len(),
+                            conn.peer_credit(),
+                            key.0,
+                            key.1
                         );
                     }
                 }

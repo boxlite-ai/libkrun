@@ -615,11 +615,7 @@ mod imp {
                 let byte_count = mem_ctx.InstructionByteCount as usize;
                 let insn_bytes = &mem_ctx.InstructionBytes[..byte_count.min(16)];
                 let regs = self.get_registers().map_err(|e| {
-                    log::error!(
-                        "MMIO get_registers FAILED at GPA 0x{:x}: {:?}",
-                        address,
-                        e
-                    );
+                    log::error!("MMIO get_registers FAILED at GPA 0x{:x}: {:?}", address, e);
                     e
                 })?;
                 let insn = match super::super::insn::decode_mmio_insn(insn_bytes, &regs) {
@@ -1036,56 +1032,41 @@ mod imp {
         /// - DL = APIC ID (Linux convention for AP identification)
         /// - All other regs = 0 / default real mode values
         pub fn set_ap_initial_regs(&self, sipi_vector: u8, apic_id: u8) -> Result<()> {
-            use super::super::types::{SegmentRegister, SpecialRegisters, StandardRegisters};
+            use super::super::types::{SegmentRegister, StandardRegisters};
 
             let cs_base = (sipi_vector as u64) * 0x1000;
             let cs_selector = (sipi_vector as u16) * 0x100;
 
             let regs = StandardRegisters {
                 rdx: apic_id as u64, // Linux uses DL for APIC ID on AP startup
+                rflags: 0x2,         // x86 requires RFLAGS bit 1 always set
                 ..Default::default()
             };
 
-            let sregs = SpecialRegisters {
-                cs: SegmentRegister {
-                    base: cs_base,
-                    limit: 0xFFFF,
-                    selector: cs_selector,
-                    access_rights: 0x9B, // present, code, readable, accessed
-                },
-                ds: SegmentRegister {
-                    base: 0,
-                    limit: 0xFFFF,
-                    selector: 0,
-                    access_rights: 0x93, // present, data, writable, accessed
-                },
-                es: SegmentRegister {
-                    base: 0,
-                    limit: 0xFFFF,
-                    selector: 0,
-                    access_rights: 0x93,
-                },
-                fs: SegmentRegister {
-                    base: 0,
-                    limit: 0xFFFF,
-                    selector: 0,
-                    access_rights: 0x93,
-                },
-                gs: SegmentRegister {
-                    base: 0,
-                    limit: 0xFFFF,
-                    selector: 0,
-                    access_rights: 0x93,
-                },
-                ss: SegmentRegister {
-                    base: 0,
-                    limit: 0xFFFF,
-                    selector: 0,
-                    access_rights: 0x93,
-                },
-                cr0: 0x10, // ET (Extension Type) — required for real mode on x86
-                ..Default::default()
+            // Read existing special registers to preserve WHPX defaults for TR, LDT,
+            // GDT, IDT. WHPX requires valid access_rights for these even in real mode;
+            // overwriting them with zeros causes WHvRunVpExitReasonInvalidVpRegisterValue
+            // (exit reason 5).
+            let mut sregs = self.get_special_registers()?;
+
+            sregs.cs = SegmentRegister {
+                base: cs_base,
+                limit: 0xFFFF,
+                selector: cs_selector,
+                access_rights: 0x9B, // present, code, readable, accessed
             };
+            let data_seg = SegmentRegister {
+                base: 0,
+                limit: 0xFFFF,
+                selector: 0,
+                access_rights: 0x93, // present, data, writable, accessed
+            };
+            sregs.ds = data_seg;
+            sregs.es = data_seg;
+            sregs.fs = data_seg;
+            sregs.gs = data_seg;
+            sregs.ss = data_seg;
+            sregs.cr0 = 0x10; // ET (Extension Type) — required for real mode on x86
 
             self.set_registers(&regs)?;
             self.set_special_registers(&sregs)?;

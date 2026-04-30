@@ -507,10 +507,7 @@ pub unsafe extern "C" fn krun_set_mapped_volumes(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn krun_set_port_map(
-    _ctx_id: u32,
-    _c_port_map: *const *const c_char,
-) -> i32 {
+pub unsafe extern "C" fn krun_set_port_map(_ctx_id: u32, _c_port_map: *const *const c_char) -> i32 {
     0 // No-op
 }
 
@@ -557,10 +554,7 @@ pub unsafe extern "C" fn krun_add_vsock_port(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn krun_set_tee_config_file(
-    _ctx_id: u32,
-    _c_filepath: *const c_char,
-) -> i32 {
+pub unsafe extern "C" fn krun_set_tee_config_file(_ctx_id: u32, _c_filepath: *const c_char) -> i32 {
     -libc::ENOSYS
 }
 
@@ -625,11 +619,7 @@ pub extern "C" fn krun_stop(ctx_id: u32) -> i32 {
 /// Otherwise, copies up to `buf_size` bytes into `buf` and returns the number copied.
 /// Returns -1 if the ctx_id has no console buffer.
 #[no_mangle]
-pub unsafe extern "C" fn krun_get_console_output(
-    ctx_id: u32,
-    buf: *mut u8,
-    buf_size: u32,
-) -> i32 {
+pub unsafe extern "C" fn krun_get_console_output(ctx_id: u32, buf: *mut u8, buf_size: u32) -> i32 {
     let output = match devices::get_console_output(ctx_id) {
         Some(data) => data,
         None => return -1,
@@ -661,11 +651,7 @@ pub unsafe extern "C" fn krun_add_display(_ctx_id: u32, _width: u32, _height: u3
 }
 
 #[no_mangle]
-pub extern "C" fn krun_display_set_refresh_rate(
-    _ctx_id: u32,
-    _display_id: u32,
-    _rate: u32,
-) -> i32 {
+pub extern "C" fn krun_display_set_refresh_rate(_ctx_id: u32, _display_id: u32, _rate: u32) -> i32 {
     -libc::ENOSYS
 }
 
@@ -745,10 +731,7 @@ pub unsafe extern "C" fn krun_add_serial_console_default(_ctx_id: u32) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn krun_set_kernel_console(
-    _ctx_id: u32,
-    _console_id: *const c_char,
-) -> i32 {
+pub unsafe extern "C" fn krun_set_kernel_console(_ctx_id: u32, _console_id: *const c_char) -> i32 {
     -libc::ENOSYS
 }
 

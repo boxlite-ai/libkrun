@@ -149,7 +149,9 @@ impl VsockConnection {
         self.state = ConnState::Connected;
         log::debug!(
             "vsock conn ({},{}) → Connected (guest REQUEST, buf_alloc={})",
-            self.local_port, self.peer_port, hdr.buf_alloc
+            self.local_port,
+            self.peer_port,
+            hdr.buf_alloc
         );
 
         Some(VsockHeader::new_response(
@@ -207,7 +209,10 @@ impl VsockConnection {
         if self.state != old_state {
             log::debug!(
                 "vsock conn ({},{}) → {:?} (SHUTDOWN flags=0x{:x})",
-                self.local_port, self.peer_port, self.state, flags
+                self.local_port,
+                self.peer_port,
+                self.state,
+                flags
             );
         }
     }
@@ -216,7 +221,8 @@ impl VsockConnection {
     pub fn handle_rst(&mut self) {
         log::debug!(
             "vsock conn ({},{}) → Closed (RST)",
-            self.local_port, self.peer_port
+            self.local_port,
+            self.peer_port
         );
         self.state = ConnState::Closed;
     }
@@ -341,7 +347,9 @@ impl VsockConnection {
                     self.state = ConnState::Connected;
                     log::debug!(
                         "vsock conn ({},{}) → Connected (guest RESPONSE, buf_alloc={})",
-                        self.local_port, self.peer_port, hdr.buf_alloc
+                        self.local_port,
+                        self.peer_port,
+                        hdr.buf_alloc
                     );
                 }
                 (None, None)

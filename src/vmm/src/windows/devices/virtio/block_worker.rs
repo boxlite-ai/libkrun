@@ -256,7 +256,11 @@ impl BlockWorker {
                     read_targets: vec![],
                 };
             }
-            if self.disk.write_at(offset, &write_data[data_offset..end]).is_err() {
+            if self
+                .disk
+                .write_at(offset, &write_data[data_offset..end])
+                .is_err()
+            {
                 return BlockCompletion {
                     head_index: req.head_index,
                     bytes_written: 0,
@@ -338,7 +342,11 @@ mod tests {
     unsafe impl Send for MemDisk {}
 
     impl DiskBackend for MemDisk {
-        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> super::super::super::super::error::Result<()> {
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> super::super::super::super::error::Result<()> {
             let start = offset as usize;
             let end = start + buf.len();
             if end > self.data.len() {
@@ -350,7 +358,11 @@ mod tests {
             Ok(())
         }
 
-        fn write_at(&mut self, offset: u64, buf: &[u8]) -> super::super::super::super::error::Result<()> {
+        fn write_at(
+            &mut self,
+            offset: u64,
+            buf: &[u8],
+        ) -> super::super::super::super::error::Result<()> {
             if self.read_only {
                 return Err(super::super::super::super::error::WkrunError::Device(
                     "read-only disk".into(),

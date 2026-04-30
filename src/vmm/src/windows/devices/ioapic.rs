@@ -207,8 +207,8 @@ impl IoApic {
     fn read_register(&self, reg: u8) -> u32 {
         match reg {
             0x00 => (self.id as u32) << 24, // IOAPIC ID
-            0x01 => IOAPIC_VERSION,          // Version
-            0x02 => 0,                       // Arbitration ID (not used)
+            0x01 => IOAPIC_VERSION,         // Version
+            0x02 => 0,                      // Arbitration ID (not used)
             0x10..=0x3F => {
                 let pin = ((reg - 0x10) / 2) as usize;
                 if pin < NUM_PINS {

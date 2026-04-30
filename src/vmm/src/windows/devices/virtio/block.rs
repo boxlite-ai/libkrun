@@ -512,8 +512,7 @@ impl VirtioDeviceBackend for VirtioBlock {
                     let _ = mem.write_at(status_desc.addr, &[status]);
                 }
 
-                let total_written: u32 =
-                    chain.iter().filter(|d| d.is_write()).map(|d| d.len).sum();
+                let total_written: u32 = chain.iter().filter(|d| d.is_write()).map(|d| d.len).sum();
                 let _ = queue.add_used(head, total_written, mem);
                 processed = true;
             }
@@ -942,9 +941,24 @@ mod tests {
         mem.write_bytes(0x1000, &header);
 
         let chain = vec![
-            Descriptor { addr: 0x1000, len: 16, flags: 0, next: 0 },
-            Descriptor { addr: 0x2000, len: 512, flags: 2, next: 0 },
-            Descriptor { addr: 0x3000, len: 1, flags: 2, next: 0 },
+            Descriptor {
+                addr: 0x1000,
+                len: 16,
+                flags: 0,
+                next: 0,
+            },
+            Descriptor {
+                addr: 0x2000,
+                len: 512,
+                flags: 2,
+                next: 0,
+            },
+            Descriptor {
+                addr: 0x3000,
+                len: 1,
+                flags: 2,
+                next: 0,
+            },
         ];
 
         let req = VirtioBlock::parse_request(&chain, 10, &mem).unwrap();
@@ -959,9 +973,12 @@ mod tests {
     #[test]
     fn test_parse_request_short_chain_returns_none() {
         let mem = MockMem::new(0x10000);
-        let chain = vec![
-            Descriptor { addr: 0x1000, len: 16, flags: 0, next: 0 },
-        ];
+        let chain = vec![Descriptor {
+            addr: 0x1000,
+            len: 16,
+            flags: 0,
+            next: 0,
+        }];
         assert!(VirtioBlock::parse_request(&chain, 0, &mem).is_none());
     }
 
