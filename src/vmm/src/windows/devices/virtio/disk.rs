@@ -5,7 +5,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::super::super::error::{Result, WkrunError};
 /// Disk format: raw file passthrough.
@@ -106,6 +106,8 @@ const L2_OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FE00;
 struct Qcow2Header {
     #[allow(dead_code)]
     version: u32,
+    backing_file_offset: u64, // File offset of the backing file path (0 = none).
+    backing_file_size: u32,   // Length of the backing file path in bytes.
     cluster_bits: u32,
     size: u64,            // Virtual disk size in bytes.
     l1_size: u32,         // Number of entries in the L1 table.
@@ -134,13 +136,10 @@ impl Qcow2Header {
             )));
         }
 
-        // Backing file offset (u64 at 8) — must be zero (no backing files).
+        // Backing file offset and size (parsed but not validated here —
+        // the backend's open() method handles backing file resolution).
         let backing_file_offset = u64::from_be_bytes(buf[8..16].try_into().unwrap());
-        if backing_file_offset != 0 {
-            return Err(WkrunError::Device(
-                "qcow2 backing files are not supported".into(),
-            ));
-        }
+        let backing_file_size = u32::from_be_bytes(buf[16..20].try_into().unwrap());
 
         let cluster_bits = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
         if !(9..=21).contains(&cluster_bits) {
@@ -179,6 +178,8 @@ impl Qcow2Header {
 
         Ok(Qcow2Header {
             version,
+            backing_file_offset,
+            backing_file_size,
             cluster_bits,
             size,
             l1_size,
@@ -190,11 +191,36 @@ impl Qcow2Header {
     }
 }
 
+/// Detect disk format by checking for QCOW2 magic bytes.
+fn detect_disk_format(path: &Path) -> Result<u32> {
+    let mut f = File::open(path).map_err(|e| {
+        WkrunError::Device(format!(
+            "failed to open '{}' for format detection: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).map_err(|e| {
+        WkrunError::Device(format!(
+            "failed to read magic from '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    if u32::from_be_bytes(magic) == QCOW2_MAGIC {
+        Ok(DISK_FORMAT_QCOW2)
+    } else {
+        Ok(DISK_FORMAT_RAW)
+    }
+}
+
 /// qcow2 image backend with two-level L1/L2 table navigation.
 ///
 /// Supports reading and writing existing qcow2 images. New clusters
 /// are allocated by appending to the end of the file (append-only).
-/// No compression, encryption, snapshots, or backing file support.
+/// Unallocated clusters delegate to an optional backing file.
+/// No compression, encryption, or snapshot support.
 struct Qcow2DiskBackend {
     file: File,
     header: Qcow2Header,
@@ -204,6 +230,7 @@ struct Qcow2DiskBackend {
     refcount_table: Vec<u64>,
     next_free_cluster: u64,
     read_only: bool,
+    backing: Option<Box<dyn DiskBackend>>,
 }
 
 impl Qcow2DiskBackend {
@@ -260,6 +287,37 @@ impl Qcow2DiskBackend {
             .map_err(|e| WkrunError::Device(format!("failed to get qcow2 file size: {}", e)))?;
         let next_free_cluster = file_len.div_ceil(cluster_size) * cluster_size;
 
+        // Open backing file if referenced in the header.
+        let backing = if header.backing_file_offset != 0 && header.backing_file_size > 0 {
+            file.seek(SeekFrom::Start(header.backing_file_offset))
+                .map_err(|e| {
+                    WkrunError::Device(format!("failed to seek to backing file path: {}", e))
+                })?;
+            let mut path_buf = vec![0u8; header.backing_file_size as usize];
+            file.read_exact(&mut path_buf).map_err(|e| {
+                WkrunError::Device(format!("failed to read backing file path: {}", e))
+            })?;
+            let backing_path_str = String::from_utf8(path_buf).map_err(|e| {
+                WkrunError::Device(format!("invalid UTF-8 in backing file path: {}", e))
+            })?;
+
+            // Resolve relative paths against the parent directory of this qcow2 file.
+            let backing_path = {
+                let p = PathBuf::from(&backing_path_str);
+                if p.is_absolute() {
+                    p
+                } else {
+                    path.parent().unwrap_or_else(|| Path::new(".")).join(&p)
+                }
+            };
+
+            let backing_format = detect_disk_format(&backing_path)?;
+            let backend = open_disk_backend(&backing_path, backing_format, true)?;
+            Some(backend)
+        } else {
+            None
+        };
+
         Ok(Qcow2DiskBackend {
             file,
             header,
@@ -269,6 +327,7 @@ impl Qcow2DiskBackend {
             refcount_table,
             next_free_cluster,
             read_only,
+            backing,
         })
     }
 
@@ -476,8 +535,13 @@ impl DiskBackend for Qcow2DiskBackend {
                         .map_err(|e| WkrunError::Device(format!("qcow2: read failed: {}", e)))?;
                 }
                 None => {
-                    // Unallocated cluster — return zeros.
-                    buf[pos..pos + chunk_len].fill(0);
+                    // Unallocated cluster — read from backing file or return zeros.
+                    match self.backing {
+                        Some(ref mut b) => {
+                            b.read_at(guest_offset, &mut buf[pos..pos + chunk_len])?
+                        }
+                        None => buf[pos..pos + chunk_len].fill(0),
+                    }
                 }
             }
 
@@ -848,17 +912,23 @@ mod tests {
     }
 
     #[test]
-    fn test_qcow2_header_backing_file_rejected() {
-        let mut tmp = NamedTempFile::new().unwrap();
-        let mut data = vec![0u8; 512];
-        data[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
-        data[4..8].copy_from_slice(&2u32.to_be_bytes());
-        data[8..16].copy_from_slice(&100u64.to_be_bytes()); // Backing file offset.
-        tmp.write_all(&data).unwrap();
-        tmp.flush().unwrap();
+    fn test_qcow2_header_backing_file_parsed() {
+        // Verify that header parsing accepts backing_file_offset != 0.
+        let mut buf = [0u8; 104];
+        buf[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        buf[4..8].copy_from_slice(&2u32.to_be_bytes());
+        buf[8..16].copy_from_slice(&100u64.to_be_bytes()); // Backing file offset.
+        buf[16..20].copy_from_slice(&10u32.to_be_bytes()); // Backing file size.
+        buf[20..24].copy_from_slice(&16u32.to_be_bytes()); // cluster_bits.
+        buf[24..32].copy_from_slice(&(1024u64 * 1024).to_be_bytes()); // size.
+        buf[36..40].copy_from_slice(&1u32.to_be_bytes()); // l1_size.
+        buf[40..48].copy_from_slice(&(65536u64).to_be_bytes()); // l1_table_offset.
+        buf[48..56].copy_from_slice(&(65536u64).to_be_bytes()); // refcount_table_offset.
+        buf[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters.
 
-        let err = Qcow2DiskBackend::open(tmp.path(), false).err().unwrap();
-        assert!(err.to_string().contains("backing"), "error was: {}", err);
+        let header = Qcow2Header::parse(&buf).unwrap();
+        assert_eq!(header.backing_file_offset, 100);
+        assert_eq!(header.backing_file_size, 10);
     }
 
     #[test]
@@ -1074,5 +1144,155 @@ mod tests {
         let mut buf = [0u8; 512];
         backend.read_at(0, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0x99));
+    }
+
+    // -----------------------------------------------------------------------
+    // Backing file support
+    // -----------------------------------------------------------------------
+
+    /// Create a minimal qcow2 v2 image with a backing file reference.
+    ///
+    /// Layout (cluster_size = 512):
+    ///   Cluster 0: header + backing file path
+    ///   Cluster 1: refcount table
+    ///   Cluster 2: refcount block
+    ///   Cluster 3: L1 table (all zeros — everything reads from backing)
+    fn create_test_qcow2_with_backing(
+        virtual_size: u64,
+        cluster_bits: u32,
+        backing_path: &Path,
+    ) -> NamedTempFile {
+        let cluster_size = 1u64 << cluster_bits;
+        let l2_entries = cluster_size / 8;
+        let l1_entries = virtual_size.div_ceil(cluster_size * l2_entries) as u32;
+
+        let backing_path_bytes = backing_path.to_string_lossy().as_bytes().to_vec();
+        let backing_path_len = backing_path_bytes.len() as u32;
+        // Store backing path right after the 104-byte header.
+        let backing_file_offset: u64 = 104;
+
+        let refcount_table_offset = cluster_size;
+        let refcount_block_offset = cluster_size * 2;
+        let l1_table_offset = cluster_size * 3;
+        let total_clusters = 4u64;
+        let file_size = cluster_size * total_clusters;
+
+        let mut f = NamedTempFile::new().unwrap();
+        let mut image = vec![0u8; file_size as usize];
+
+        // --- Header (cluster 0) ---
+        image[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        image[4..8].copy_from_slice(&2u32.to_be_bytes()); // version
+        image[8..16].copy_from_slice(&backing_file_offset.to_be_bytes());
+        image[16..20].copy_from_slice(&backing_path_len.to_be_bytes());
+        image[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
+        image[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        image[32..36].copy_from_slice(&0u32.to_be_bytes()); // crypt_method
+        image[36..40].copy_from_slice(&l1_entries.to_be_bytes());
+        image[40..48].copy_from_slice(&l1_table_offset.to_be_bytes());
+        image[48..56].copy_from_slice(&refcount_table_offset.to_be_bytes());
+        image[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters
+        image[60..64].copy_from_slice(&0u32.to_be_bytes()); // nb_snapshots
+
+        // Backing file path (after header).
+        let start = backing_file_offset as usize;
+        image[start..start + backing_path_bytes.len()].copy_from_slice(&backing_path_bytes);
+
+        // --- Refcount table (cluster 1) ---
+        let rt_off = refcount_table_offset as usize;
+        image[rt_off..rt_off + 8].copy_from_slice(&refcount_block_offset.to_be_bytes());
+
+        // --- Refcount block (cluster 2) ---
+        let rb_off = refcount_block_offset as usize;
+        for i in 0..total_clusters {
+            let entry_off = rb_off + (i as usize) * 2;
+            image[entry_off..entry_off + 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+
+        // L1 table (cluster 3) — all zeros (everything unallocated → backing).
+
+        f.write_all(&image).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn test_qcow2_backing_file_read() {
+        // Create a raw base disk with a known pattern.
+        let base = create_raw_file_with_pattern(8); // 8 sectors = 4096 bytes
+        let base_path = base.path().to_path_buf();
+
+        // Create a QCOW2 child that references the base as backing.
+        let child = create_test_qcow2_with_backing(4096, 9, &base_path);
+
+        let mut backend = Qcow2DiskBackend::open(child.path(), false).unwrap();
+
+        // Read sector 0 — should come from backing (pattern byte = 0x00).
+        let mut buf = [0u8; 512];
+        backend.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x00));
+
+        // Read sector 3 — should come from backing (pattern byte = 0x03).
+        backend.read_at(512 * 3, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x03));
+
+        // Read sector 7 — should come from backing (pattern byte = 0x07).
+        backend.read_at(512 * 7, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x07));
+    }
+
+    #[test]
+    fn test_qcow2_backing_file_cow_write() {
+        // Create a raw base disk with pattern.
+        let base = create_raw_file_with_pattern(8);
+        let base_path = base.path().to_path_buf();
+
+        let child = create_test_qcow2_with_backing(4096, 9, &base_path);
+        let mut backend = Qcow2DiskBackend::open(child.path(), false).unwrap();
+
+        // Write to sector 2 in the child.
+        backend.write_at(512 * 2, &[0xFF; 512]).unwrap();
+
+        // Read sector 2 — should reflect the child write (0xFF).
+        let mut buf = [0u8; 512];
+        backend.read_at(512 * 2, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xFF));
+
+        // Read sector 3 — should still come from backing (0x03).
+        backend.read_at(512 * 3, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x03));
+
+        // Read sector 0 — should still come from backing (0x00).
+        backend.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn test_qcow2_backing_file_missing_errors() {
+        let missing_path = Path::new("/nonexistent/backing/file.raw");
+        let child = create_test_qcow2_with_backing(4096, 9, missing_path);
+
+        let result = Qcow2DiskBackend::open(child.path(), false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent") || err.contains("No such file"),
+            "error was: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_detect_disk_format_raw() {
+        let tmp = create_raw_file(1024);
+        let fmt = detect_disk_format(tmp.path()).unwrap();
+        assert_eq!(fmt, DISK_FORMAT_RAW);
+    }
+
+    #[test]
+    fn test_detect_disk_format_qcow2() {
+        let tmp = create_test_qcow2(1024 * 1024, 9, &[]);
+        let fmt = detect_disk_format(tmp.path()).unwrap();
+        assert_eq!(fmt, DISK_FORMAT_QCOW2);
     }
 }

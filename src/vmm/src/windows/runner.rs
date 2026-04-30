@@ -694,11 +694,7 @@ mod imp {
                     if address >= crate::windows::memory::LAPIC_MMIO_BASE {
                         let offset = address - crate::windows::memory::LAPIC_MMIO_BASE;
                         if offset == 0x300 || offset == 0x310 {
-                            diag!(
-                                "LAPIC ICR write: offset={:#X} data={:#X}",
-                                offset,
-                                data
-                            );
+                            diag!("LAPIC ICR write: offset={:#X} data={:#X}", offset, data);
                         }
                     }
                     // Dispatch IPI if this was an ICR write.
@@ -814,7 +810,13 @@ mod imp {
                                 .unwrap_or(0);
                             let (qn, bc) = dm.blk_stats();
                             let apic_mode = dm.irq_chip.apic_mode();
-                            let blk_mode = if sync_block { "sync" } else if blk_workers_started { "async" } else { "pending" };
+                            let blk_mode = if sync_block {
+                                "sync"
+                            } else if blk_workers_started {
+                                "async"
+                            } else {
+                                "pending"
+                            };
                             drop(dm);
                             log::info!(
                                 target: "whpx::diag",
@@ -983,10 +985,21 @@ mod imp {
                  GDT=base:{:#X}/lim:{:#X} IDT=base:{:#X}/lim:{:#X} \
                  CR0={:#X} CR4={:#X} EFER={:#X}",
                 ap_id,
-                sregs.tr.selector, sregs.tr.base, sregs.tr.limit, sregs.tr.access_rights,
-                sregs.ldt.selector, sregs.ldt.base, sregs.ldt.limit, sregs.ldt.access_rights,
-                sregs.gdt.base, sregs.gdt.limit, sregs.idt.base, sregs.idt.limit,
-                sregs.cr0, sregs.cr4, sregs.efer
+                sregs.tr.selector,
+                sregs.tr.base,
+                sregs.tr.limit,
+                sregs.tr.access_rights,
+                sregs.ldt.selector,
+                sregs.ldt.base,
+                sregs.ldt.limit,
+                sregs.ldt.access_rights,
+                sregs.gdt.base,
+                sregs.gdt.limit,
+                sregs.idt.base,
+                sregs.idt.limit,
+                sregs.cr0,
+                sregs.cr4,
+                sregs.efer
             );
         }
 
@@ -1094,7 +1107,14 @@ mod imp {
                     let ipi_action = dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
                     if !matches!(ipi_action, IpiAction::None) {
                         // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
-                        dispatch_ipi(ipi_action, &mut dm, &[], cancellers, diag_log, stats.start_time);
+                        dispatch_ipi(
+                            ipi_action,
+                            &mut dm,
+                            &[],
+                            cancellers,
+                            diag_log,
+                            stats.start_time,
+                        );
                     }
                     drop(dm);
                     let _ = vcpu.skip_instruction();
@@ -1248,7 +1268,9 @@ mod imp {
                 VcpuExit::Unknown(reason) => {
                     diag!(
                         "AP{}: unknown exit reason {} after {} exits",
-                        ap_id, reason, stats.exit_count
+                        ap_id,
+                        reason,
+                        stats.exit_count
                     );
                     return;
                 }

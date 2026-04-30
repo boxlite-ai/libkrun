@@ -275,7 +275,7 @@ impl LocalApic {
             0x310 => self.icr_high,         // ICR High
             0x320 => self.read_lvt_timer(), // LVT Timer
             0x380 => self.timer_initial,    // Timer Initial Count
-            0x390 => self.current_count(),   // Timer Current Count
+            0x390 => self.current_count(),  // Timer Current Count
             0x3E0 => self.timer_divide_reg, // Timer Divide Configuration
             _ => 0,
         }
