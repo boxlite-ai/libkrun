@@ -687,8 +687,12 @@ impl DeviceManager {
         // Tick LAPIC timers for ALL vCPUs (only fires in APIC mode).
         // Each AP's LAPIC timer must advance so the kernel scheduler can preempt
         // tasks on all CPUs. Without this, AP LAPIC timer calibration hangs.
-        for i in 0..self.irq_chip.num_vcpus() {
-            self.irq_chip.tick_timer(i, now);
+        // Throttle: LAPIC timers fire at ~100Hz (10ms period), so checking more
+        // than every 500µs wastes CPU. PIT timer (IRQ 0) still fires every tick.
+        if elapsed_ns > 500_000 {
+            for i in 0..self.irq_chip.num_vcpus() {
+                self.irq_chip.tick_timer(i, now);
+            }
         }
         // Suppress unused variable — vcpu_id was the original single-vCPU target.
         let _ = vcpu_id;

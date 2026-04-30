@@ -10,7 +10,7 @@
 #[cfg(target_os = "windows")]
 mod imp {
     use std::collections::HashMap;
-    use std::io::Write as IoWrite;
+    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
@@ -54,6 +54,13 @@ mod imp {
     /// loop whenever there are no interrupts; this is normal and does
     /// NOT indicate the VM is stuck.
     const MAX_HALTS: u64 = 50_000;
+
+    /// Number of spin-yield iterations before sleeping on HLT.
+    /// ~50µs of yielding to catch imminent timer interrupts.
+    const HLT_SPIN_ITERS: u32 = 50;
+
+    /// Short sleep duration (µs) after spin phase completes without interrupt.
+    const HLT_SLEEP_US: u64 = 200;
 
     /// Per-AP (Application Processor) startup state.
     ///
@@ -276,15 +283,6 @@ mod imp {
             regs.rip,
             cmdline
         );
-        // Also emit to stderr so shim can capture it (log::* may be silently dropped
-        // when no log→tracing bridge is installed).
-        eprintln!(
-            "[WHPX] Kernel loaded, RIP={:#X}, ram={}MB, mmio_hole={}, cmdline_len={}",
-            regs.rip,
-            ctx.ram_mib,
-            ctx.ram_mib as u64 * 1024 * 1024 > crate::windows::memory::VIRTIO_MMIO_BASE,
-            cmdline.len()
-        );
         diag!("Kernel loaded, RIP={:#X}, ram={}MB", regs.rip, ctx.ram_mib);
 
         // Create all vCPUs. BSP (index 0) gets the boot registers.
@@ -318,8 +316,7 @@ mod imp {
         // Move diag_log into shared state for BSP diagnostics.
         let diag_log = Arc::new(Mutex::new(diag_log));
 
-        log::info!("Starting VM with {} vCPU(s), ctx_id={}", num_vcpus, ctx_id,);
-        eprintln!("[WHPX] Starting {} vCPU(s)", num_vcpus);
+        log::info!("Starting VM with {} vCPU(s), ctx_id={}", num_vcpus, ctx_id);
 
         let mut exit_code = 1i32;
 
@@ -405,7 +402,11 @@ mod imp {
         }
 
         log::info!("VM exited with code {}", exit_code);
-        eprintln!("[WHPX] VM exited, code={}", exit_code);
+
+        // Clean up diagnostic file on normal exit.
+        // Drop the file handle first, then remove the temp file.
+        drop(diag_log);
+        let _ = std::fs::remove_file(&diag_path);
 
         Ok(exit_code)
     }
@@ -494,11 +495,13 @@ mod imp {
         ap_states: &[ApStartupState],
         cancellers: &[VcpuCanceller],
         diag_log: &Arc<Mutex<Option<std::fs::File>>>,
+        start_time: Instant,
     ) {
         macro_rules! ipi_diag {
             ($($arg:tt)*) => {
                 if let Ok(mut guard) = diag_log.lock() {
                     if let Some(ref mut f) = *guard {
+                        let _ = write!(f, "[{:.3}s] ", start_time.elapsed().as_secs_f64());
                         let _ = writeln!(f, $($arg)*);
                         let _ = f.flush();
                     }
@@ -624,10 +627,6 @@ mod imp {
                         stats.exit_count,
                         e
                     );
-                    eprintln!(
-                        "[WHPX] BSP vcpu.run() FAILED after {} exits: {:?}",
-                        stats.exit_count, e
-                    );
                     return 1;
                 }
             };
@@ -682,14 +681,13 @@ mod imp {
                     if !blk_workers_started && !sync_block {
                         dm.start_blk_workers();
                         blk_workers_started = true;
-                        let msg = format!(
+                        log::info!(
+                            target: "whpx::diag",
                             "Block workers started at exit={} mmio={} elapsed={:.1}ms",
                             stats.exit_count,
                             stats.mmio_count,
                             stats.start_time.elapsed().as_secs_f64() * 1000.0
                         );
-                        eprintln!("[WHPX] {}", msg);
-                        diag!("{}", msg);
                     }
                     let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
                     // Log LAPIC ICR writes for diagnostics.
@@ -711,6 +709,7 @@ mod imp {
                             ap_states,
                             cancellers,
                             diag_log,
+                            stats.start_time,
                         );
                     }
                     drop(dm);
@@ -758,28 +757,18 @@ mod imp {
                                 .map(|b| b.len())
                                 .unwrap_or(0);
                             let if_flag = vcpu.interrupts_enabled().unwrap_or(false);
-                            eprintln!(
-                                "[WHPX] BSP HLT stuck: consecutive={} total_halt={} halt_with_irq={} \
-                                 exits={} RIP={:#X} RFLAGS={:#X} IF={} console={}B mmio={} vcpus={}",
+                            log::warn!(
+                                target: "whpx::diag",
+                                "BSP HLT stuck: consecutive={} total_halt={} halt_w_irq={} \
+                                 exits={} RIP={:#X} IF={} console={}B mmio={} vcpus={}",
                                 stats.halt_count, stats.total_halt_exits, stats.halt_with_irq,
-                                stats.exit_count, regs.rip, regs.rflags,
+                                stats.exit_count, regs.rip,
                                 if_flag, console_len, stats.mmio_count, num_vcpus
                             );
                         }
                     }
 
                     if stats.halt_count > MAX_HALTS {
-                        if let Ok(regs) = vcpu.get_registers() {
-                            let console_len = devices::get_console_output(ctx_id)
-                                .map(|b| b.len())
-                                .unwrap_or(0);
-                            eprintln!(
-                                "[WHPX] BSP HALT_MAX: consecutive={} total_halt={} halt_with_irq={} \
-                                 exits={} RIP={:#X} console={}B mmio={}",
-                                stats.halt_count, stats.total_halt_exits, stats.halt_with_irq,
-                                stats.exit_count, regs.rip, console_len, stats.mmio_count
-                            );
-                        }
                         log::warn!(
                             "BSP halted {} times consecutively after {} exits",
                             stats.halt_count,
@@ -788,7 +777,24 @@ mod imp {
                         _last_exit_reason = "HALT_MAX_REACHED";
                         return 0;
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+
+                    // Tiered sleep: spin-yield phase to catch imminent interrupts,
+                    // then short sleep if no interrupt arrived.
+                    let mut woke_by_irq = false;
+                    for i in 0..HLT_SPIN_ITERS {
+                        std::thread::yield_now();
+                        if i % 10 == 9 {
+                            let mut dm = devices.lock().unwrap();
+                            dm.tick_and_poll(0, guest_mem);
+                            if dm.irq_chip.has_pending(0) {
+                                woke_by_irq = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !woke_by_irq {
+                        std::thread::sleep(Duration::from_micros(HLT_SLEEP_US));
+                    }
                 }
                 VcpuExit::Shutdown => {
                     log::info!("BSP: VM shutdown after {} exits", stats.exit_count);
@@ -807,29 +813,24 @@ mod imp {
                                 .map(|b| b.len())
                                 .unwrap_or(0);
                             let (qn, bc) = dm.blk_stats();
-                            let (ioapic_mmio, lapic_mmio) = dm.apic_mmio_stats();
-                            let (irr, isr, imr, vbase) = dm.irq_chip.pic_master_state();
-                            let (s_irr, s_isr, s_imr, s_vbase) = dm.irq_chip.pic_slave_state();
                             let apic_mode = dm.irq_chip.apic_mode();
-                            let msg = format!(
-                                "BSP @ {:.1}s: exits={} RIP={:#X} console={}B io_out={} serial={} mmio={} blk_qn={} blk_comp={} halt={}/{} halt_w_irq={} inj={} ioapic_mmio={} lapic_mmio={} pic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} spic=irr:{:02X}/isr:{:02X}/imr:{:02X}/vb:{:02X} irq={} mode={} vcpus={}",
+                            let blk_mode = if sync_block { "sync" } else if blk_workers_started { "async" } else { "pending" };
+                            drop(dm);
+                            log::info!(
+                                target: "whpx::diag",
+                                "vCPU0 @ {:.1}s: exits={} RIP={:#X} console={}B mmio={} halt={}/{} inj={} blk_comp={} mode={}/{}",
                                 stats.start_time.elapsed().as_secs_f64(),
                                 stats.exit_count, regs.rip, console_len,
-                                stats.io_out_count, stats.serial_out_count,
-                                stats.mmio_count, qn, bc,
-                                stats.halt_count, stats.total_halt_exits,
-                                stats.halt_with_irq, stats.inject_count,
-                                ioapic_mmio, lapic_mmio,
-                                irr, isr, imr, vbase,
-                                s_irr, s_isr, s_imr, s_vbase,
-                                if apic_mode { "apic" } else { "pic" },
-                                if sync_block { "sync" } else if blk_workers_started { "async" } else { "pending" },
-                                num_vcpus,
+                                stats.mmio_count, stats.halt_count, stats.total_halt_exits,
+                                stats.inject_count, bc,
+                                if apic_mode { "apic" } else { "pic" }, blk_mode,
                             );
-                            drop(dm);
-                            log::info!("{}", msg);
-                            eprintln!("[WHPX] {}", msg);
-                            diag!("{}", msg);
+                            log::debug!(
+                                target: "whpx::diag",
+                                "vCPU0 detail: io_out={} serial={} blk_qn={} halt_w_irq={} vcpus={}",
+                                stats.io_out_count, stats.serial_out_count, qn,
+                                stats.halt_with_irq, num_vcpus,
+                            );
                         }
                     }
                 }
@@ -900,11 +901,6 @@ mod imp {
                         sregs.as_ref().map_or(0, |s| s.cr3),
                         sregs.as_ref().map_or(0, |s| s.cr4),
                         sregs.as_ref().map_or(0, |s| s.efer),
-                    );
-                    eprintln!(
-                        "[WHPX] BSP TRIPLE FAULT after {} exits, RIP={:#X}",
-                        stats.exit_count,
-                        regs.as_ref().map_or(0, |r| r.rip),
                     );
                     return -1;
                 }
@@ -1098,7 +1094,7 @@ mod imp {
                     let ipi_action = dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
                     if !matches!(ipi_action, IpiAction::None) {
                         // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
-                        dispatch_ipi(ipi_action, &mut dm, &[], cancellers, diag_log);
+                        dispatch_ipi(ipi_action, &mut dm, &[], cancellers, diag_log, stats.start_time);
                     }
                     drop(dm);
                     let _ = vcpu.skip_instruction();
@@ -1145,7 +1141,23 @@ mod imp {
                         // Don't exit, just keep waiting for interrupts.
                         stats.halt_count = 0;
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+
+                    // Tiered sleep: spin-yield phase to catch imminent interrupts,
+                    // then short sleep if no interrupt arrived.
+                    let mut woke_by_irq = false;
+                    for i in 0..HLT_SPIN_ITERS {
+                        std::thread::yield_now();
+                        if i % 10 == 9 {
+                            let mut dm = devices.lock().unwrap();
+                            if dm.irq_chip.has_pending(ap_id) {
+                                woke_by_irq = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !woke_by_irq {
+                        std::thread::sleep(Duration::from_micros(HLT_SLEEP_US));
+                    }
                 }
                 VcpuExit::Shutdown => {
                     log::info!("AP{}: shutdown after {} exits", ap_id, stats.exit_count);
