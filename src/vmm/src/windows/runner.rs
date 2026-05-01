@@ -18,11 +18,11 @@ mod imp {
     use super::super::boot::loader::load_kernel_with_initrd;
     use super::super::cmdline::build_kernel_cmdline;
     use super::super::context::VmContext;
-    use super::super::devices::lapic::IpiAction;
+    use super::super::devices::lapic::{IpiAction, LocalApic};
     use super::super::devices::manager::{self as devices, DeviceManager};
     use super::super::devices::virtio::queue::GuestMemoryAccessor;
     use super::super::error::{Result, WkrunError};
-    use super::super::memory::GuestMemory;
+    use super::super::memory::{GuestMemory, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
     use super::super::types::VcpuExit;
     use super::super::vcpu::VcpuRunConfig;
     use super::super::whpx::{VcpuCanceller, WhpxPartition, WhpxVcpu};
@@ -311,6 +311,12 @@ mod imp {
 
         // Shared VM shutdown flag — set by any vCPU to signal all others to exit.
         let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Extract per-vCPU LAPIC refs BEFORE wrapping in Arc<Mutex<>>.
+        // These allow the runner fast path to bypass the DeviceManager lock
+        // for LAPIC MMIO reads/writes, eliminating cross-vCPU contention.
+        let lapic_refs: Vec<Arc<Mutex<LocalApic>>> = devices.get_lapic_refs();
+
         let devices = Arc::new(Mutex::new(devices));
 
         // Move diag_log into shared state for BSP diagnostics.
@@ -331,6 +337,7 @@ mod imp {
             let run_config_ref = &run_config;
             let guest_mem_ref: &GuestMemory = &guest_mem;
             let diag_ref = &diag_log;
+            let lapic_refs_ref = &lapic_refs;
 
             // Spawn timer thread — cancels ALL vCPUs every 1ms.
             let timer_flag = run_config.running.clone();
@@ -350,6 +357,7 @@ mod imp {
                 // Spawn AP threads (vCPU 1..N-1).
                 for ap_idx in 1..num_vcpus as usize {
                     let vcpu = &vcpus[ap_idx];
+                    let my_lapic = &lapic_refs_ref[ap_idx];
                     s.spawn(move || {
                         run_ap_loop(
                             ap_idx as u8,
@@ -363,6 +371,7 @@ mod imp {
                             &ap_states_ref[ap_idx - 1],
                             ctx_id,
                             diag_ref,
+                            my_lapic,
                         );
                     });
                 }
@@ -380,6 +389,7 @@ mod imp {
                     ctx_id,
                     diag_ref,
                     num_vcpus,
+                    &lapic_refs_ref[0],
                 );
                 // BSP exited — signal all APs to exit.
                 shutdown_ref.store(true, Ordering::Release);
@@ -570,6 +580,52 @@ mod imp {
         }
     }
 
+    /// Fast path: read from LAPIC MMIO without acquiring DeviceManager lock.
+    ///
+    /// All LAPIC register reads are safe to handle via the per-vCPU LAPIC lock
+    /// since they only access the vCPU's own LAPIC state (IRR, ISR, TPR, CCR, etc).
+    /// Returns Some(value) if the address is in the LAPIC range, None otherwise.
+    fn handle_lapic_mmio_read_fast(lapic: &Mutex<LocalApic>, address: u64) -> Option<u64> {
+        if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
+            let offset = address - LAPIC_MMIO_BASE;
+            Some(lapic.lock().unwrap().read_mmio(offset) as u64)
+        } else {
+            None
+        }
+    }
+
+    /// Fast path: write to LAPIC MMIO without acquiring DeviceManager lock.
+    ///
+    /// Only handles registers that have NO side effects requiring other devices
+    /// (no EOI → IOAPIC propagation, no SVR → APIC transition check, no ICR → IPI).
+    /// Returns Some(()) if handled, None if the write needs the DeviceManager path.
+    fn handle_lapic_mmio_write_fast(lapic: &Mutex<LocalApic>, address: u64, data: u64) -> Option<()> {
+        if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
+            let offset = address - LAPIC_MMIO_BASE;
+            match offset {
+                // TPR: no cross-device side effects.
+                0x080 |
+                // ICR High: sets destination, no IPI dispatch until ICR Low write.
+                0x310 |
+                // LVT Timer: configures timer mode/vector, no immediate side effects.
+                0x320 |
+                // Timer Initial Count: starts/resets timer countdown.
+                0x380 |
+                // Timer Divide Config: sets timer divider.
+                0x3E0 => {
+                    lapic.lock().unwrap().write_mmio(offset, data as u32);
+                    Some(())
+                }
+                // EOI (0x0B0): needs IOAPIC propagation → DeviceManager path.
+                // SVR (0x0F0): needs APIC transition check → DeviceManager path.
+                // ICR Low (0x300): needs IPI dispatch → DeviceManager path.
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// BSP (Bootstrap Processor, vCPU 0) main loop.
     ///
     /// Handles timer ticking, device polling, interrupt injection, block worker
@@ -586,6 +642,7 @@ mod imp {
         ctx_id: u32,
         diag_log: &Arc<Mutex<Option<std::fs::File>>>,
         num_vcpus: u8,
+        my_lapic: &Arc<Mutex<LocalApic>>,
     ) -> i32 {
         macro_rules! diag {
             ($($arg:tt)*) => {
@@ -664,7 +721,12 @@ mod imp {
                 VcpuExit::MmioRead { address, size } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    let data = devices.lock().unwrap().handle_mmio_read(0, address, size);
+                    // Fast path: LAPIC reads bypass DeviceManager lock.
+                    let data = if let Some(val) = handle_lapic_mmio_read_fast(my_lapic, address) {
+                        val
+                    } else {
+                        devices.lock().unwrap().handle_mmio_read(0, address, size)
+                    };
                     if let Err(e) = vcpu.complete_mmio_read(data) {
                         log::error!("BSP complete_mmio_read error: {:?}", e);
                         return 1;
@@ -677,38 +739,42 @@ mod imp {
                 } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    let mut dm = devices.lock().unwrap();
-                    if !blk_workers_started && !sync_block {
-                        dm.start_blk_workers();
-                        blk_workers_started = true;
-                        log::info!(
-                            target: "whpx::diag",
-                            "Block workers started at exit={} mmio={} elapsed={:.1}ms",
-                            stats.exit_count,
-                            stats.mmio_count,
-                            stats.start_time.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
-                    let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
-                    // Log LAPIC ICR writes for diagnostics.
-                    if address >= crate::windows::memory::LAPIC_MMIO_BASE {
-                        let offset = address - crate::windows::memory::LAPIC_MMIO_BASE;
-                        if offset == 0x300 || offset == 0x310 {
-                            diag!("LAPIC ICR write: offset={:#X} data={:#X}", offset, data);
+                    // Fast path: simple LAPIC writes bypass DeviceManager lock.
+                    if handle_lapic_mmio_write_fast(my_lapic, address, data).is_none() {
+                        // Slow path: needs DeviceManager for EOI/SVR/ICR or non-LAPIC devices.
+                        let mut dm = devices.lock().unwrap();
+                        if !blk_workers_started && !sync_block {
+                            dm.start_blk_workers();
+                            blk_workers_started = true;
+                            log::info!(
+                                target: "whpx::diag",
+                                "Block workers started at exit={} mmio={} elapsed={:.1}ms",
+                                stats.exit_count,
+                                stats.mmio_count,
+                                stats.start_time.elapsed().as_secs_f64() * 1000.0
+                            );
                         }
+                        let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
+                        // Log LAPIC ICR writes for diagnostics.
+                        if address >= LAPIC_MMIO_BASE {
+                            let offset = address - LAPIC_MMIO_BASE;
+                            if offset == 0x300 || offset == 0x310 {
+                                diag!("LAPIC ICR write: offset={:#X} data={:#X}", offset, data);
+                            }
+                        }
+                        // Dispatch IPI if this was an ICR write.
+                        if !matches!(ipi_action, IpiAction::None) {
+                            dispatch_ipi(
+                                ipi_action,
+                                &mut dm,
+                                ap_states,
+                                cancellers,
+                                diag_log,
+                                stats.start_time,
+                            );
+                        }
+                        drop(dm);
                     }
-                    // Dispatch IPI if this was an ICR write.
-                    if !matches!(ipi_action, IpiAction::None) {
-                        dispatch_ipi(
-                            ipi_action,
-                            &mut dm,
-                            ap_states,
-                            cancellers,
-                            diag_log,
-                            stats.start_time,
-                        );
-                    }
-                    drop(dm);
                     if let Err(e) = vcpu.skip_instruction() {
                         log::error!("BSP skip_instruction error: {:?}", e);
                         return 1;
@@ -780,6 +846,12 @@ mod imp {
                     for i in 0..HLT_SPIN_ITERS {
                         std::thread::yield_now();
                         if i % 10 == 9 {
+                            // Fast check: per-LAPIC only (no DeviceManager lock).
+                            if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
+                                woke_by_irq = true;
+                                break;
+                            }
+                            // Slow check: tick PIT + poll devices.
                             let mut dm = devices.lock().unwrap();
                             dm.tick_and_poll(0, guest_mem);
                             if dm.irq_chip.has_pending(0) {
@@ -940,6 +1012,7 @@ mod imp {
         startup: &ApStartupState,
         _ctx_id: u32,
         diag_log: &Arc<Mutex<Option<std::fs::File>>>,
+        my_lapic: &Arc<Mutex<LocalApic>>,
     ) {
         macro_rules! diag {
             ($($arg:tt)*) => {
@@ -1020,7 +1093,8 @@ mod imp {
             }
 
             // Try to inject pending interrupt (no timer ticking for APs).
-            {
+            // Fast path: check per-LAPIC first — usually no pending → skip DeviceManager.
+            if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
                 let mut dm = devices.lock().unwrap();
                 if let Err(e) = try_inject_interrupt(vcpu, ap_id, &mut dm, &mut stats) {
                     log::error!("AP{}: interrupt injection error: {:?}", ap_id, e);
@@ -1090,10 +1164,15 @@ mod imp {
                 VcpuExit::MmioRead { address, size } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    let data = devices
-                        .lock()
-                        .unwrap()
-                        .handle_mmio_read(ap_id, address, size);
+                    // Fast path: LAPIC reads bypass DeviceManager lock.
+                    let data = if let Some(val) = handle_lapic_mmio_read_fast(my_lapic, address) {
+                        val
+                    } else {
+                        devices
+                            .lock()
+                            .unwrap()
+                            .handle_mmio_read(ap_id, address, size)
+                    };
                     let _ = vcpu.complete_mmio_read(data);
                 }
                 VcpuExit::MmioWrite {
@@ -1103,20 +1182,25 @@ mod imp {
                 } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    let mut dm = devices.lock().unwrap();
-                    let ipi_action = dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
-                    if !matches!(ipi_action, IpiAction::None) {
-                        // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
-                        dispatch_ipi(
-                            ipi_action,
-                            &mut dm,
-                            &[],
-                            cancellers,
-                            diag_log,
-                            stats.start_time,
-                        );
+                    // Fast path: simple LAPIC writes bypass DeviceManager lock.
+                    if handle_lapic_mmio_write_fast(my_lapic, address, data).is_none() {
+                        // Slow path: needs DeviceManager for EOI/SVR/ICR or non-LAPIC devices.
+                        let mut dm = devices.lock().unwrap();
+                        let ipi_action =
+                            dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
+                        if !matches!(ipi_action, IpiAction::None) {
+                            // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
+                            dispatch_ipi(
+                                ipi_action,
+                                &mut dm,
+                                &[],
+                                cancellers,
+                                diag_log,
+                                stats.start_time,
+                            );
+                        }
+                        drop(dm);
                     }
-                    drop(dm);
                     let _ = vcpu.skip_instruction();
                 }
                 VcpuExit::InterruptWindow => {
@@ -1130,8 +1214,8 @@ mod imp {
                         return;
                     }
 
-                    // Check for pending interrupts.
-                    {
+                    // Check for pending interrupts (fast path: per-LAPIC only).
+                    if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
                         let mut dm = devices.lock().unwrap();
                         if dm.irq_chip.has_pending(ap_id) {
                             let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
@@ -1164,12 +1248,12 @@ mod imp {
 
                     // Tiered sleep: spin-yield phase to catch imminent interrupts,
                     // then short sleep if no interrupt arrived.
+                    // Fast path: per-LAPIC only (no DeviceManager lock).
                     let mut woke_by_irq = false;
                     for i in 0..HLT_SPIN_ITERS {
                         std::thread::yield_now();
                         if i % 10 == 9 {
-                            let mut dm = devices.lock().unwrap();
-                            if dm.irq_chip.has_pending(ap_id) {
+                            if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
                                 woke_by_irq = true;
                                 break;
                             }

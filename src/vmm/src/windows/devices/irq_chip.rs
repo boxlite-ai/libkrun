@@ -10,6 +10,7 @@
 //! The APIC mode is auto-detected: when the guest writes to the LAPIC SVR
 //! register with the enable bit set, the IrqChip switches to APIC mode.
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
@@ -42,7 +43,12 @@ pub struct IrqChip {
     /// I/O APIC for routing device interrupts to the LAPICs.
     ioapic: IoApic,
     /// Per-vCPU Local APICs (indexed by vCPU ID).
-    lapics: Vec<LocalApic>,
+    ///
+    /// Each LAPIC is wrapped in its own Arc<Mutex<>> to allow per-vCPU locking.
+    /// This eliminates cross-vCPU contention during LAPIC MMIO reads (esp. timer
+    /// CCR at 0x390), which is critical for 4+ vCPU support — without this, SMP
+    /// timer calibration causes BSP starvation on tick_and_poll().
+    lapics: Vec<Arc<Mutex<LocalApic>>>,
     /// false = PIC mode (early boot), true = APIC mode.
     apic_mode: bool,
 }
@@ -57,7 +63,7 @@ impl IrqChip {
     /// Create a new IrqChip in PIC mode (legacy boot) with N LAPICs.
     pub fn new(num_vcpus: u8) -> Self {
         let lapics = (0..num_vcpus)
-            .map(|id| LocalApic::new_with_id(id))
+            .map(|id| Arc::new(Mutex::new(LocalApic::new_with_id(id))))
             .collect();
         Self {
             pic: Pic::new(),
@@ -65,6 +71,14 @@ impl IrqChip {
             lapics,
             apic_mode: false,
         }
+    }
+
+    /// Get a clone of the Arc<Mutex<LocalApic>> for a specific vCPU.
+    ///
+    /// Used by the runner to acquire per-vCPU LAPIC refs that can be locked
+    /// independently of the DeviceManager lock (fast path for MMIO reads).
+    pub fn get_lapic_ref(&self, vcpu_id: u32) -> Arc<Mutex<LocalApic>> {
+        self.lapics[vcpu_id as usize].clone()
     }
 
     /// Number of vCPUs (LAPICs).
@@ -90,7 +104,7 @@ impl IrqChip {
             let gsi = if irq == 0 { 2 } else { irq };
             if let Some((vector, dest)) = self.ioapic.service_irq(gsi, true) {
                 let target = (dest as usize).min(self.lapics.len() - 1);
-                self.lapics[target].accept_interrupt(vector);
+                self.lapics[target].lock().unwrap().accept_interrupt(vector);
             }
         } else {
             self.pic.raise_irq(irq);
@@ -102,7 +116,10 @@ impl IrqChip {
     /// Checks LAPIC (APIC mode) or PIC (legacy mode, only for BSP / vCPU 0).
     pub fn get_injectable_vector(&self, vcpu_id: u8) -> Option<u8> {
         if self.apic_mode {
-            self.lapics[vcpu_id as usize].get_highest_injectable()
+            self.lapics[vcpu_id as usize]
+                .lock()
+                .unwrap()
+                .get_highest_injectable()
         } else if vcpu_id == 0 {
             if self.pic.has_pending() {
                 // PIC has pending, but we need to peek — can't acknowledge yet.
@@ -120,6 +137,8 @@ impl IrqChip {
     pub fn has_pending(&self, vcpu_id: u8) -> bool {
         if self.apic_mode {
             self.lapics[vcpu_id as usize]
+                .lock()
+                .unwrap()
                 .get_highest_injectable()
                 .is_some()
         } else if vcpu_id == 0 {
@@ -135,7 +154,10 @@ impl IrqChip {
     /// In APIC mode: returns the highest injectable from the vCPU's LAPIC.
     pub fn acknowledge(&mut self, vcpu_id: u8) -> Option<u8> {
         if self.apic_mode {
-            self.lapics[vcpu_id as usize].get_highest_injectable()
+            self.lapics[vcpu_id as usize]
+                .lock()
+                .unwrap()
+                .get_highest_injectable()
         } else if vcpu_id == 0 {
             self.pic.acknowledge()
         } else {
@@ -149,7 +171,10 @@ impl IrqChip {
     /// In PIC mode: no-op (PIC acknowledge already moved to ISR).
     pub fn notify_injected(&mut self, vcpu_id: u8, vector: u8) {
         if self.apic_mode {
-            self.lapics[vcpu_id as usize].start_of_interrupt(vector);
+            self.lapics[vcpu_id as usize]
+                .lock()
+                .unwrap()
+                .start_of_interrupt(vector);
         }
     }
 
@@ -162,7 +187,10 @@ impl IrqChip {
             // Pin still asserted — re-deliver using the correct IOAPIC pin.
             if let Some((new_vector, dest)) = self.ioapic.service_irq(pin, true) {
                 let target = (dest as usize).min(self.lapics.len() - 1);
-                self.lapics[target].accept_interrupt(new_vector);
+                self.lapics[target]
+                    .lock()
+                    .unwrap()
+                    .accept_interrupt(new_vector);
             }
         }
         // Suppress unused variable warning — vcpu_id is used for routing context.
@@ -174,7 +202,7 @@ impl IrqChip {
         if !self.apic_mode {
             return None;
         }
-        let lapic = &mut self.lapics[vcpu_id as usize];
+        let mut lapic = self.lapics[vcpu_id as usize].lock().unwrap();
         if let Some(vector) = lapic.tick_timer(now) {
             lapic.accept_interrupt(vector);
             Some(vector)
@@ -193,7 +221,7 @@ impl IrqChip {
             Some(self.ioapic.read_mmio(offset))
         } else if addr >= LAPIC_MMIO_BASE && addr < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
             let offset = addr - LAPIC_MMIO_BASE;
-            Some(self.lapics[vcpu_id as usize].read_mmio(offset))
+            Some(self.lapics[vcpu_id as usize].lock().unwrap().read_mmio(offset))
         } else {
             None
         }
@@ -221,7 +249,10 @@ impl IrqChip {
             }
         } else if addr >= LAPIC_MMIO_BASE && addr < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
             let offset = addr - LAPIC_MMIO_BASE;
-            let result = self.lapics[vcpu_id as usize].write_mmio(offset, data);
+            let result = self.lapics[vcpu_id as usize]
+                .lock()
+                .unwrap()
+                .write_mmio(offset, data);
 
             // LAPIC SVR may have been enabled — check transition.
             self.check_apic_transition();
@@ -247,7 +278,10 @@ impl IrqChip {
     /// are handled by the runner's AP startup logic).
     pub fn deliver_ipi_interrupt(&mut self, target_apic_id: u8, vector: u8) {
         if (target_apic_id as usize) < self.lapics.len() {
-            self.lapics[target_apic_id as usize].accept_interrupt(vector);
+            self.lapics[target_apic_id as usize]
+                .lock()
+                .unwrap()
+                .accept_interrupt(vector);
         }
     }
 
@@ -264,7 +298,7 @@ impl IrqChip {
         if self.apic_mode {
             return;
         }
-        let any_lapic_enabled = self.lapics.iter().any(|l| l.is_enabled());
+        let any_lapic_enabled = self.lapics.iter().any(|l| l.lock().unwrap().is_enabled());
         if any_lapic_enabled && self.ioapic.has_unmasked_entries() {
             log::info!("APIC mode enabled — LAPIC active + IOAPIC has unmasked entries");
             self.apic_mode = true;
@@ -296,10 +330,10 @@ mod tests {
     fn test_irq_chip_multi_vcpu_creates_lapics() {
         let chip = IrqChip::new(4);
         assert_eq!(chip.num_vcpus(), 4);
-        assert_eq!(chip.lapics[0].id(), 0);
-        assert_eq!(chip.lapics[1].id(), 1);
-        assert_eq!(chip.lapics[2].id(), 2);
-        assert_eq!(chip.lapics[3].id(), 3);
+        assert_eq!(chip.lapics[0].lock().unwrap().id(), 0);
+        assert_eq!(chip.lapics[1].lock().unwrap().id(), 1);
+        assert_eq!(chip.lapics[2].lock().unwrap().id(), 2);
+        assert_eq!(chip.lapics[3].lock().unwrap().id(), 3);
     }
 
     #[test]
@@ -530,5 +564,41 @@ mod tests {
     fn test_irq_chip_default_is_single_vcpu() {
         let chip = IrqChip::default();
         assert_eq!(chip.num_vcpus(), 1);
+    }
+
+    #[test]
+    fn test_get_lapic_ref_returns_correct_lapic() {
+        let chip = IrqChip::new(4);
+        for i in 0..4u32 {
+            let lapic_ref = chip.get_lapic_ref(i);
+            assert_eq!(lapic_ref.lock().unwrap().id(), i as u8);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_lapic_access() {
+        // Verify that per-LAPIC locks allow concurrent access from multiple threads.
+        let chip = IrqChip::new(4);
+        let refs: Vec<Arc<Mutex<LocalApic>>> = (0..4).map(|i| chip.get_lapic_ref(i)).collect();
+
+        std::thread::scope(|s| {
+            for (vcpu_id, lapic_ref) in refs.iter().enumerate() {
+                let lapic = lapic_ref.clone();
+                s.spawn(move || {
+                    // Each thread reads/writes its own LAPIC 1000 times.
+                    for _ in 0..1000 {
+                        let mut l = lapic.lock().unwrap();
+                        // Read LAPIC ID register (offset 0x020).
+                        let id_val = l.read_mmio(0x020);
+                        assert_eq!(id_val >> 24, vcpu_id as u32);
+                        // Write TPR (offset 0x080).
+                        l.write_mmio(0x080, 0x10);
+                        // Read TPR back.
+                        let tpr = l.read_mmio(0x080);
+                        assert_eq!(tpr, 0x10);
+                    }
+                });
+            }
+        });
     }
 }

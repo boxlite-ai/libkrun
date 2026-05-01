@@ -15,7 +15,7 @@ use super::super::context::VmContext;
 use super::super::error::{Result, WkrunError};
 use super::super::vcpu::IoHandler;
 use super::irq_chip::IrqChip;
-use super::lapic::IpiAction;
+use super::lapic::{IpiAction, LocalApic};
 use super::pit::Pit;
 use super::serial::{Serial, COM1_BASE};
 use super::virtio::balloon::VirtioBalloon;
@@ -782,6 +782,16 @@ impl DeviceManager {
     /// Set the interrupt window requested flag.
     pub fn set_window_requested(&mut self, requested: bool) {
         self.window_requested = requested;
+    }
+
+    /// Get per-vCPU LAPIC references for the runner fast path.
+    ///
+    /// Each ref can be locked independently of the DeviceManager lock,
+    /// eliminating cross-vCPU contention on LAPIC MMIO reads.
+    pub fn get_lapic_refs(&self) -> Vec<Arc<Mutex<LocalApic>>> {
+        (0..self.irq_chip.num_vcpus())
+            .map(|i| self.irq_chip.get_lapic_ref(i as u32))
+            .collect()
     }
 }
 
