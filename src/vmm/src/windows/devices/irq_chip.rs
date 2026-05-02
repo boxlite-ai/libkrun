@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use super::super::memory::{IOAPIC_MMIO_BASE, IOAPIC_MMIO_SIZE, LAPIC_MMIO_BASE, LAPIC_MMIO_SIZE};
 use super::ioapic::IoApic;
-use super::lapic::{IpiAction, LocalApic};
+use super::lapic::{IpiAction, LocalApic, SharedApicState};
 use super::pic::Pic;
 
 /// Result of an IrqChip MMIO write operation.
@@ -49,6 +49,11 @@ pub struct IrqChip {
     /// CCR at 0x390), which is critical for 4+ vCPU support — without this, SMP
     /// timer calibration causes BSP starvation on tick_and_poll().
     lapics: Vec<Arc<Mutex<LocalApic>>>,
+    /// Per-vCPU shared APIC state for lock-free cross-vCPU interrupt delivery.
+    ///
+    /// Source vCPUs atomically OR vector bits into the target's SharedApicState.
+    /// The owning vCPU pulls these into its local IRR via `pull_irr()`.
+    shared_states: Vec<Arc<SharedApicState>>,
     /// false = PIC mode (early boot), true = APIC mode.
     apic_mode: bool,
 }
@@ -65,10 +70,14 @@ impl IrqChip {
         let lapics = (0..num_vcpus)
             .map(|id| Arc::new(Mutex::new(LocalApic::new_with_id(id))))
             .collect();
+        let shared_states = (0..num_vcpus)
+            .map(|_| Arc::new(SharedApicState::new()))
+            .collect();
         Self {
             pic: Pic::new(),
             ioapic: IoApic::new(),
             lapics,
+            shared_states,
             apic_mode: false,
         }
     }
@@ -79,6 +88,13 @@ impl IrqChip {
     /// independently of the DeviceManager lock (fast path for MMIO reads).
     pub fn get_lapic_ref(&self, vcpu_id: u32) -> Arc<Mutex<LocalApic>> {
         self.lapics[vcpu_id as usize].clone()
+    }
+
+    /// Get a clone of the Arc<SharedApicState> for a specific vCPU.
+    ///
+    /// Used by the runner for lock-free cross-vCPU interrupt delivery.
+    pub fn get_shared_state(&self, vcpu_id: u32) -> Arc<SharedApicState> {
+        self.shared_states[vcpu_id as usize].clone()
     }
 
     /// Number of vCPUs (LAPICs).
@@ -104,7 +120,8 @@ impl IrqChip {
             let gsi = if irq == 0 { 2 } else { irq };
             if let Some((vector, dest)) = self.ioapic.service_irq(gsi, true) {
                 let target = (dest as usize).min(self.lapics.len() - 1);
-                self.lapics[target].lock().unwrap().accept_interrupt(vector);
+                // Lock-free: atomic OR into shared state instead of locking LAPIC.
+                self.shared_states[target].request_interrupt(vector);
             }
         } else {
             self.pic.raise_irq(irq);
@@ -187,10 +204,8 @@ impl IrqChip {
             // Pin still asserted — re-deliver using the correct IOAPIC pin.
             if let Some((new_vector, dest)) = self.ioapic.service_irq(pin, true) {
                 let target = (dest as usize).min(self.lapics.len() - 1);
-                self.lapics[target]
-                    .lock()
-                    .unwrap()
-                    .accept_interrupt(new_vector);
+                // Lock-free: atomic OR into shared state.
+                self.shared_states[target].request_interrupt(new_vector);
             }
         }
         // Suppress unused variable warning — vcpu_id is used for routing context.
@@ -277,11 +292,10 @@ impl IrqChip {
     /// that targets another LAPIC (SendInterrupt variant only — INIT and SIPI
     /// are handled by the runner's AP startup logic).
     pub fn deliver_ipi_interrupt(&mut self, target_apic_id: u8, vector: u8) {
-        if (target_apic_id as usize) < self.lapics.len() {
-            self.lapics[target_apic_id as usize]
-                .lock()
-                .unwrap()
-                .accept_interrupt(vector);
+        let idx = target_apic_id as usize;
+        if idx < self.shared_states.len() {
+            // Lock-free: atomic OR into shared state instead of locking LAPIC.
+            self.shared_states[idx].request_interrupt(vector);
         }
     }
 
@@ -409,6 +423,8 @@ mod tests {
         assert!(chip.apic_mode());
 
         chip.raise_irq(5);
+        // pull_irr: merge shared state into local IRR (lock-free delivery path).
+        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
         assert!(chip.has_pending(0));
 
         let vector = chip.acknowledge(0);
@@ -429,6 +445,8 @@ mod tests {
 
         // raise_irq(0) should remap to IOAPIC pin 2 and deliver vector 0x22.
         chip.raise_irq(0);
+        // pull_irr: merge shared state into local IRR (lock-free delivery path).
+        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
         assert!(chip.has_pending(0));
 
         let vector = chip.acknowledge(0);
@@ -494,6 +512,8 @@ mod tests {
 
         // Raise IRQ 3.
         chip.raise_irq(3);
+        // pull_irr: merge shared state into local IRR (lock-free delivery path).
+        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
         let vector = chip.acknowledge(0);
         assert_eq!(vector, Some(0x33));
 
@@ -503,7 +523,8 @@ mod tests {
         // Write EOI to LAPIC (offset 0x0B0).
         chip.handle_mmio_write(0, LAPIC_MMIO_BASE + 0x0B0, 4, 0);
 
-        // After EOI, the pin is still asserted → re-injection.
+        // After EOI, the pin is still asserted → re-injection via shared state.
+        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
         assert!(chip.has_pending(0));
     }
 
@@ -544,6 +565,8 @@ mod tests {
 
         // Deliver IPI to vCPU 1.
         chip.deliver_ipi_interrupt(1, 0x40);
+        // pull_irr: merge shared state into local IRR (lock-free delivery path).
+        chip.lapics[1].lock().unwrap().pull_irr(&chip.shared_states[1]);
         assert!(chip.has_pending(1));
         assert_eq!(chip.acknowledge(1), Some(0x40));
     }
@@ -600,5 +623,63 @@ mod tests {
                 });
             }
         });
+    }
+
+    // ---- Lock-free SharedApicState integration tests ----
+
+    #[test]
+    fn test_raise_irq_uses_shared_state() {
+        use super::lapic::SharedApicState;
+
+        let mut chip = IrqChip::new(2);
+        // Enable APIC mode: SVR on vCPU 0.
+        chip.lapics[0].lock().unwrap().write_mmio(0x0F0, 0x1FF);
+        // Unmask IOAPIC entry 1 → GSI 1, vector 49, dest = LAPIC 0.
+        chip.ioapic.set_entry(1, 49, 0, false);
+        chip.apic_mode = true;
+
+        // raise_irq goes through shared state (lock-free).
+        chip.raise_irq(1);
+
+        // Before pull_irr, LAPIC has nothing.
+        assert_eq!(chip.lapics[0].lock().unwrap().get_highest_injectable(), None);
+
+        // After pull_irr, LAPIC sees vector 49.
+        let shared = chip.get_shared_state(0);
+        chip.lapics[0].lock().unwrap().pull_irr(&shared);
+        assert_eq!(
+            chip.lapics[0].lock().unwrap().get_highest_injectable(),
+            Some(49)
+        );
+    }
+
+    #[test]
+    fn test_deliver_ipi_lock_free() {
+        use super::lapic::SharedApicState;
+
+        let mut chip = IrqChip::new(2);
+        // Enable both LAPICs.
+        chip.lapics[0].lock().unwrap().write_mmio(0x0F0, 0x1FF);
+        chip.lapics[1].lock().unwrap().write_mmio(0x0F0, 0x1FF);
+        chip.apic_mode = true;
+
+        // Deliver IPI: vector 80 to LAPIC 1.
+        chip.deliver_ipi_interrupt(1, 80);
+
+        // Before pull_irr, LAPIC 1 has nothing.
+        assert_eq!(chip.lapics[1].lock().unwrap().get_highest_injectable(), None);
+
+        // After pull_irr, LAPIC 1 sees vector 80.
+        let shared = chip.get_shared_state(1);
+        chip.lapics[1].lock().unwrap().pull_irr(&shared);
+        assert_eq!(
+            chip.lapics[1].lock().unwrap().get_highest_injectable(),
+            Some(80)
+        );
+
+        // LAPIC 0 should be unaffected.
+        let shared0 = chip.get_shared_state(0);
+        chip.lapics[0].lock().unwrap().pull_irr(&shared0);
+        assert_eq!(chip.lapics[0].lock().unwrap().get_highest_injectable(), None);
     }
 }

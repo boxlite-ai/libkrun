@@ -18,7 +18,7 @@ mod imp {
     use super::super::boot::loader::load_kernel_with_initrd;
     use super::super::cmdline::build_kernel_cmdline;
     use super::super::context::VmContext;
-    use super::super::devices::lapic::{IpiAction, LocalApic};
+    use super::super::devices::lapic::{IpiAction, LocalApic, SharedApicState};
     use super::super::devices::manager::{self as devices, DeviceManager};
     use super::super::devices::virtio::queue::GuestMemoryAccessor;
     use super::super::error::{Result, WkrunError};
@@ -317,6 +317,10 @@ mod imp {
         // for LAPIC MMIO reads/writes, eliminating cross-vCPU contention.
         let lapic_refs: Vec<Arc<Mutex<LocalApic>>> = devices.get_lapic_refs();
 
+        // Extract per-vCPU shared APIC states for lock-free cross-vCPU interrupt delivery.
+        // Source vCPUs atomic-OR vector bits here; owning vCPU pulls into local IRR.
+        let shared_states: Vec<Arc<SharedApicState>> = devices.get_shared_states();
+
         let devices = Arc::new(Mutex::new(devices));
 
         // Move diag_log into shared state for BSP diagnostics.
@@ -338,6 +342,7 @@ mod imp {
             let guest_mem_ref: &GuestMemory = &guest_mem;
             let diag_ref = &diag_log;
             let lapic_refs_ref = &lapic_refs;
+            let shared_states_ref = &shared_states;
 
             // Spawn timer thread — cancels ALL vCPUs every 1ms.
             let timer_flag = run_config.running.clone();
@@ -358,6 +363,7 @@ mod imp {
                 for ap_idx in 1..num_vcpus as usize {
                     let vcpu = &vcpus[ap_idx];
                     let my_lapic = &lapic_refs_ref[ap_idx];
+                    let my_shared = &shared_states_ref[ap_idx];
                     s.spawn(move || {
                         run_ap_loop(
                             ap_idx as u8,
@@ -372,6 +378,8 @@ mod imp {
                             ctx_id,
                             diag_ref,
                             my_lapic,
+                            my_shared,
+                            shared_states_ref,
                         );
                     });
                 }
@@ -390,6 +398,8 @@ mod imp {
                     diag_ref,
                     num_vcpus,
                     &lapic_refs_ref[0],
+                    &shared_states_ref[0],
+                    shared_states_ref,
                 );
                 // BSP exited — signal all APs to exit.
                 shutdown_ref.store(true, Ordering::Release);
@@ -435,6 +445,10 @@ mod imp {
         last_progress: Instant,
         start_time: Instant,
         window_requested: bool,
+        /// Last MMIO read address (for tight loop detection).
+        last_mmio_read_addr: u64,
+        /// Consecutive MMIO reads to the same address.
+        consecutive_mmio_reads: u64,
     }
 
     impl VcpuStats {
@@ -453,6 +467,8 @@ mod imp {
                 last_progress: now,
                 start_time: now,
                 window_requested: false,
+                last_mmio_read_addr: u64::MAX,
+                consecutive_mmio_reads: 0,
             }
         }
     }
@@ -493,6 +509,49 @@ mod imp {
             }
             Err(ref e) => {
                 log::warn!("vCPU{}: interrupts_enabled() error: {:?}", vcpu_id, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lock-free interrupt injection for APIC mode — no DeviceManager lock.
+    ///
+    /// Checks the per-vCPU LAPIC for injectable vectors and injects directly
+    /// via the WHPX vCPU API. Only the owning vCPU's LAPIC mutex is acquired.
+    fn try_inject_interrupt_fast(
+        vcpu: &WhpxVcpu,
+        lapic: &Mutex<LocalApic>,
+        stats: &mut VcpuStats,
+    ) -> Result<()> {
+        let has_injectable = lapic.lock().unwrap().get_highest_injectable().is_some();
+        if !has_injectable {
+            return Ok(());
+        }
+
+        let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
+        if already_pending {
+            return Ok(());
+        }
+
+        match vcpu.interrupts_enabled() {
+            Ok(true) => {
+                let mut guard = lapic.lock().unwrap();
+                if let Some(vector) = guard.get_highest_injectable() {
+                    guard.start_of_interrupt(vector);
+                    drop(guard);
+                    vcpu.inject_interrupt(vector)?;
+                    stats.inject_count += 1;
+                    stats.window_requested = false;
+                }
+            }
+            Ok(false) => {
+                if !stats.window_requested {
+                    vcpu.request_interrupt_window()?;
+                    stats.window_requested = true;
+                }
+            }
+            Err(ref e) => {
+                log::warn!("try_inject_interrupt_fast: interrupts_enabled() error: {:?}", e);
             }
         }
         Ok(())
@@ -594,12 +653,27 @@ mod imp {
         }
     }
 
+    /// Result of a fast-path LAPIC MMIO write.
+    enum LapicWriteFastResult {
+        /// Write handled completely (no further action needed).
+        Handled,
+        /// ICR Low write: IPI action needs dispatching inline (lock-free).
+        IpiAction(IpiAction),
+        /// Not handled: needs DeviceManager slow path (EOI, SVR, non-LAPIC).
+        NotHandled,
+    }
+
     /// Fast path: write to LAPIC MMIO without acquiring DeviceManager lock.
     ///
-    /// Only handles registers that have NO side effects requiring other devices
-    /// (no EOI → IOAPIC propagation, no SVR → APIC transition check, no ICR → IPI).
-    /// Returns Some(()) if handled, None if the write needs the DeviceManager path.
-    fn handle_lapic_mmio_write_fast(lapic: &Mutex<LocalApic>, address: u64, data: u64) -> Option<()> {
+    /// Handles most LAPIC registers directly via per-vCPU lock. ICR Low writes
+    /// are parsed and returned as IpiAction for inline dispatch (lock-free IPI).
+    /// Only EOI (→ IOAPIC propagation) and SVR (→ APIC transition check)
+    /// require the DeviceManager slow path.
+    fn handle_lapic_mmio_write_fast(
+        lapic: &Mutex<LocalApic>,
+        address: u64,
+        data: u64,
+    ) -> LapicWriteFastResult {
         if address >= LAPIC_MMIO_BASE && address < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
             let offset = address - LAPIC_MMIO_BASE;
             match offset {
@@ -614,15 +688,20 @@ mod imp {
                 // Timer Divide Config: sets timer divider.
                 0x3E0 => {
                     lapic.lock().unwrap().write_mmio(offset, data as u32);
-                    Some(())
+                    LapicWriteFastResult::Handled
+                }
+                // ICR Low (0x300): parse ICR and return IPI action for inline dispatch.
+                // This eliminates the DeviceManager lock for ALL IPI dispatch.
+                0x300 => {
+                    let result = lapic.lock().unwrap().write_mmio(offset, data as u32);
+                    LapicWriteFastResult::IpiAction(result.ipi_action)
                 }
                 // EOI (0x0B0): needs IOAPIC propagation → DeviceManager path.
                 // SVR (0x0F0): needs APIC transition check → DeviceManager path.
-                // ICR Low (0x300): needs IPI dispatch → DeviceManager path.
-                _ => None,
+                _ => LapicWriteFastResult::NotHandled,
             }
         } else {
-            None
+            LapicWriteFastResult::NotHandled
         }
     }
 
@@ -643,6 +722,8 @@ mod imp {
         diag_log: &Arc<Mutex<Option<std::fs::File>>>,
         num_vcpus: u8,
         my_lapic: &Arc<Mutex<LocalApic>>,
+        my_shared: &Arc<SharedApicState>,
+        all_shared: &[Arc<SharedApicState>],
     ) -> i32 {
         macro_rules! diag {
             ($($arg:tt)*) => {
@@ -666,14 +747,37 @@ mod imp {
                 return 0;
             }
 
-            // Tick PIT and poll devices (BSP only).
+            // 1. Pull remote interrupts (lock-free) + tick own LAPIC timer.
+            {
+                let mut lapic = my_lapic.lock().unwrap();
+                lapic.pull_irr(my_shared);
+                if let Some(vector) = lapic.tick_timer(Instant::now()) {
+                    lapic.accept_interrupt(vector);
+                }
+            }
+            // 2. Lock-free interrupt injection (APIC mode, per-vCPU only).
+            if let Err(e) = try_inject_interrupt_fast(vcpu, my_lapic, &mut stats) {
+                log::error!("BSP lock-free inject error: {:?}", e);
+            }
+            // 3. Tick PIT + poll devices (reduced lock time — no LAPIC timer loop).
             {
                 let mut dm = devices.lock().unwrap();
                 dm.tick_and_poll(0, guest_mem);
-                // Try to inject pending interrupt.
-                if let Err(e) = try_inject_interrupt(vcpu, 0, &mut dm, &mut stats) {
-                    log::error!("BSP interrupt injection error: {:?}", e);
+                // PIC mode fallback: inject via DeviceManager path.
+                if !dm.irq_chip.apic_mode() {
+                    if let Err(e) = try_inject_interrupt(vcpu, 0, &mut dm, &mut stats) {
+                        log::error!("BSP PIC inject error: {:?}", e);
+                    }
                 }
+            }
+            // 4. Pull any interrupts raised by tick_and_poll (device completions,
+            //    PIT timer) and inject before entering the guest.
+            {
+                let mut lapic = my_lapic.lock().unwrap();
+                lapic.pull_irr(my_shared);
+            }
+            if let Err(e) = try_inject_interrupt_fast(vcpu, my_lapic, &mut stats) {
+                log::error!("BSP post-poll inject error: {:?}", e);
             }
 
             let exit = match vcpu.run() {
@@ -721,6 +825,23 @@ mod imp {
                 VcpuExit::MmioRead { address, size } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
+                    // Detect tight MMIO read loops (same address read 10K+ times).
+                    // This catches BSP hang during LAPIC timer calibration.
+                    if address == stats.last_mmio_read_addr {
+                        stats.consecutive_mmio_reads += 1;
+                        if stats.consecutive_mmio_reads == 10_000 {
+                            log::warn!(
+                                "BSP: tight MMIO read loop: addr={:#X} count={} exit={}",
+                                address, stats.consecutive_mmio_reads, stats.exit_count
+                            );
+                            if let Ok(regs) = vcpu.get_registers() {
+                                log::warn!("BSP: RIP={:#X} at tight MMIO loop", regs.rip);
+                            }
+                        }
+                    } else {
+                        stats.last_mmio_read_addr = address;
+                        stats.consecutive_mmio_reads = 1;
+                    }
                     // Fast path: LAPIC reads bypass DeviceManager lock.
                     let data = if let Some(val) = handle_lapic_mmio_read_fast(my_lapic, address) {
                         val
@@ -739,41 +860,63 @@ mod imp {
                 } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    // Fast path: simple LAPIC writes bypass DeviceManager lock.
-                    if handle_lapic_mmio_write_fast(my_lapic, address, data).is_none() {
-                        // Slow path: needs DeviceManager for EOI/SVR/ICR or non-LAPIC devices.
-                        let mut dm = devices.lock().unwrap();
-                        if !blk_workers_started && !sync_block {
-                            dm.start_blk_workers();
-                            blk_workers_started = true;
-                            log::info!(
-                                target: "whpx::diag",
-                                "Block workers started at exit={} mmio={} elapsed={:.1}ms",
-                                stats.exit_count,
-                                stats.mmio_count,
-                                stats.start_time.elapsed().as_secs_f64() * 1000.0
-                            );
+                    match handle_lapic_mmio_write_fast(my_lapic, address, data) {
+                        LapicWriteFastResult::Handled => {
+                            // Fast path: handled via per-vCPU lock only.
                         }
-                        let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
-                        // Log LAPIC ICR writes for diagnostics.
-                        if address >= LAPIC_MMIO_BASE {
-                            let offset = address - LAPIC_MMIO_BASE;
-                            if offset == 0x300 || offset == 0x310 {
-                                diag!("LAPIC ICR write: offset={:#X} data={:#X}", offset, data);
+                        LapicWriteFastResult::IpiAction(action) => {
+                            // ICR fast path: dispatch IPI inline (lock-free).
+                            match action {
+                                IpiAction::SendInterrupt { target_apic_id, vector } => {
+                                    let idx = target_apic_id as usize;
+                                    if idx < all_shared.len() {
+                                        all_shared[idx].request_interrupt(vector);
+                                        if idx < cancellers.len() {
+                                            let _ = cancellers[idx].cancel();
+                                        }
+                                    }
+                                }
+                                IpiAction::SendInit { .. } | IpiAction::SendSipi { .. } => {
+                                    // INIT/SIPI use existing condvar mechanism.
+                                    dispatch_ipi(
+                                        action,
+                                        &mut devices.lock().unwrap(),
+                                        ap_states,
+                                        cancellers,
+                                        diag_log,
+                                        stats.start_time,
+                                    );
+                                }
+                                IpiAction::None => {}
                             }
                         }
-                        // Dispatch IPI if this was an ICR write.
-                        if !matches!(ipi_action, IpiAction::None) {
-                            dispatch_ipi(
-                                ipi_action,
-                                &mut dm,
-                                ap_states,
-                                cancellers,
-                                diag_log,
-                                stats.start_time,
-                            );
+                        LapicWriteFastResult::NotHandled => {
+                            // Slow path: needs DeviceManager for EOI/SVR or non-LAPIC devices.
+                            let mut dm = devices.lock().unwrap();
+                            if !blk_workers_started && !sync_block {
+                                dm.start_blk_workers();
+                                blk_workers_started = true;
+                                log::info!(
+                                    target: "whpx::diag",
+                                    "Block workers started at exit={} mmio={} elapsed={:.1}ms",
+                                    stats.exit_count,
+                                    stats.mmio_count,
+                                    stats.start_time.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
+                            if !matches!(ipi_action, IpiAction::None) {
+                                dispatch_ipi(
+                                    ipi_action,
+                                    &mut dm,
+                                    ap_states,
+                                    cancellers,
+                                    diag_log,
+                                    stats.start_time,
+                                );
+                            }
+                            drop(dm);
                         }
-                        drop(dm);
                     }
                     if let Err(e) = vcpu.skip_instruction() {
                         log::error!("BSP skip_instruction error: {:?}", e);
@@ -791,11 +934,28 @@ mod imp {
                         return 0;
                     }
 
-                    // Poll devices before sleeping.
+                    // Pull remote interrupts + tick timer before sleeping.
+                    {
+                        let mut lapic = my_lapic.lock().unwrap();
+                        lapic.pull_irr(my_shared);
+                        if let Some(vector) = lapic.tick_timer(Instant::now()) {
+                            lapic.accept_interrupt(vector);
+                        }
+                        if lapic.get_highest_injectable().is_some() {
+                            drop(lapic);
+                            if let Err(e) = try_inject_interrupt_fast(vcpu, my_lapic, &mut stats) {
+                                log::error!("BSP HLT inject error: {:?}", e);
+                            }
+                            stats.halt_with_irq += 1;
+                            stats.halt_count = 0;
+                            continue;
+                        }
+                    }
+                    // Also poll PIT + devices (PIC mode fallback + block I/O).
                     {
                         let mut dm = devices.lock().unwrap();
                         dm.tick_and_poll(0, guest_mem);
-                        if dm.irq_chip.has_pending(0) {
+                        if !dm.irq_chip.apic_mode() && dm.irq_chip.has_pending(0) {
                             let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
                             if !already_pending {
                                 if let Some(vector) = dm.irq_chip.acknowledge(0) {
@@ -846,18 +1006,17 @@ mod imp {
                     for i in 0..HLT_SPIN_ITERS {
                         std::thread::yield_now();
                         if i % 10 == 9 {
-                            // Fast check: per-LAPIC only (no DeviceManager lock).
-                            if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
+                            // Fast check: pull_irr + per-LAPIC (no DeviceManager lock).
+                            let mut lapic = my_lapic.lock().unwrap();
+                            lapic.pull_irr(my_shared);
+                            if lapic.get_highest_injectable().is_some() {
                                 woke_by_irq = true;
                                 break;
                             }
+                            drop(lapic);
                             // Slow check: tick PIT + poll devices.
                             let mut dm = devices.lock().unwrap();
                             dm.tick_and_poll(0, guest_mem);
-                            if dm.irq_chip.has_pending(0) {
-                                woke_by_irq = true;
-                                break;
-                            }
                         }
                     }
                     if !woke_by_irq {
@@ -947,6 +1106,7 @@ mod imp {
                         0,
                         num_vcpus,
                         rax as u32,
+                        rcx,
                         default_rax,
                         default_rbx,
                         default_rcx,
@@ -1013,6 +1173,8 @@ mod imp {
         _ctx_id: u32,
         diag_log: &Arc<Mutex<Option<std::fs::File>>>,
         my_lapic: &Arc<Mutex<LocalApic>>,
+        my_shared: &Arc<SharedApicState>,
+        all_shared: &[Arc<SharedApicState>],
     ) {
         macro_rules! diag {
             ($($arg:tt)*) => {
@@ -1092,13 +1254,17 @@ mod imp {
                 return;
             }
 
-            // Try to inject pending interrupt (no timer ticking for APs).
-            // Fast path: check per-LAPIC first — usually no pending → skip DeviceManager.
-            if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
-                let mut dm = devices.lock().unwrap();
-                if let Err(e) = try_inject_interrupt(vcpu, ap_id, &mut dm, &mut stats) {
-                    log::error!("AP{}: interrupt injection error: {:?}", ap_id, e);
+            // Pull remote interrupts (lock-free) + tick own LAPIC timer.
+            {
+                let mut lapic = my_lapic.lock().unwrap();
+                lapic.pull_irr(my_shared);
+                if let Some(vector) = lapic.tick_timer(Instant::now()) {
+                    lapic.accept_interrupt(vector);
                 }
+            }
+            // Lock-free interrupt injection (APIC mode, per-vCPU only).
+            if let Err(e) = try_inject_interrupt_fast(vcpu, my_lapic, &mut stats) {
+                log::error!("AP{}: lock-free inject error: {:?}", ap_id, e);
             }
 
             let exit = match vcpu.run() {
@@ -1164,6 +1330,22 @@ mod imp {
                 VcpuExit::MmioRead { address, size } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
+                    // Detect tight MMIO read loops (same address read 10K+ times).
+                    if address == stats.last_mmio_read_addr {
+                        stats.consecutive_mmio_reads += 1;
+                        if stats.consecutive_mmio_reads == 10_000 {
+                            log::warn!(
+                                "AP{}: tight MMIO read loop: addr={:#X} count={} exit={}",
+                                ap_id, address, stats.consecutive_mmio_reads, stats.exit_count
+                            );
+                            if let Ok(regs) = vcpu.get_registers() {
+                                log::warn!("AP{}: RIP={:#X} at tight MMIO loop", ap_id, regs.rip);
+                            }
+                        }
+                    } else {
+                        stats.last_mmio_read_addr = address;
+                        stats.consecutive_mmio_reads = 1;
+                    }
                     // Fast path: LAPIC reads bypass DeviceManager lock.
                     let data = if let Some(val) = handle_lapic_mmio_read_fast(my_lapic, address) {
                         val
@@ -1182,24 +1364,52 @@ mod imp {
                 } => {
                     stats.halt_count = 0;
                     stats.mmio_count += 1;
-                    // Fast path: simple LAPIC writes bypass DeviceManager lock.
-                    if handle_lapic_mmio_write_fast(my_lapic, address, data).is_none() {
-                        // Slow path: needs DeviceManager for EOI/SVR/ICR or non-LAPIC devices.
-                        let mut dm = devices.lock().unwrap();
-                        let ipi_action =
-                            dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
-                        if !matches!(ipi_action, IpiAction::None) {
-                            // APs can send IPIs too (e.g., IPI to BSP for TLB shootdown).
-                            dispatch_ipi(
-                                ipi_action,
-                                &mut dm,
-                                &[],
-                                cancellers,
-                                diag_log,
-                                stats.start_time,
-                            );
+                    match handle_lapic_mmio_write_fast(my_lapic, address, data) {
+                        LapicWriteFastResult::Handled => {
+                            // Fast path: handled via per-vCPU lock only.
                         }
-                        drop(dm);
+                        LapicWriteFastResult::IpiAction(action) => {
+                            // ICR fast path: dispatch IPI inline (lock-free).
+                            match action {
+                                IpiAction::SendInterrupt { target_apic_id, vector } => {
+                                    let idx = target_apic_id as usize;
+                                    if idx < all_shared.len() {
+                                        all_shared[idx].request_interrupt(vector);
+                                        if idx < cancellers.len() {
+                                            let _ = cancellers[idx].cancel();
+                                        }
+                                    }
+                                }
+                                IpiAction::SendInit { .. } | IpiAction::SendSipi { .. } => {
+                                    dispatch_ipi(
+                                        action,
+                                        &mut devices.lock().unwrap(),
+                                        &[],
+                                        cancellers,
+                                        diag_log,
+                                        stats.start_time,
+                                    );
+                                }
+                                IpiAction::None => {}
+                            }
+                        }
+                        LapicWriteFastResult::NotHandled => {
+                            // Slow path: needs DeviceManager for EOI/SVR or non-LAPIC devices.
+                            let mut dm = devices.lock().unwrap();
+                            let ipi_action =
+                                dm.handle_mmio_write(ap_id, address, size, data, guest_mem);
+                            if !matches!(ipi_action, IpiAction::None) {
+                                dispatch_ipi(
+                                    ipi_action,
+                                    &mut dm,
+                                    &[],
+                                    cancellers,
+                                    diag_log,
+                                    stats.start_time,
+                                );
+                            }
+                            drop(dm);
+                        }
                     }
                     let _ = vcpu.skip_instruction();
                 }
@@ -1214,23 +1424,22 @@ mod imp {
                         return;
                     }
 
-                    // Check for pending interrupts (fast path: per-LAPIC only).
-                    if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
-                        let mut dm = devices.lock().unwrap();
-                        if dm.irq_chip.has_pending(ap_id) {
-                            let already_pending = vcpu.has_pending_interruption().unwrap_or(false);
-                            if !already_pending {
-                                if let Some(vector) = dm.irq_chip.acknowledge(ap_id) {
-                                    let _ = vcpu.inject_interrupt(vector);
-                                    dm.irq_chip.notify_injected(ap_id, vector);
-                                    stats.window_requested = false;
-                                    stats.inject_count += 1;
-                                }
-                            }
-                            stats.halt_with_irq += 1;
-                            stats.halt_count = 0;
-                            continue;
+                    // Pull remote interrupts + tick timer before checking.
+                    {
+                        let mut lapic = my_lapic.lock().unwrap();
+                        lapic.pull_irr(my_shared);
+                        if let Some(vector) = lapic.tick_timer(Instant::now()) {
+                            lapic.accept_interrupt(vector);
                         }
+                    }
+                    // Lock-free check: inject from per-vCPU LAPIC only.
+                    if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
+                        if let Err(e) = try_inject_interrupt_fast(vcpu, my_lapic, &mut stats) {
+                            log::error!("AP{}: HLT inject error: {:?}", ap_id, e);
+                        }
+                        stats.halt_with_irq += 1;
+                        stats.halt_count = 0;
+                        continue;
                     }
 
                     stats.halt_count += 1;
@@ -1248,12 +1457,14 @@ mod imp {
 
                     // Tiered sleep: spin-yield phase to catch imminent interrupts,
                     // then short sleep if no interrupt arrived.
-                    // Fast path: per-LAPIC only (no DeviceManager lock).
+                    // Fast path: pull_irr + per-LAPIC only (no DeviceManager lock).
                     let mut woke_by_irq = false;
                     for i in 0..HLT_SPIN_ITERS {
                         std::thread::yield_now();
                         if i % 10 == 9 {
-                            if my_lapic.lock().unwrap().get_highest_injectable().is_some() {
+                            let mut lapic = my_lapic.lock().unwrap();
+                            lapic.pull_irr(my_shared);
+                            if lapic.get_highest_injectable().is_some() {
                                 woke_by_irq = true;
                                 break;
                             }
@@ -1318,6 +1529,7 @@ mod imp {
                         ap_id,
                         num_vcpus,
                         rax as u32,
+                        rcx,
                         default_rax,
                         default_rbx,
                         default_rcx,
@@ -1492,10 +1704,15 @@ pub fn stop(_ctx_id: u32) -> super::error::Result<()> {
 ///
 /// Injects CPU topology info into leaf 1 and masks Hyper-V leaves.
 /// This is a pure function (no side effects) for testability.
+///
+/// `input_rcx` is the guest's original ECX value (sub-leaf number for leaves
+/// 0xB/0x1F/4). This is distinct from `default_rcx` which is WHPX's computed
+/// default OUTPUT for ECX.
 fn handle_cpuid(
     vcpu_id: u8,
     num_vcpus: u8,
     leaf: u32,
+    input_rcx: u64,
     default_rax: u64,
     default_rbx: u64,
     default_rcx: u64,
@@ -1518,6 +1735,76 @@ fn handle_cpuid(
                 default_rcx & !(1u64 << 31), // clear hypervisor present
                 default_rdx,
             )
+        }
+        // Leaf 0xB / 0x1F: Extended Topology Enumeration.
+        //
+        // WHPX passes through the HOST topology (e.g., 4C/8T on i5-1135G7),
+        // which confuses the guest kernel when num_vcpus differs from the host.
+        // The kernel's parse_topology_leaf() loops over sub-leaves calling
+        // cpuid_subleaf() until type==0 (INVALID). If the host topology reports
+        // more logical processors than the guest has, the kernel hangs in
+        // topology parsing (BSP stuck in parse_topology_leaf at 4+ vCPUs).
+        //
+        // We override to present a flat topology: 1 thread per core, num_vcpus
+        // cores, no HT. This matches what the MADT advertises.
+        0xB | 0x1F => {
+            let subleaf = input_rcx & 0xFF; // guest's ECX input = sub-leaf number
+            match subleaf {
+                // Sub-leaf 0: SMT level — 1 thread per core (no hyperthreading).
+                0 => {
+                    let eax = 0u64; // shift = 0 (1 thread per core)
+                    let ebx = 1u64; // 1 logical processor at this level
+                    let ecx = (1u64 << 8) | subleaf; // type=1 (SMT), level=0
+                    let edx = vcpu_id as u64; // x2APIC ID
+                    (eax, ebx, ecx, edx)
+                }
+                // Sub-leaf 1: Core level — num_vcpus cores total.
+                1 => {
+                    // shift = ceil(log2(num_vcpus)): bits to shift right to get
+                    // package-level ID from x2APIC ID.
+                    let shift = if num_vcpus <= 1 {
+                        0u64
+                    } else {
+                        (num_vcpus as u64).next_power_of_two().trailing_zeros() as u64
+                    };
+                    let eax = shift;
+                    let ebx = num_vcpus as u64; // total logical processors
+                    let ecx = (2u64 << 8) | subleaf; // type=2 (Core), level=1
+                    let edx = vcpu_id as u64; // x2APIC ID
+                    (eax, ebx, ecx, edx)
+                }
+                // Sub-leaf 2+: invalid — terminates the kernel's enumeration loop.
+                _ => {
+                    let ecx = subleaf; // type=0 (INVALID), level=subleaf
+                    (0, 0, ecx, vcpu_id as u64)
+                }
+            }
+        }
+        // Leaf 4: Deterministic Cache Parameters.
+        //
+        // Host reports max_cores_in_package (EAX[31:26]) and max_threads_sharing
+        // (EAX[25:14]) based on host topology. Override to match guest vCPU count
+        // so cache topology is consistent with leaf 0xB.
+        4 => {
+            let cache_type = default_rax & 0x1F;
+            if cache_type == 0 {
+                // No more cache levels.
+                (default_rax, default_rbx, default_rcx, default_rdx)
+            } else {
+                let mut eax = default_rax;
+                // EAX[25:14] = max threads sharing this cache - 1.
+                // For L1/L2: 0 (not shared). For L3: num_vcpus - 1 (shared).
+                let max_sharing = if (default_rax & 0x1F) == 3 {
+                    // Unified cache (L3): shared by all vCPUs.
+                    (num_vcpus as u64).saturating_sub(1)
+                } else {
+                    0 // L1/L2: per-core, not shared.
+                };
+                eax = (eax & !(0xFFF << 14)) | (max_sharing << 14);
+                // EAX[31:26] = max cores in package - 1.
+                eax = (eax & !(0x3F << 26)) | (((num_vcpus as u64).saturating_sub(1)) << 26);
+                (eax, default_rbx, default_rcx, default_rdx)
+            }
         }
         // Hyper-V CPUID range: return zeros.
         0x40000000..=0x400000FF => (0, 0, 0, 0),
@@ -1685,8 +1972,9 @@ mod tests {
     #[test]
     fn test_cpuid_leaf1_topology_bsp() {
         // BSP (vcpu 0) with 2 vCPUs.
+        // input_rcx=0 (leaf 1 doesn't use sub-leaves).
         let (rax, rbx, rcx, rdx) =
-            super::handle_cpuid(0, 2, 1, 0x1234, 0x0000_0000_0000_5678, 0x8000_0001, 0xABCD);
+            super::handle_cpuid(0, 2, 1, 0, 0x1234, 0x0000_0000_0000_5678, 0x8000_0001, 0xABCD);
         // EBX[23:16] = num_vcpus = 2, EBX[31:24] = vcpu_id = 0
         assert_eq!(rbx & 0x00FF_0000, 0x0002_0000, "EBX[23:16] should be 2");
         assert_eq!(
@@ -1706,7 +1994,7 @@ mod tests {
     #[test]
     fn test_cpuid_leaf1_topology_ap() {
         // AP (vcpu 3) with 4 vCPUs.
-        let (_, rbx, _, _) = super::handle_cpuid(3, 4, 1, 0, 0, 0, 0);
+        let (_, rbx, _, _) = super::handle_cpuid(3, 4, 1, 0, 0, 0, 0, 0);
         assert_eq!((rbx >> 16) & 0xFF, 4, "EBX[23:16] should be num_vcpus=4");
         assert_eq!((rbx >> 24) & 0xFF, 3, "EBX[31:24] should be vcpu_id=3");
     }
@@ -1716,7 +2004,7 @@ mod tests {
         // Hyper-V CPUID range should return all zeros.
         for leaf in [0x40000000u32, 0x40000001, 0x400000FF] {
             let (rax, rbx, rcx, rdx) =
-                super::handle_cpuid(0, 1, leaf, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D);
+                super::handle_cpuid(0, 1, leaf, 0, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D);
             assert_eq!(
                 (rax, rbx, rcx, rdx),
                 (0, 0, 0, 0),
@@ -1729,11 +2017,102 @@ mod tests {
     #[test]
     fn test_cpuid_passthrough_other_leaves() {
         // Non-special leaves should pass through defaults unchanged.
-        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 2, 0, 0x1111, 0x2222, 0x3333, 0x4444);
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 2, 0, 0, 0x1111, 0x2222, 0x3333, 0x4444);
         assert_eq!((rax, rbx, rcx, rdx), (0x1111, 0x2222, 0x3333, 0x4444));
 
-        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 2, 7, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 2, 7, 0, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
         assert_eq!((rax, rbx, rcx, rdx), (0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD));
+    }
+
+    // --- CPUID leaf 0xB tests ---
+
+    #[test]
+    fn test_cpuid_leaf_0xb_smt_level() {
+        // Sub-leaf 0 = SMT: shift=0, np=1, type=1, edx=vcpu_id.
+        // input_rcx=0 (sub-leaf 0).
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 4, 0xB, 0, 0, 0, 0, 0);
+        assert_eq!(rax & 0x1F, 0, "SMT shift should be 0 (no HT)");
+        assert_eq!(rbx & 0xFFFF, 1, "SMT should report 1 logical proc");
+        assert_eq!((rcx >> 8) & 0xFF, 1, "type should be 1 (SMT)");
+        assert_eq!(rdx, 0, "x2APIC ID should be vcpu_id=0");
+
+        // Same for vcpu 3.
+        let (_, _, _, rdx) = super::handle_cpuid(3, 4, 0xB, 0, 0, 0, 0, 0);
+        assert_eq!(rdx, 3, "x2APIC ID should be vcpu_id=3");
+    }
+
+    #[test]
+    fn test_cpuid_leaf_0xb_core_level_4vcpus() {
+        // Sub-leaf 1 = Core: shift=ceil(log2(4))=2, np=4, type=2.
+        // input_rcx=1 (sub-leaf 1).
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 4, 0xB, 1, 0, 0, 0, 0);
+        assert_eq!(rax & 0x1F, 2, "Core shift should be 2 for 4 vCPUs");
+        assert_eq!(rbx & 0xFFFF, 4, "Core should report 4 logical procs");
+        assert_eq!((rcx >> 8) & 0xFF, 2, "type should be 2 (Core)");
+        assert_eq!(rdx, 0, "x2APIC ID should be vcpu_id=0");
+    }
+
+    #[test]
+    fn test_cpuid_leaf_0xb_core_level_2vcpus() {
+        let (rax, rbx, _, _) = super::handle_cpuid(1, 2, 0xB, 1, 0, 0, 0, 0);
+        assert_eq!(rax & 0x1F, 1, "Core shift should be 1 for 2 vCPUs");
+        assert_eq!(rbx & 0xFFFF, 2, "Core should report 2 logical procs");
+    }
+
+    #[test]
+    fn test_cpuid_leaf_0xb_core_level_1vcpu() {
+        let (rax, rbx, _, _) = super::handle_cpuid(0, 1, 0xB, 1, 0, 0, 0, 0);
+        assert_eq!(rax & 0x1F, 0, "Core shift should be 0 for 1 vCPU");
+        assert_eq!(rbx & 0xFFFF, 1, "Core should report 1 logical proc");
+    }
+
+    #[test]
+    fn test_cpuid_leaf_0xb_invalid_subleaf() {
+        // Sub-leaf 2+ should return type=0 (INVALID) to terminate kernel loop.
+        let (rax, rbx, rcx, _) = super::handle_cpuid(0, 4, 0xB, 2, 0, 0, 0, 0);
+        assert_eq!(rax, 0);
+        assert_eq!(rbx, 0);
+        assert_eq!((rcx >> 8) & 0xFF, 0, "type should be 0 (INVALID)");
+    }
+
+    #[test]
+    fn test_cpuid_leaf_0x1f_same_as_0xb() {
+        // Leaf 0x1F should produce identical results to 0xB.
+        for subleaf in 0..3u64 {
+            let r_b = super::handle_cpuid(0, 4, 0xB, subleaf, 0, 0, 0, 0);
+            let r_1f = super::handle_cpuid(0, 4, 0x1F, subleaf, 0, 0, 0, 0);
+            assert_eq!(r_b, r_1f, "Leaf 0xB and 0x1F should match for sub-leaf {}", subleaf);
+        }
+    }
+
+    #[test]
+    fn test_cpuid_leaf4_cache_topology() {
+        // Leaf 4 with cache_type != 0 should override max_cores and max_threads.
+        // Simulate L1 data cache (type=1) with host values.
+        let host_eax: u64 = 1 // cache_type = 1 (data)
+            | (7 << 14) // max_threads_sharing = 8 (host value)
+            | (7 << 26); // max_cores = 8 (host value)
+        let (rax, _, _, _) = super::handle_cpuid(0, 4, 4, 0, host_eax, 0, 0, 0);
+        // For L1 (non-unified): max_threads_sharing should be 0 (per-core).
+        assert_eq!((rax >> 14) & 0xFFF, 0, "L1 max_threads_sharing should be 0");
+        // max_cores should be num_vcpus - 1 = 3.
+        assert_eq!((rax >> 26) & 0x3F, 3, "max_cores should be num_vcpus-1=3");
+
+        // Simulate L3 unified cache (type=3).
+        let host_eax: u64 = 3 // cache_type = 3 (unified)
+            | (15 << 14) // max_threads_sharing = 16 (host)
+            | (7 << 26); // max_cores = 8 (host)
+        let (rax, _, _, _) = super::handle_cpuid(0, 4, 4, 2, host_eax, 0, 0, 0);
+        // L3: max_threads_sharing should be num_vcpus - 1 = 3.
+        assert_eq!((rax >> 14) & 0xFFF, 3, "L3 max_threads_sharing should be 3");
+        assert_eq!((rax >> 26) & 0x3F, 3, "max_cores should be num_vcpus-1=3");
+    }
+
+    #[test]
+    fn test_cpuid_leaf4_no_cache_passthrough() {
+        // cache_type = 0 means no more caches — pass through unchanged.
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(0, 4, 4, 0, 0, 0xBEEF, 0xCAFE, 0xDEAD);
+        assert_eq!((rax, rbx, rcx, rdx), (0, 0xBEEF, 0xCAFE, 0xDEAD));
     }
 
     // --- handle_msr_read tests ---
@@ -1762,4 +2141,5 @@ mod tests {
         assert_eq!(super::handle_msr_read(0, 0x174), 0);
         assert_eq!(super::handle_msr_read(1, 0xC000_0080), 0);
     }
+
 }

@@ -19,7 +19,44 @@
 //! - 0x390: Timer Current Count
 //! - 0x3E0: Timer Divide Configuration
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
+
+/// Shared APIC state for lock-free cross-vCPU interrupt delivery.
+///
+/// Other vCPUs atomically OR bits into `new_irr`. The owning vCPU
+/// periodically calls `pull_irr()` to merge into its local IRR.
+/// Inspired by OpenVMM's `virt_support_apic::SharedState`.
+pub struct SharedApicState {
+    /// Remote interrupt requests (256 bits = 8 x AtomicU32).
+    /// Source vCPUs atomic-OR the vector bit here.
+    new_irr: [AtomicU32; 8],
+}
+
+impl SharedApicState {
+    /// Create a new shared state with no pending interrupts.
+    pub fn new() -> Self {
+        Self {
+            new_irr: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    /// Atomically request an interrupt vector on this vCPU.
+    ///
+    /// Returns `true` if the bit was newly set (caller should wake target vCPU).
+    pub fn request_interrupt(&self, vector: u8) -> bool {
+        let (bank, mask) = bank_mask(vector);
+        let prev = self.new_irr[bank].fetch_or(mask, Ordering::Release);
+        prev & mask == 0
+    }
+}
+
+/// Compute the bank index and bit mask for a vector (0-255).
+fn bank_mask(vector: u8) -> (usize, u32) {
+    let bank = (vector / 32) as usize;
+    let bit = vector % 32;
+    (bank, 1u32 << bit)
+}
 
 /// Action resulting from an ICR write (Inter-Processor Interrupt).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +186,19 @@ impl LocalApic {
     /// Whether the LAPIC is software-enabled (SVR bit 8).
     pub fn is_enabled(&self) -> bool {
         self.svr & SVR_APIC_ENABLE != 0
+    }
+
+    /// Pull remote interrupt requests from the shared state into the local IRR.
+    ///
+    /// Atomically swaps each bank to 0 and ORs the bits into the local IRR.
+    /// Called at the top of each vCPU loop iteration (lock-free fast path).
+    pub fn pull_irr(&mut self, shared: &SharedApicState) {
+        for i in 0..8 {
+            let bits = shared.new_irr[i].swap(0, Ordering::Acquire);
+            if bits != 0 {
+                self.irr[i] |= bits;
+            }
+        }
     }
 
     /// Accept an interrupt vector into the IRR.
@@ -338,15 +388,6 @@ impl LocalApic {
     }
 
     /// Parse the ICR low/high registers to produce an IPI action.
-    ///
-    /// ICR Low bits:
-    /// - [7:0]   Vector
-    /// - [10:8]  Delivery mode: 000=Fixed, 101=INIT, 110=Startup (SIPI)
-    /// - [11]    Destination mode (ignored, always physical)
-    /// - [17:16] Destination shorthand (00=field, others unsupported)
-    ///
-    /// ICR High bits:
-    /// - [31:24] Destination APIC ID
     fn parse_icr(&self) -> IpiAction {
         let vector = (self.icr_low & 0xFF) as u8;
         let delivery_mode = (self.icr_low >> 8) & 0x7;
@@ -871,5 +912,79 @@ mod tests {
         let result = lapic.write_mmio(0x0F0, 0x1FF);
         assert_eq!(result.ipi_action, IpiAction::None);
         assert_eq!(result.eoi_vector, None);
+    }
+
+
+    // ---- SharedApicState tests ----
+
+    #[test]
+    fn test_shared_request_interrupt() {
+        let shared = SharedApicState::new();
+        // Vector 32 → bank 1, bit 0.
+        assert!(shared.request_interrupt(32)); // first set → true
+        assert!(!shared.request_interrupt(32)); // already set → false
+        // Vector 33 → bank 1, bit 1.
+        assert!(shared.request_interrupt(33)); // different bit → true
+    }
+
+    #[test]
+    fn test_shared_pull_irr() {
+        let shared = SharedApicState::new();
+        let mut lapic = LocalApic::new();
+
+        shared.request_interrupt(48); // bank 1, bit 16
+        shared.request_interrupt(100); // bank 3, bit 4
+
+        lapic.pull_irr(&shared);
+
+        // After pull, shared should be cleared.
+        assert!(shared.request_interrupt(48)); // re-setting returns true (was cleared)
+
+        // LAPIC should now have vector 100 injectable (highest).
+        // Enable LAPIC first (SVR bit 8).
+        lapic.write_mmio(0x0F0, 0x1FF);
+        assert_eq!(lapic.get_highest_injectable(), Some(100));
+    }
+
+    #[test]
+    fn test_shared_concurrent_ipi() {
+        use std::sync::Arc;
+
+        let shared = Arc::new(SharedApicState::new());
+        let num_threads = 8;
+        // Each thread sets a distinct vector: 32, 33, ..., 39.
+        std::thread::scope(|s| {
+            for t in 0..num_threads {
+                let sh = shared.clone();
+                let vector = 32 + t as u8;
+                s.spawn(move || {
+                    assert!(sh.request_interrupt(vector));
+                });
+            }
+        });
+
+        // Pull all into a LAPIC and verify all vectors present.
+        let mut lapic = LocalApic::new();
+        lapic.pull_irr(&shared);
+        lapic.write_mmio(0x0F0, 0x1FF); // enable
+        // Highest should be 39.
+        assert_eq!(lapic.get_highest_injectable(), Some(39));
+    }
+
+    #[test]
+    fn test_pull_irr_priority() {
+        let shared = SharedApicState::new();
+        let mut lapic = LocalApic::new();
+
+        shared.request_interrupt(64); // lower priority
+        shared.request_interrupt(200); // higher priority
+
+        lapic.pull_irr(&shared);
+        lapic.write_mmio(0x0F0, 0x1FF); // enable
+        assert_eq!(lapic.get_highest_injectable(), Some(200));
+
+        // Acknowledge 200, next should be 64.
+        lapic.start_of_interrupt(200);
+        assert_eq!(lapic.get_highest_injectable(), Some(64));
     }
 }

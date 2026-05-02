@@ -15,7 +15,7 @@ use super::super::context::VmContext;
 use super::super::error::{Result, WkrunError};
 use super::super::vcpu::IoHandler;
 use super::irq_chip::IrqChip;
-use super::lapic::{IpiAction, LocalApic};
+use super::lapic::{IpiAction, LocalApic, SharedApicState};
 use super::pit::Pit;
 use super::serial::{Serial, COM1_BASE};
 use super::virtio::balloon::VirtioBalloon;
@@ -684,16 +684,8 @@ impl DeviceManager {
             }
         }
 
-        // Tick LAPIC timers for ALL vCPUs (only fires in APIC mode).
-        // Each AP's LAPIC timer must advance so the kernel scheduler can preempt
-        // tasks on all CPUs. Without this, AP LAPIC timer calibration hangs.
-        // Throttle: LAPIC timers fire at ~100Hz (10ms period), so checking more
-        // than every 500µs wastes CPU. PIT timer (IRQ 0) still fires every tick.
-        if elapsed_ns > 500_000 {
-            for i in 0..self.irq_chip.num_vcpus() {
-                self.irq_chip.tick_timer(i, now);
-            }
-        }
+        // LAPIC timers are now ticked per-vCPU in the runner loop (lock-free).
+        // This eliminates cross-vCPU contention on tick_and_poll().
         // Suppress unused variable — vcpu_id was the original single-vCPU target.
         let _ = vcpu_id;
 
@@ -791,6 +783,13 @@ impl DeviceManager {
     pub fn get_lapic_refs(&self) -> Vec<Arc<Mutex<LocalApic>>> {
         (0..self.irq_chip.num_vcpus())
             .map(|i| self.irq_chip.get_lapic_ref(i as u32))
+            .collect()
+    }
+
+    /// Get per-vCPU shared APIC states for lock-free cross-vCPU interrupt delivery.
+    pub fn get_shared_states(&self) -> Vec<Arc<SharedApicState>> {
+        (0..self.irq_chip.num_vcpus())
+            .map(|i| self.irq_chip.get_shared_state(i as u32))
             .collect()
     }
 }
