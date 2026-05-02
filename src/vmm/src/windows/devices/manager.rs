@@ -83,7 +83,6 @@ const PM1A_EVT_BLK: u16 = 0x600;
 const PM1A_CNT_BLK: u16 = 0x604;
 
 /// Default vsock listen ports (BoxLite: 2695=gRPC, 2696=ready signal).
-const DEFAULT_VSOCK_PORTS: &[u32] = &[2695, 2696];
 
 /// Convert a value to BCD (Binary-Coded Decimal).
 /// E.g. 26 → 0x26, 59 → 0x59.
@@ -293,40 +292,14 @@ impl DeviceManager {
 
         // Virtio-vsock (slot 1) — always present.
         let mut vsock_backend = VirtioVsock::new(GUEST_CID);
-        // Configure ports: listen=true creates TCP listener (host→guest),
+        // Configure ports: listen=true creates Unix socket listener (host→guest),
         // listen=false registers outbound target (guest→host).
-        if ctx.vsock_ports.is_empty() {
-            for &port in DEFAULT_VSOCK_PORTS {
-                let _ = vsock_backend.listen(port);
-            }
-        } else {
-            for vp in &ctx.vsock_ports {
-                // Resolve the host TCP address from either:
-                // 1. Explicit host_tcp_port (set by boot_kernel CLI)
-                // 2. host_path as "host:port" string (set by krun_add_vsock_port2 API)
-                // 3. Fallback: vsock port number as TCP port
-                let host_addr = if let Some(tcp_port) = vp.host_tcp_port {
-                    format!("127.0.0.1:{}", tcp_port)
-                } else {
-                    let path_str = vp.host_path.to_string_lossy();
-                    if path_str.contains(':') {
-                        // host_path is "host:port" format (e.g., "127.0.0.1:55008")
-                        path_str.to_string()
-                    } else {
-                        format!("127.0.0.1:{}", vp.port)
-                    }
-                };
-                if vp.listen {
-                    // Parse port from host_addr for listen_on
-                    let port = host_addr
-                        .rsplit(':')
-                        .next()
-                        .and_then(|s| s.parse::<u16>().ok())
-                        .unwrap_or(vp.port as u16);
-                    let _ = vsock_backend.listen_on(vp.port, port);
-                } else {
-                    vsock_backend.connect_to(vp.port, host_addr);
-                }
+        for vp in &ctx.vsock_ports {
+            let socket_path = vp.host_path.to_string_lossy();
+            if vp.listen {
+                let _ = vsock_backend.listen_on(vp.port, &socket_path);
+            } else {
+                vsock_backend.connect_to(vp.port, socket_path.to_string());
             }
         }
         let virtio_vsock = VirtioMmioDevice::new(vsock_backend);
@@ -719,8 +692,7 @@ impl DeviceManager {
 
     /// Connect to the userspace networking proxy and return a transport.
     ///
-    /// On Unix: connects via Unix stream socket.
-    /// On Windows: parses "host:port" and connects via TCP.
+    /// Connects via Unix stream socket on all platforms.
     fn connect_net_transport(
         socket_path: &Path,
     ) -> Result<Option<Box<dyn super::virtio::net::NetTransport>>> {
@@ -738,13 +710,16 @@ impl DeviceManager {
             })?;
             Ok(Some(Box::new(transport)))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let addr = socket_path.to_string_lossy();
-            let stream = std::net::TcpStream::connect(addr.as_ref()).map_err(|e| {
-                WkrunError::Device(format!("failed to connect to net proxy '{}': {}", addr, e))
+            let stream = uds_windows::UnixStream::connect(socket_path).map_err(|e| {
+                WkrunError::Device(format!(
+                    "failed to connect to net socket '{}': {}",
+                    socket_path.display(),
+                    e
+                ))
             })?;
-            let transport = super::virtio::net::TcpTransport::new(stream).map_err(|e| {
+            let transport = super::virtio::net::UdsTransport::new(stream).map_err(|e| {
                 WkrunError::Device(format!("failed to configure net socket: {}", e))
             })?;
             Ok(Some(Box::new(transport)))

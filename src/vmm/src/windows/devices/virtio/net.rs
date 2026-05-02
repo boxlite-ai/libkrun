@@ -44,7 +44,7 @@ const VIRTIO_NET_S_LINK_UP: u16 = 1;
 
 /// Transport trait for pluggable networking backends.
 ///
-/// Both Unix socket and TCP transports use the passt/gvproxy wire
+/// Unix socket transports use the passt/gvproxy wire
 /// protocol: each frame is `[4-byte big-endian length][frame bytes]`.
 pub trait NetTransport: Send {
     /// Try to receive a complete Ethernet frame. Returns `None` if no
@@ -106,24 +106,27 @@ impl NetTransport for UnixStreamTransport {
     }
 }
 
-/// TCP transport (cross-platform, used on Windows).
-pub struct TcpTransport {
-    stream: std::net::TcpStream,
+/// Unix domain socket transport (Windows, via uds_windows crate).
+#[cfg(windows)]
+pub struct UdsTransport {
+    stream: uds_windows::UnixStream,
     state: RecvState,
 }
 
-impl TcpTransport {
-    /// Wrap a non-blocking TCP stream.
-    pub fn new(stream: std::net::TcpStream) -> io::Result<Self> {
+#[cfg(windows)]
+impl UdsTransport {
+    /// Wrap a non-blocking Unix domain socket stream.
+    pub fn new(stream: uds_windows::UnixStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
-        Ok(TcpTransport {
+        Ok(UdsTransport {
             stream,
             state: RecvState::default(),
         })
     }
 }
 
-impl NetTransport for TcpTransport {
+#[cfg(windows)]
+impl NetTransport for UdsTransport {
     fn recv_frame(&mut self) -> Option<Vec<u8>> {
         recv_frame_from(&mut self.stream, &mut self.state)
     }

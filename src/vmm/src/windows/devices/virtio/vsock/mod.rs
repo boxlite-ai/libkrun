@@ -1,7 +1,7 @@
 //! Virtio-vsock device backend (virtio spec v1.2 Section 5.10).
 //!
-//! Provides a socket transport between guest (AF_VSOCK) and host (TCP).
-//! The host side uses non-blocking TCP listeners on localhost for
+//! Provides a socket transport between guest (AF_VSOCK) and host (Unix sockets).
+//! The host side uses non-blocking Unix domain socket listeners for
 //! cross-platform compatibility (Windows + macOS + Linux).
 //!
 //! Queue layout:
@@ -14,7 +14,11 @@ pub mod packet;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 use super::mmio::VirtioDeviceBackend;
 use super::queue::{GuestMemoryAccessor, Virtqueue};
@@ -44,22 +48,22 @@ type ConnKey = (u32, u32);
 /// Starting ephemeral port for host-initiated vsock connections.
 const EPHEMERAL_PORT_START: u32 = 49152;
 
-/// Virtio-vsock device with TCP host-side bridge.
+/// Virtio-vsock device with Unix socket host-side bridge.
 pub struct VirtioVsock {
     /// Guest CID (typically 3 for the first guest).
     guest_cid: u64,
     /// Active connections keyed by (guest_port, host_port).
     connections: HashMap<ConnKey, VsockConnection>,
-    /// TCP listeners on the host side, keyed by vsock port.
-    /// Used for host-initiated connections (host TCP → guest vsock).
-    listeners: HashMap<u32, TcpListener>,
-    /// Outbound TCP targets keyed by vsock port.
-    /// Used for guest-initiated connections (guest vsock → host TCP).
+    /// Unix socket listeners on the host side, keyed by vsock port.
+    /// Used for host-initiated connections (host UDS → guest vsock).
+    listeners: HashMap<u32, UnixListener>,
+    /// Outbound Unix socket targets keyed by vsock port.
+    /// Used for guest-initiated connections (guest vsock → host UDS).
     /// When the guest connects to a port in this map, the device makes
-    /// an outbound TCP connection to the specified address.
+    /// an outbound Unix socket connection to the specified path.
     connect_targets: HashMap<u32, String>,
-    /// Accepted TCP streams, keyed by (guest_port, host_port).
-    streams: HashMap<ConnKey, TcpStream>,
+    /// Accepted Unix streams, keyed by (guest_port, host_port).
+    streams: HashMap<ConnKey, UnixStream>,
     /// Pending response/control packets to inject into the RX queue.
     rx_pending: Vec<(VsockHeader, Vec<u8>)>,
     /// Next ephemeral port for host-initiated connections.
@@ -80,34 +84,29 @@ impl VirtioVsock {
         }
     }
 
-    /// Register a TCP listener on `127.0.0.1:port` for the given host port.
+    /// Register a Unix socket listener on `socket_path` for the given vsock port.
     ///
     /// When a guest connects to this port via AF_VSOCK, the connection
-    /// is bridged to an accepted TCP client on this listener.
-    pub fn listen(&mut self, port: u32) -> io::Result<()> {
-        self.listen_on(port, port as u16)
-    }
-
-    /// Register a TCP listener on `127.0.0.1:host_port` for the given vsock port.
+    /// is bridged to an accepted Unix socket client on this listener.
     ///
-    /// The guest connects to `vsock_port` via AF_VSOCK, and the bridge listens
-    /// on `host_port` on the host side. This allows multiple VMs to use
-    /// distinct host ports for the same guest vsock port number.
-    pub fn listen_on(&mut self, vsock_port: u32, host_port: u16) -> io::Result<()> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", host_port))?;
+    /// Removes any stale socket file before binding.
+    pub fn listen_on(&mut self, vsock_port: u32, socket_path: &str) -> io::Result<()> {
+        // Remove stale socket file if it exists.
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path)?;
         listener.set_nonblocking(true)?;
         self.listeners.insert(vsock_port, listener);
         Ok(())
     }
 
-    /// Register an outbound TCP target for guest-initiated connections.
+    /// Register an outbound Unix socket target for guest-initiated connections.
     ///
     /// When the guest connects to `vsock_port`, the device makes an outbound
-    /// TCP connection to `host_addr` instead of accepting from a listener.
+    /// Unix socket connection to `host_path` instead of accepting from a listener.
     /// Used for notification channels where the guest initiates the connection
     /// and the host is already listening.
-    pub fn connect_to(&mut self, vsock_port: u32, host_addr: String) {
-        self.connect_targets.insert(vsock_port, host_addr);
+    pub fn connect_to(&mut self, vsock_port: u32, host_path: String) {
+        self.connect_targets.insert(vsock_port, host_path);
     }
 
     /// Get the guest CID.
@@ -199,7 +198,7 @@ impl VirtioVsock {
         if let Some(conn) = self.connections.get_mut(&key) {
             let (resp_hdr, fwd_data) = conn.dispatch(hdr, payload);
 
-            // Forward data to host TCP socket.
+            // Forward data to host Unix socket.
             // Use retry loop for non-blocking sockets (write_all fails on WouldBlock).
             if let Some(data) = fwd_data {
                 if let Some(stream) = self.streams.get_mut(&key) {
@@ -257,22 +256,19 @@ impl VirtioVsock {
     fn handle_connect_request(&mut self, hdr: &VsockHeader) {
         let key = (hdr.src_port, hdr.dst_port);
 
-        // Try outbound connection first (guest-initiated → host TCP target).
-        if let Some(addr) = self.connect_targets.get(&hdr.dst_port).cloned() {
-            log::debug!("guest-initiated CONNECT: port={} → {}", hdr.dst_port, addr);
-            let stream = match TcpStream::connect(&addr) {
+        // Try outbound connection first (guest-initiated → host UDS target).
+        if let Some(path) = self.connect_targets.get(&hdr.dst_port).cloned() {
+            log::debug!("guest-initiated CONNECT: port={} → {}", hdr.dst_port, path);
+            let stream = match UnixStream::connect(&path) {
                 Ok(stream) => {
                     if let Err(e) = stream.set_nonblocking(true) {
                         log::warn!("guest-connect: set_nonblocking failed: {}", e);
                     }
-                    if let Err(e) = stream.set_nodelay(true) {
-                        log::warn!("guest-connect: set_nodelay failed: {}", e);
-                    }
-                    log::debug!("TCP connect OK to {}", addr);
+                    log::debug!("UDS connect OK to {}", path);
                     stream
                 }
                 Err(ref e) => {
-                    log::warn!("TCP connect FAILED to {}: {}", addr, e);
+                    log::warn!("UDS connect FAILED to {}: {}", path, e);
                     let rst = VsockHeader::new_rst(
                         VSOCK_CID_HOST,
                         hdr.dst_port,
@@ -311,7 +307,7 @@ impl VirtioVsock {
             return;
         }
 
-        // Try to accept a pending TCP connection on this listener.
+        // Try to accept a pending Unix socket connection on this listener.
         let stream = if let Some(listener) = self.listeners.get(&hdr.dst_port) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
@@ -319,8 +315,8 @@ impl VirtioVsock {
                     Some(stream)
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // No pending TCP connection yet — still accept the vsock connection.
-                    // Data will buffer until a TCP client connects.
+                    // No pending connection yet — still accept the vsock connection.
+                    // Data will buffer until a client connects.
                     None
                 }
                 Err(_) => {
@@ -365,26 +361,23 @@ impl VirtioVsock {
         port
     }
 
-    /// Poll TCP listeners for pending connections and initiate vsock handshakes.
+    /// Poll Unix socket listeners for pending connections and initiate vsock handshakes.
     ///
-    /// When a host TCP client connects to a listener, this method:
-    /// 1. Accepts the TCP connection
+    /// When a host client connects to a listener, this method:
+    /// 1. Accepts the Unix socket connection
     /// 2. Allocates an ephemeral host port for the vsock side
     /// 3. Creates a VsockConnection in Connecting state
     /// 4. Generates a REQUEST packet to send to the guest via RX queue
-    /// 5. Stores the TCP stream (data is NOT read until Connected)
-    fn poll_tcp_listeners(&mut self) {
+    /// 5. Stores the Unix stream (data is NOT read until Connected)
+    fn poll_listeners(&mut self) {
         let vsock_ports: Vec<u32> = self.listeners.keys().copied().collect();
 
         for vsock_port in vsock_ports {
             let stream = if let Some(listener) = self.listeners.get(&vsock_port) {
                 match listener.accept() {
-                    Ok((stream, addr)) => {
+                    Ok((stream, _addr)) => {
                         if let Err(e) = stream.set_nonblocking(true) {
-                            log::warn!("vsock set_nonblocking failed: {} (addr={:?})", e, addr);
-                        }
-                        if let Err(e) = stream.set_nodelay(true) {
-                            log::warn!("vsock set_nodelay failed: {} (addr={:?})", e, addr);
+                            log::warn!("vsock set_nonblocking failed: {}", e);
                         }
                         stream
                     }
@@ -414,14 +407,14 @@ impl VirtioVsock {
         }
     }
 
-    /// Poll TCP streams for incoming data and queue it for RX injection.
-    fn poll_tcp_streams(&mut self) {
+    /// Poll Unix streams for incoming data and queue it for RX injection.
+    fn poll_streams(&mut self) {
         // Collect keys first to avoid borrow issues.
         let keys: Vec<ConnKey> = self.streams.keys().copied().collect();
 
         for key in keys {
             // Skip streams whose vsock connection is still handshaking.
-            // TCP data stays in the kernel receive buffer until Connected.
+            // Data stays in the kernel receive buffer until Connected.
             if let Some(conn) = self.connections.get(&key) {
                 if conn.state() != ConnState::Connected {
                     continue;
@@ -432,8 +425,8 @@ impl VirtioVsock {
             let data = if let Some(stream) = self.streams.get_mut(&key) {
                 match stream.read(&mut buf) {
                     Ok(0) => {
-                        // TCP connection closed. Send SHUTDOWN to guest.
-                        log::debug!("TCP EOF, key=({},{})", key.0, key.1);
+                        // Unix socket connection closed. Send SHUTDOWN to guest.
+                        log::debug!("UDS EOF, key=({},{})", key.0, key.1);
                         if let Some(conn) = self.connections.get(&key) {
                             let hdr = VsockHeader::new_shutdown(
                                 conn.local_cid,
@@ -453,14 +446,14 @@ impl VirtioVsock {
                         continue;
                     }
                     Ok(n) => {
-                        log::trace!("TCP read {} bytes, key=({},{})", n, key.0, key.1);
+                        log::trace!("UDS read {} bytes, key=({},{})", n, key.0, key.1);
                         Some(buf[..n].to_vec())
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => None,
                     Err(ref e) => {
-                        // I/O error on TCP stream. RST the vsock connection.
+                        // I/O error on Unix stream. RST the vsock connection.
                         log::warn!(
-                            "vsock TCP read error: {} (raw={:?}), key=({},{})",
+                            "vsock UDS read error: {} (raw={:?}), key=({},{})",
                             e,
                             e.raw_os_error(),
                             key.0,
@@ -617,16 +610,16 @@ impl VirtioDeviceBackend for VirtioVsock {
     }
 
     fn poll(&mut self, queues: &mut [Virtqueue], mem: &dyn GuestMemoryAccessor) -> bool {
-        // Accept new TCP connections and initiate vsock handshakes.
-        self.poll_tcp_listeners();
+        // Accept new Unix socket connections and initiate vsock handshakes.
+        self.poll_listeners();
 
-        // Poll TCP streams for incoming data.
+        // Poll Unix streams for incoming data.
         let pending_before = self.rx_pending.len();
-        self.poll_tcp_streams();
+        self.poll_streams();
         let new_data = self.rx_pending.len() - pending_before;
         if new_data > 0 {
             log::trace!(
-                "vsock poll: TCP produced {} new packets, total pending={}",
+                "vsock poll: UDS produced {} new packets, total pending={}",
                 new_data,
                 self.rx_pending.len()
             );
@@ -832,22 +825,19 @@ mod tests {
         assert_eq!(dev.rx_pending[0].0.op, VSOCK_OP_RST);
     }
 
+    /// Create a temporary socket path for tests.
+    fn temp_socket_path(name: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        (path, dir)
+    }
+
     #[test]
     fn test_tx_request_with_listener_sends_response() {
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap(); // Port 0 = OS-assigned.
-                                // Get the actual port.
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        // Re-register with correct port.
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("vsock-test.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
         let mem = MockMem::new(0x10000);
         let mut tx_queue = setup_queue(128);
@@ -856,7 +846,7 @@ mod tests {
             src_cid: 3,
             dst_cid: 2,
             src_port: 5000,
-            dst_port: port,
+            dst_port: vsock_port,
             len: 0,
             type_: 1,
             op: VSOCK_OP_REQUEST,
@@ -1106,7 +1096,7 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let mem = MockMem::new(0x10000);
 
-        // Manually create connection to test data flow without TCP.
+        // Manually create connection to test data flow without sockets.
         let req_hdr = VsockHeader {
             src_cid: 3,
             dst_cid: 2,
@@ -1261,79 +1251,37 @@ mod tests {
         assert_eq!(hdr.op, packet::VSOCK_OP_CREDIT_UPDATE);
     }
 
-    // --- Listen and connect with TCP ---
+    // --- Listen and connect with Unix sockets ---
 
     #[test]
     fn test_listen_creates_listener() {
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap(); // Port 0 = OS-assigned.
+        let (sock_path, _dir) = temp_socket_path("listen-test.sock");
+        dev.listen_on(2695, sock_path.to_str().unwrap()).unwrap();
         assert_eq!(dev.listeners.len(), 1);
     }
 
     #[test]
-    fn test_listen_on_different_host_port() {
+    fn test_listen_on_two_vsock_ports() {
         let mut dev = VirtioVsock::new(3);
-        // vsock port 2695, host TCP port 0 (OS-assigned)
-        dev.listen_on(2695, 0).unwrap();
-        assert_eq!(dev.listeners.len(), 1);
-        // Listener is keyed by vsock port, not host port
-        assert!(dev.listeners.contains_key(&2695));
-        // The actual TCP port may differ from the vsock port
-        let actual_port = dev
-            .listeners
-            .get(&2695)
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        assert_ne!(actual_port, 2695); // OS assigned a different port
-    }
-
-    #[test]
-    fn test_listen_on_two_vsock_ports_different_host_ports() {
-        let mut dev = VirtioVsock::new(3);
-        dev.listen_on(2695, 0).unwrap();
-        dev.listen_on(2696, 0).unwrap();
+        let (path1, _dir1) = temp_socket_path("listen1.sock");
+        let (path2, _dir2) = temp_socket_path("listen2.sock");
+        dev.listen_on(2695, path1.to_str().unwrap()).unwrap();
+        dev.listen_on(2696, path2.to_str().unwrap()).unwrap();
         assert_eq!(dev.listeners.len(), 2);
-        // Each vsock port has its own listener
-        let port1 = dev
-            .listeners
-            .get(&2695)
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let port2 = dev
-            .listeners
-            .get(&2696)
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        assert_ne!(port1, port2);
+        assert!(dev.listeners.contains_key(&2695));
+        assert!(dev.listeners.contains_key(&2696));
     }
 
     #[test]
-    fn test_listen_with_tcp_connect() {
-        use std::net::TcpStream;
-
+    fn test_listen_with_uds_connect() {
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        // Re-register with actual port.
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("listen-connect.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
-        // Connect a TCP client before the guest sends REQUEST.
-        let _client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-        // Brief delay for the accept backlog to propagate.
+        // Connect a UDS client before the guest sends REQUEST.
+        let _client = UnixStream::connect(&sock_path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let mem = MockMem::new(0x10000);
@@ -1343,7 +1291,7 @@ mod tests {
             src_cid: 3,
             dst_cid: 2,
             src_port: 5000,
-            dst_port: port,
+            dst_port: vsock_port,
             len: 0,
             type_: 1,
             op: VSOCK_OP_REQUEST,
@@ -1357,35 +1305,26 @@ mod tests {
 
         dev.process_tx(&mut tx_queue, &mem);
 
-        // Should have RESPONSE and a TCP stream.
+        // Should have RESPONSE and a stream.
         assert_eq!(dev.rx_pending.len(), 1);
         assert_eq!(dev.rx_pending[0].0.op, packet::VSOCK_OP_RESPONSE);
         assert_eq!(dev.connection_count(), 1);
         assert_eq!(dev.streams.len(), 1);
     }
 
-    // --- Poll with TCP data ---
+    // --- Poll with UDS data ---
 
     #[test]
-    fn test_poll_reads_tcp_data() {
+    fn test_poll_reads_uds_data() {
         use std::io::Write as IoWrite;
-        use std::net::TcpStream;
 
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("poll-data.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
-        // Connect TCP client.
-        let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        // Connect UDS client.
+        let mut client = UnixStream::connect(&sock_path).unwrap();
 
         // Establish vsock connection.
         let mem = MockMem::new(0x10000);
@@ -1395,7 +1334,7 @@ mod tests {
             src_cid: 3,
             dst_cid: 2,
             src_port: 5000,
-            dst_port: port,
+            dst_port: vsock_port,
             len: 0,
             type_: 1,
             op: VSOCK_OP_REQUEST,
@@ -1409,23 +1348,20 @@ mod tests {
         dev.process_tx(&mut tx_queue, &mem);
         dev.rx_pending.clear();
 
-        // Send data from TCP client to be picked up by poll.
-        client.write_all(b"tcp data").unwrap();
+        // Send data from UDS client to be picked up by poll.
+        client.write_all(b"uds data").unwrap();
         client.flush().unwrap();
 
-        // Small delay to allow TCP data to arrive.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // Poll should read TCP data and queue it.
+        // Poll should read UDS data and queue it.
         let mut queues = vec![
             setup_queue(128), // RX
             setup_queue(128), // TX
             setup_queue(128), // Event
         ];
 
-        // Set up an RX buffer.
         let rx_buf = BUF_BASE + 0x4000;
-        // Use separate addresses for the RX queue to avoid overlap.
         let rx_desc = 0x8000u64;
         let rx_avail = 0x8800u64;
         let rx_used = 0x9000u64;
@@ -1433,26 +1369,23 @@ mod tests {
         queues[0].set_avail_ring(rx_avail);
         queues[0].set_used_ring(rx_used);
 
-        // Write descriptor for RX.
         mem.write_u64_at(rx_desc, rx_buf);
         mem.write_u32_at(rx_desc + 8, 256);
         mem.write_u16_at(rx_desc + 12, 2); // WRITE
         mem.write_u16_at(rx_desc + 14, 0);
-        // Push to avail ring.
-        mem.write_u16_at(rx_avail + 4, 0); // ring[0] = desc 0
-        mem.write_u16_at(rx_avail + 2, 1); // avail idx = 1
+        mem.write_u16_at(rx_avail + 4, 0);
+        mem.write_u16_at(rx_avail + 2, 1);
 
         let raised = dev.poll(&mut queues, &mem);
         assert!(raised);
 
-        // Check that data was injected.
         let hdr_bytes = mem.read_bytes(rx_buf, VSOCK_HEADER_SIZE);
         let rx_hdr = VsockHeader::from_bytes(&hdr_bytes.try_into().unwrap());
         assert_eq!(rx_hdr.op, packet::VSOCK_OP_RW);
         assert_eq!(rx_hdr.len, 8);
 
         let payload = mem.read_bytes(rx_buf + VSOCK_HEADER_SIZE as u64, 8);
-        assert_eq!(payload, b"tcp data");
+        assert_eq!(payload, b"uds data");
     }
 
     // --- Guest-initiated outbound connection ---
@@ -1460,24 +1393,23 @@ mod tests {
     #[test]
     fn test_connect_to_registers_target() {
         let mut dev = VirtioVsock::new(3);
-        dev.connect_to(2696, "127.0.0.1:9999".to_string());
+        dev.connect_to(2696, "/tmp/nonexistent.sock".to_string());
         assert_eq!(dev.connect_targets.len(), 1);
         assert!(dev.connect_targets.contains_key(&2696));
     }
 
     #[test]
     fn test_connect_to_outbound_success() {
-        // Set up a host-side TCP listener to receive the outbound connection.
-        let host_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let host_port = host_listener.local_addr().unwrap().port();
+        // Set up a host-side Unix listener to receive the outbound connection.
+        let (host_sock, _dir) = temp_socket_path("host-outbound.sock");
+        let host_listener = UnixListener::bind(&host_sock).unwrap();
 
         let mut dev = VirtioVsock::new(3);
-        dev.connect_to(2696, format!("127.0.0.1:{}", host_port));
+        dev.connect_to(2696, host_sock.to_str().unwrap().to_string());
 
         let mem = MockMem::new(0x10000);
         let mut tx_queue = setup_queue(128);
 
-        // Guest sends CONNECT to vsock port 2696.
         let hdr = VsockHeader {
             src_cid: 3,
             dst_cid: 2,
@@ -1496,7 +1428,6 @@ mod tests {
 
         dev.process_tx(&mut tx_queue, &mem);
 
-        // Should get RESPONSE (not RST) and have a connection + stream.
         assert_eq!(dev.rx_pending.len(), 1);
         assert_eq!(dev.rx_pending[0].0.op, packet::VSOCK_OP_RESPONSE);
         assert_eq!(dev.connection_count(), 1);
@@ -1505,14 +1436,14 @@ mod tests {
         // Host listener should have received the connection.
         host_listener.set_nonblocking(true).unwrap();
         let accepted = host_listener.accept();
-        assert!(accepted.is_ok(), "Host should have received TCP connection");
+        assert!(accepted.is_ok(), "Host should have received UDS connection");
     }
 
     #[test]
     fn test_connect_to_unreachable_sends_rst() {
         let mut dev = VirtioVsock::new(3);
-        // Port 1 is not listening — connection will fail.
-        dev.connect_to(2696, "127.0.0.1:1".to_string());
+        // Nonexistent path — connection will fail.
+        dev.connect_to(2696, "/tmp/nonexistent-vsock-test-path.sock".to_string());
 
         let mem = MockMem::new(0x10000);
         let mut tx_queue = setup_queue(128);
@@ -1535,7 +1466,6 @@ mod tests {
 
         dev.process_tx(&mut tx_queue, &mem);
 
-        // Should get RST because target is unreachable.
         assert_eq!(dev.rx_pending.len(), 1);
         assert_eq!(dev.rx_pending[0].0.op, VSOCK_OP_RST);
         assert_eq!(dev.connection_count(), 0);
@@ -1543,14 +1473,14 @@ mod tests {
 
     #[test]
     fn test_connect_to_preferred_over_listener() {
-        // If both connect_target and listener exist for same port,
-        // connect_target should be used (checked first).
-        let host_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let host_port = host_listener.local_addr().unwrap().port();
+        let (host_sock, _dir) = temp_socket_path("preferred.sock");
+        let _host_listener = UnixListener::bind(&host_sock).unwrap();
+
+        let (listen_sock, _dir2) = temp_socket_path("listen-fallback.sock");
 
         let mut dev = VirtioVsock::new(3);
-        dev.connect_to(2696, format!("127.0.0.1:{}", host_port));
-        dev.listen_on(2696, 0).unwrap(); // Also add a listener on same vsock port.
+        dev.connect_to(2696, host_sock.to_str().unwrap().to_string());
+        dev.listen_on(2696, listen_sock.to_str().unwrap()).unwrap();
 
         let mem = MockMem::new(0x10000);
         let mut tx_queue = setup_queue(128);
@@ -1573,54 +1503,45 @@ mod tests {
 
         dev.process_tx(&mut tx_queue, &mem);
 
-        // Should get RESPONSE via outbound connection.
         assert_eq!(dev.rx_pending.len(), 1);
         assert_eq!(dev.rx_pending[0].0.op, packet::VSOCK_OP_RESPONSE);
         assert_eq!(dev.connection_count(), 1);
         assert_eq!(dev.streams.len(), 1);
     }
 
-    // --- Host-initiated connections (poll_tcp_listeners) ---
+    // --- Host-initiated connections (poll_listeners) ---
 
     #[test]
-    fn test_poll_tcp_listeners_accepts_and_sends_request() {
+    fn test_poll_listeners_accepts_and_sends_request() {
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("poll-accept.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
-        // Host TCP client connects BEFORE any guest action.
-        let _client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        // Host UDS client connects BEFORE any guest action.
+        let _client = UnixStream::connect(&sock_path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // poll_tcp_listeners should accept and generate a REQUEST.
-        dev.poll_tcp_listeners();
+        dev.poll_listeners();
 
         assert_eq!(dev.rx_pending.len(), 1);
         assert_eq!(dev.rx_pending[0].0.op, VSOCK_OP_REQUEST);
         assert_eq!(dev.rx_pending[0].0.src_cid, VSOCK_CID_HOST);
-        assert_eq!(dev.rx_pending[0].0.dst_cid, 3); // guest CID
-        assert_eq!(dev.rx_pending[0].0.dst_port, port); // guest vsock port
+        assert_eq!(dev.rx_pending[0].0.dst_cid, 3);
+        assert_eq!(dev.rx_pending[0].0.dst_port, vsock_port);
         assert!(dev.rx_pending[0].0.src_port >= EPHEMERAL_PORT_START);
         assert_eq!(dev.connection_count(), 1);
         assert_eq!(dev.streams.len(), 1);
     }
 
     #[test]
-    fn test_poll_tcp_listeners_no_pending_is_noop() {
+    fn test_poll_listeners_no_pending_is_noop() {
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
+        let (sock_path, _dir) = temp_socket_path("poll-noop.sock");
+        dev.listen_on(2695, sock_path.to_str().unwrap()).unwrap();
 
-        // No TCP client connected.
-        dev.poll_tcp_listeners();
+        // No client connected.
+        dev.poll_listeners();
 
         assert!(dev.rx_pending.is_empty());
         assert_eq!(dev.connection_count(), 0);
@@ -1631,36 +1552,28 @@ mod tests {
         use std::io::Write as IoWrite;
 
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("lifecycle.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
-        // Step 1: Host TCP client connects.
-        let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        // Step 1: Host client connects.
+        let mut client = UnixStream::connect(&sock_path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Step 2: VMM accepts and sends REQUEST to guest.
-        dev.poll_tcp_listeners();
+        dev.poll_listeners();
         assert_eq!(dev.rx_pending.len(), 1);
         let req = &dev.rx_pending[0].0;
         assert_eq!(req.op, VSOCK_OP_REQUEST);
         let host_ephemeral = req.src_port;
-        let key = (port, host_ephemeral);
+        let key = (vsock_port, host_ephemeral);
         dev.rx_pending.clear();
 
-        // Step 3: Guest sends RESPONSE (simulated via handle_guest_packet).
+        // Step 3: Guest sends RESPONSE.
         let resp = VsockHeader {
             src_cid: 3,
             dst_cid: VSOCK_CID_HOST,
-            src_port: port,
+            src_port: vsock_port,
             dst_port: host_ephemeral,
             len: 0,
             type_: 1,
@@ -1671,18 +1584,17 @@ mod tests {
         };
         dev.handle_guest_packet(&resp, &[]);
 
-        // Connection should now be Connected.
         assert_eq!(
             dev.connections.get(&key).unwrap().state(),
             ConnState::Connected
         );
 
-        // Step 4: Host sends data via TCP -> forwarded to guest via vsock.
+        // Step 4: Host sends data → forwarded to guest via vsock.
         client.write_all(b"hello from host").unwrap();
         client.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        dev.poll_tcp_streams();
+        dev.poll_streams();
         let conn = dev.connections.get(&key).unwrap();
         assert!(conn.tx_buf_len() > 0);
     }
@@ -1692,28 +1604,18 @@ mod tests {
         use std::io::Write as IoWrite;
 
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("handshake.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
-        // Host connects and sends data before handshake completes.
-        let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        dev.poll_tcp_listeners();
+        dev.poll_listeners();
         let host_ephemeral = dev.rx_pending[0].0.src_port;
-        let key = (port, host_ephemeral);
+        let key = (vsock_port, host_ephemeral);
         dev.rx_pending.clear();
 
-        // Connection is in Connecting state.
         assert_eq!(
             dev.connections.get(&key).unwrap().state(),
             ConnState::Connecting
@@ -1724,16 +1626,15 @@ mod tests {
         client.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // poll_tcp_streams should SKIP this stream (not Connected yet).
-        dev.poll_tcp_streams();
-        // Data stays in kernel buffer, connection tx_buf is empty.
+        // poll_streams should SKIP this stream (not Connected yet).
+        dev.poll_streams();
         assert_eq!(dev.connections.get(&key).unwrap().tx_buf_len(), 0);
 
-        // Now complete the handshake.
+        // Complete the handshake.
         let resp = VsockHeader {
             src_cid: 3,
             dst_cid: VSOCK_CID_HOST,
-            src_port: port,
+            src_port: vsock_port,
             dst_port: host_ephemeral,
             len: 0,
             type_: 1,
@@ -1748,8 +1649,8 @@ mod tests {
             ConnState::Connected
         );
 
-        // NOW poll_tcp_streams reads the data.
-        dev.poll_tcp_streams();
+        // NOW poll_streams reads the data.
+        dev.poll_streams();
         assert!(dev.connections.get(&key).unwrap().tx_buf_len() > 0);
     }
 
@@ -1765,38 +1666,28 @@ mod tests {
     }
 
     #[test]
-    fn test_host_initiated_guest_data_to_host_tcp() {
+    fn test_host_initiated_guest_data_to_host_uds() {
         use std::io::Read as IoRead;
 
         let mut dev = VirtioVsock::new(3);
-        dev.listen(0).unwrap();
-        let port = dev
-            .listeners
-            .values()
-            .next()
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port() as u32;
-        let listener = dev.listeners.remove(&0).unwrap();
-        dev.listeners.insert(port, listener);
+        let (sock_path, _dir) = temp_socket_path("guest-data.sock");
+        let vsock_port = 2695u32;
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
 
-        // Host connects.
-        let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
         client.set_nonblocking(true).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // Accept + REQUEST.
-        dev.poll_tcp_listeners();
+        dev.poll_listeners();
         let host_ephemeral = dev.rx_pending[0].0.src_port;
-        let key = (port, host_ephemeral);
+        let key = (vsock_port, host_ephemeral);
         dev.rx_pending.clear();
 
         // Guest RESPONSE.
         let resp = VsockHeader {
             src_cid: 3,
             dst_cid: VSOCK_CID_HOST,
-            src_port: port,
+            src_port: vsock_port,
             dst_port: host_ephemeral,
             len: 0,
             type_: 1,
@@ -1807,11 +1698,11 @@ mod tests {
         };
         dev.handle_guest_packet(&resp, &[]);
 
-        // Guest sends data (RW) → should be forwarded to host TCP stream.
+        // Guest sends data (RW) → should be forwarded to host Unix stream.
         let rw_hdr = VsockHeader {
             src_cid: 3,
             dst_cid: VSOCK_CID_HOST,
-            src_port: port,
+            src_port: vsock_port,
             dst_port: host_ephemeral,
             len: 11,
             type_: 1,
@@ -1822,7 +1713,7 @@ mod tests {
         };
         dev.handle_guest_packet(&rw_hdr, b"hello guest");
 
-        // Read from TCP client.
+        // Read from UDS client.
         std::thread::sleep(std::time::Duration::from_millis(50));
         let mut buf = [0u8; 128];
         let n = client.read(&mut buf).unwrap();
