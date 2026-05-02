@@ -302,6 +302,14 @@ mod imp {
         // need to be able to wake any vCPU.
         let cancellers: Vec<VcpuCanceller> = vcpus.iter().map(|v| v.canceller()).collect();
 
+        // Track which vCPUs have actually entered WHvRunVirtualProcessor.
+        // The timer thread only cancels running vCPUs — cancelling a VP that
+        // hasn't been run yet has undefined behavior on WHPX and may corrupt
+        // partition state (suspected cause of 4-vCPU BSP hang).
+        let vcpu_running: Vec<Arc<AtomicBool>> = (0..num_vcpus as usize)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+
         // Store BSP canceller so stop() can wake the VM.
         *canceller_slot.lock().unwrap() = Some(cancellers[0].clone());
 
@@ -343,17 +351,25 @@ mod imp {
             let diag_ref = &diag_log;
             let lapic_refs_ref = &lapic_refs;
             let shared_states_ref = &shared_states;
+            let vcpu_running_ref = &vcpu_running;
 
-            // Spawn timer thread — cancels ALL vCPUs every 1ms.
+            // Spawn timer thread — cancels only RUNNING vCPUs every 1ms.
+            // Previously this cancelled ALL vCPUs including APs that hadn't
+            // entered WHvRunVirtualProcessor yet. At 4 vCPUs, calling
+            // WHvCancelRunVirtualProcessor on 3 non-running APs every 1ms
+            // may corrupt WHPX partition state, causing BSP hang.
             let timer_flag = run_config.running.clone();
             let timer_cancellers: Vec<VcpuCanceller> = cancellers.clone();
             let timer_shutdown = shutdown.clone();
+            let timer_vcpu_running: Vec<Arc<AtomicBool>> = vcpu_running.clone();
             let timer_thread = std::thread::spawn(move || {
                 while timer_flag.load(Ordering::Relaxed) && !timer_shutdown.load(Ordering::Relaxed)
                 {
                     std::thread::sleep(Duration::from_millis(1));
-                    for c in &timer_cancellers {
-                        let _ = c.cancel();
+                    for (i, c) in timer_cancellers.iter().enumerate() {
+                        if timer_vcpu_running[i].load(Ordering::Relaxed) {
+                            let _ = c.cancel();
+                        }
                     }
                 }
             });
@@ -364,6 +380,7 @@ mod imp {
                     let vcpu = &vcpus[ap_idx];
                     let my_lapic = &lapic_refs_ref[ap_idx];
                     let my_shared = &shared_states_ref[ap_idx];
+                    let my_running = &vcpu_running_ref[ap_idx];
                     s.spawn(move || {
                         run_ap_loop(
                             ap_idx as u8,
@@ -380,11 +397,14 @@ mod imp {
                             my_lapic,
                             my_shared,
                             shared_states_ref,
+                            my_running,
                         );
                     });
                 }
 
                 // BSP runs on the current thread.
+                // Mark BSP as running before entering the loop so timer can cancel it.
+                vcpu_running_ref[0].store(true, Ordering::Release);
                 let bsp_vcpu = &vcpus[0];
                 let bsp_code = run_bsp_loop(
                     bsp_vcpu,
@@ -442,6 +462,8 @@ mod imp {
         io_out_count: u64,
         io_in_count: u64,
         inject_count: u64,
+        cancelled_count: u64,
+        cpuid_count: u64,
         last_progress: Instant,
         start_time: Instant,
         window_requested: bool,
@@ -464,6 +486,8 @@ mod imp {
                 io_out_count: 0,
                 io_in_count: 0,
                 inject_count: 0,
+                cancelled_count: 0,
+                cpuid_count: 0,
                 last_progress: now,
                 start_time: now,
                 window_requested: false,
@@ -636,6 +660,25 @@ mod imp {
                     target_apic_id,
                 );
             }
+            IpiAction::BroadcastInterrupt {
+                source_apic_id,
+                vector,
+            } => {
+                // Send to all vCPUs except the source.
+                let num = cancellers.len();
+                for idx in 0..num {
+                    if idx as u8 != source_apic_id {
+                        devices.irq_chip.deliver_ipi_interrupt(idx as u8, vector);
+                        let _ = cancellers[idx].cancel();
+                    }
+                }
+                ipi_diag!(
+                    "IPI: broadcast vector={:#X} from vCPU{} → all-excl-self ({} targets)",
+                    vector,
+                    source_apic_id,
+                    num - 1,
+                );
+            }
         }
     }
 
@@ -793,6 +836,22 @@ mod imp {
             };
             stats.exit_count += 1;
 
+            // Periodic progress logging for early-boot diagnostics.
+            // Written to diag file (not log::info!) because shim's tracing
+            // subscriber doesn't capture log crate output from VMM.
+            if stats.exit_count % 50_000 == 0 {
+                let console_len = devices::get_console_output(ctx_id)
+                    .map(|b| b.len())
+                    .unwrap_or(0);
+                diag!(
+                    "BSP progress: exit={} serial={} mmio={} io_out={} io_in={} inj={} hlt={} console={}B elapsed={:.1}s",
+                    stats.exit_count, stats.serial_out_count, stats.mmio_count,
+                    stats.io_out_count, stats.io_in_count, stats.inject_count,
+                    stats.total_halt_exits, console_len,
+                    stats.start_time.elapsed().as_secs_f64(),
+                );
+            }
+
             match exit {
                 VcpuExit::IoOut { port, size, data } => {
                     stats.halt_count = 0;
@@ -830,12 +889,12 @@ mod imp {
                     if address == stats.last_mmio_read_addr {
                         stats.consecutive_mmio_reads += 1;
                         if stats.consecutive_mmio_reads == 10_000 {
-                            log::warn!(
+                            diag!(
                                 "BSP: tight MMIO read loop: addr={:#X} count={} exit={}",
                                 address, stats.consecutive_mmio_reads, stats.exit_count
                             );
                             if let Ok(regs) = vcpu.get_registers() {
-                                log::warn!("BSP: RIP={:#X} at tight MMIO loop", regs.rip);
+                                diag!("BSP: RIP={:#X} at tight MMIO loop", regs.rip);
                             }
                         }
                     } else {
@@ -873,6 +932,17 @@ mod imp {
                                         all_shared[idx].request_interrupt(vector);
                                         if idx < cancellers.len() {
                                             let _ = cancellers[idx].cancel();
+                                        }
+                                    }
+                                }
+                                IpiAction::BroadcastInterrupt { source_apic_id, vector } => {
+                                    // Broadcast to all vCPUs except source (lock-free).
+                                    for idx in 0..all_shared.len() {
+                                        if idx as u8 != source_apic_id {
+                                            all_shared[idx].request_interrupt(vector);
+                                            if idx < cancellers.len() {
+                                                let _ = cancellers[idx].cancel();
+                                            }
                                         }
                                     }
                                 }
@@ -979,8 +1049,7 @@ mod imp {
                                 .map(|b| b.len())
                                 .unwrap_or(0);
                             let if_flag = vcpu.interrupts_enabled().unwrap_or(false);
-                            log::warn!(
-                                target: "whpx::diag",
+                            diag!(
                                 "BSP HLT stuck: consecutive={} total_halt={} halt_w_irq={} \
                                  exits={} RIP={:#X} IF={} console={}B mmio={} vcpus={}",
                                 stats.halt_count, stats.total_halt_exits, stats.halt_with_irq,
@@ -1049,20 +1118,14 @@ mod imp {
                                 "pending"
                             };
                             drop(dm);
-                            log::info!(
-                                target: "whpx::diag",
-                                "vCPU0 @ {:.1}s: exits={} RIP={:#X} console={}B mmio={} halt={}/{} inj={} blk_comp={} mode={}/{}",
+                            diag!(
+                                "vCPU0 @ {:.1}s: exits={} RIP={:#X} console={}B mmio={} halt={}/{} inj={} blk_comp={} mode={}/{} io_out={} serial={} blk_qn={} vcpus={}",
                                 stats.start_time.elapsed().as_secs_f64(),
                                 stats.exit_count, regs.rip, console_len,
                                 stats.mmio_count, stats.halt_count, stats.total_halt_exits,
                                 stats.inject_count, bc,
                                 if apic_mode { "apic" } else { "pic" }, blk_mode,
-                            );
-                            log::debug!(
-                                target: "whpx::diag",
-                                "vCPU0 detail: io_out={} serial={} blk_qn={} halt_w_irq={} vcpus={}",
-                                stats.io_out_count, stats.serial_out_count, qn,
-                                stats.halt_with_irq, num_vcpus,
+                                stats.io_out_count, stats.serial_out_count, qn, num_vcpus,
                             );
                         }
                     }
@@ -1102,6 +1165,7 @@ mod imp {
                     default_rdx,
                 } => {
                     stats.halt_count = 0;
+                    stats.cpuid_count += 1;
                     let (out_rax, out_rbx, out_rcx, out_rdx) = super::handle_cpuid(
                         0,
                         num_vcpus,
@@ -1175,6 +1239,7 @@ mod imp {
         my_lapic: &Arc<Mutex<LocalApic>>,
         my_shared: &Arc<SharedApicState>,
         all_shared: &[Arc<SharedApicState>],
+        vcpu_running_flag: &AtomicBool,
     ) {
         macro_rules! diag {
             ($($arg:tt)*) => {
@@ -1246,11 +1311,19 @@ mod imp {
         }
         diag!("AP{}: initial regs set, entering run loop", ap_id);
 
+        // Mark AP as running so the timer thread can cancel it.
+        // This MUST happen after SIPI wake + register setup, just before first vcpu.run().
+        vcpu_running_flag.store(true, Ordering::Release);
+
         let mut stats = VcpuStats::new();
 
         loop {
             if shutdown.load(Ordering::Relaxed) || !run_config.should_run() {
-                log::info!("AP{}: shutdown signal received", ap_id);
+                diag!(
+                    "AP{}: EXIT (shutdown) exits={} cancelled={} halt={} cpuid={} mmio={}",
+                    ap_id, stats.exit_count, stats.cancelled_count,
+                    stats.total_halt_exits, stats.cpuid_count, stats.mmio_count,
+                );
                 return;
             }
 
@@ -1380,6 +1453,17 @@ mod imp {
                                         }
                                     }
                                 }
+                                IpiAction::BroadcastInterrupt { source_apic_id, vector } => {
+                                    // Broadcast to all vCPUs except source (lock-free).
+                                    for idx in 0..all_shared.len() {
+                                        if idx as u8 != source_apic_id {
+                                            all_shared[idx].request_interrupt(vector);
+                                            if idx < cancellers.len() {
+                                                let _ = cancellers[idx].cancel();
+                                            }
+                                        }
+                                    }
+                                }
                                 IpiAction::SendInit { .. } | IpiAction::SendSipi { .. } => {
                                     dispatch_ipi(
                                         action,
@@ -1483,6 +1567,25 @@ mod imp {
                         log::info!("AP{}: stop requested on Cancelled", ap_id);
                         return;
                     }
+                    stats.cancelled_count += 1;
+                    // Periodic AP progress logging (every 500 Cancelled exits ≈ every 500ms).
+                    if stats.cancelled_count % 500 == 0 {
+                        let rip = vcpu
+                            .get_registers()
+                            .map(|r| r.rip)
+                            .unwrap_or(0xDEAD);
+                        diag!(
+                            "AP{} @ {:.1}s: exits={} cancelled={} halt={} cpuid={} mmio={} RIP={:#X}",
+                            ap_id,
+                            stats.start_time.elapsed().as_secs_f64(),
+                            stats.exit_count,
+                            stats.cancelled_count,
+                            stats.total_halt_exits,
+                            stats.cpuid_count,
+                            stats.mmio_count,
+                            rip,
+                        );
+                    }
                 }
                 VcpuExit::MsrAccess {
                     msr_number,
@@ -1525,6 +1628,7 @@ mod imp {
                     default_rdx,
                 } => {
                     stats.halt_count = 0;
+                    stats.cpuid_count += 1;
                     let (out_rax, out_rbx, out_rcx, out_rdx) = super::handle_cpuid(
                         ap_id,
                         num_vcpus,
@@ -1573,7 +1677,11 @@ mod imp {
             }
 
             if stats.exit_count >= MAX_EXITS {
-                log::warn!("AP{}: reached {} exit limit", ap_id, MAX_EXITS);
+                diag!(
+                    "AP{}: EXIT (max_exits) exits={} cancelled={} halt={} cpuid={} mmio={}",
+                    ap_id, stats.exit_count, stats.cancelled_count,
+                    stats.total_halt_exits, stats.cpuid_count, stats.mmio_count,
+                );
                 return;
             }
         }

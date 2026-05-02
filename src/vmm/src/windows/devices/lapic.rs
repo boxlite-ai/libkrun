@@ -65,6 +65,8 @@ pub enum IpiAction {
     None,
     /// Fixed delivery: send interrupt vector to target LAPIC.
     SendInterrupt { target_apic_id: u8, vector: u8 },
+    /// Broadcast fixed interrupt to all vCPUs except the sender.
+    BroadcastInterrupt { source_apic_id: u8, vector: u8 },
     /// INIT delivery: reset target processor.
     SendInit { target_apic_id: u8 },
     /// Startup IPI (SIPI): start target processor at vector * 0x1000.
@@ -388,10 +390,61 @@ impl LocalApic {
     }
 
     /// Parse the ICR low/high registers to produce an IPI action.
+    ///
+    /// ICR Low bits:
+    /// - [7:0]   Vector
+    /// - [10:8]  Delivery mode (000=Fixed, 101=INIT, 110=SIPI)
+    /// - [11]    Destination mode (0=physical, 1=logical)
+    /// - [17:12] Reserved/status
+    /// - [19:18] Destination shorthand (00=none, 01=self, 10=all-incl-self, 11=all-excl-self)
     fn parse_icr(&self) -> IpiAction {
         let vector = (self.icr_low & 0xFF) as u8;
         let delivery_mode = (self.icr_low >> 8) & 0x7;
+        let dest_shorthand = (self.icr_low >> 18) & 0x3;
         let dest_apic_id = ((self.icr_high >> 24) & 0xFF) as u8;
+
+        // Handle destination shorthand first.
+        match dest_shorthand {
+            0b01 => {
+                // Self: send to own LAPIC (used for self-IPI).
+                log::debug!(
+                    "LAPIC {} ICR: Self IPI vector={:#X}",
+                    self.id,
+                    vector
+                );
+                return IpiAction::SendInterrupt {
+                    target_apic_id: self.id,
+                    vector,
+                };
+            }
+            0b10 | 0b11 => {
+                // All Including Self (0b10) or All Excluding Self (0b11).
+                // For fixed delivery, broadcast to all other vCPUs.
+                if delivery_mode == 0b000 {
+                    log::debug!(
+                        "LAPIC {} ICR: Broadcast vector={:#X} (shorthand={})",
+                        self.id,
+                        vector,
+                        if dest_shorthand == 0b10 { "all-incl" } else { "all-excl" }
+                    );
+                    return IpiAction::BroadcastInterrupt {
+                        source_apic_id: self.id,
+                        vector,
+                    };
+                }
+                // Non-fixed broadcast (e.g., INIT to all) — fallthrough to per-target.
+                // For now, treat as no-op (Linux doesn't broadcast INIT/SIPI with shorthand).
+                log::debug!(
+                    "LAPIC {} ICR: Broadcast delivery_mode={} (unsupported, ignored)",
+                    self.id,
+                    delivery_mode
+                );
+                return IpiAction::None;
+            }
+            _ => {
+                // 0b00: No shorthand — use destination field (normal path).
+            }
+        }
 
         match delivery_mode {
             0b000 => {
