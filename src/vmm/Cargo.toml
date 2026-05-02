@@ -55,7 +55,7 @@ zstd = "0.13"
 
 # cpuid is needed on Unix x86_64 only (upstream VMM uses it)
 [target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
-cpuid = { path = "../cpuid" }
+cpuid = { package = "krun-cpuid", version = "=0.1.0-1.18.0", path = "../cpuid" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tdx = { version = "0.1.0", optional = true }
