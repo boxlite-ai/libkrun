@@ -133,7 +133,7 @@ impl VsockMuxer {
     }
 
     pub fn enable_tsi(&self) -> bool {
-        self.enable_tsi
+        self.tsi_flags.tsi_enabled()
     }
 
     pub(crate) fn activate(
