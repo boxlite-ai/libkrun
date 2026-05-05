@@ -463,6 +463,25 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
                               uint32_t flags);
 
 /**
+ * Disables automatic TSI networking for this context.
+ *
+ * When no virtio-net devices are added, libkrun normally enables the TSI backend.
+ * Call this function to keep the guest fully offline instead: no virtio-net
+ * device will be attached and TSI will remain disabled.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *
+ * Notes:
+ * This function only affects the automatic fallback path used when no network
+ * devices are added. It should be called before krun_start_enter.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_disable_tsi(uint32_t ctx_id);
+
+/**
  * Adds an independent virtio-net device with the tap backend.
  * Call to this function disables TSI backend.
 

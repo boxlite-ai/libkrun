@@ -78,6 +78,10 @@ impl Vsock {
         self.cid
     }
 
+    pub fn enable_tsi(&self) -> bool {
+        self.muxer.enable_tsi()
+    }
+
     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
     /// have pending. Return `true` if descriptors have been added to the used ring, and `false`
     /// otherwise.

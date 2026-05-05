@@ -88,7 +88,7 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
 use vm_memory::mmap::MmapRegion;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vm_memory::Address;
