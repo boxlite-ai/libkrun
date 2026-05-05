@@ -26,10 +26,17 @@
 //!   # Full lifecycle test: disk + init + argv
 //!   boot_kernel.exe vmlinuz --disk rootfs.img --init /init --argv --listen --argv vsock://2695
 
-use std::path::PathBuf;
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("boot_kernel: this example requires Windows (WHPX hypervisor)");
+}
 
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use vmm::windows::context::{DiskConfig, VsockPort, DISK_FORMAT_RAW};
 
+#[cfg(target_os = "windows")]
 fn main() {
     // Initialize logging (RUST_LOG controls verbosity).
     env_logger::init();
