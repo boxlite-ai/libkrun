@@ -837,7 +837,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("vsock-test.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         let mem = MockMem::new(0x10000);
         let mut tx_queue = setup_queue(128);
@@ -1278,7 +1279,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("listen-connect.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         // Connect a UDS client before the guest sends REQUEST.
         let _client = UnixStream::connect(&sock_path).unwrap();
@@ -1321,7 +1323,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("poll-data.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         // Connect UDS client.
         let mut client = UnixStream::connect(&sock_path).unwrap();
@@ -1516,7 +1519,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("poll-accept.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         // Host UDS client connects BEFORE any guest action.
         let _client = UnixStream::connect(&sock_path).unwrap();
@@ -1554,7 +1558,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("lifecycle.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         // Step 1: Host client connects.
         let mut client = UnixStream::connect(&sock_path).unwrap();
@@ -1606,7 +1611,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("handshake.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         let mut client = UnixStream::connect(&sock_path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1672,7 +1678,8 @@ mod tests {
         let mut dev = VirtioVsock::new(3);
         let (sock_path, _dir) = temp_socket_path("guest-data.sock");
         let vsock_port = 2695u32;
-        dev.listen_on(vsock_port, sock_path.to_str().unwrap()).unwrap();
+        dev.listen_on(vsock_port, sock_path.to_str().unwrap())
+            .unwrap();
 
         let mut client = UnixStream::connect(&sock_path).unwrap();
         client.set_nonblocking(true).unwrap();

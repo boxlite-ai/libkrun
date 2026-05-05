@@ -236,7 +236,12 @@ impl IrqChip {
             Some(self.ioapic.read_mmio(offset))
         } else if addr >= LAPIC_MMIO_BASE && addr < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE {
             let offset = addr - LAPIC_MMIO_BASE;
-            Some(self.lapics[vcpu_id as usize].lock().unwrap().read_mmio(offset))
+            Some(
+                self.lapics[vcpu_id as usize]
+                    .lock()
+                    .unwrap()
+                    .read_mmio(offset),
+            )
         } else {
             None
         }
@@ -424,7 +429,10 @@ mod tests {
 
         chip.raise_irq(5);
         // pull_irr: merge shared state into local IRR (lock-free delivery path).
-        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
+        chip.lapics[0]
+            .lock()
+            .unwrap()
+            .pull_irr(&chip.shared_states[0]);
         assert!(chip.has_pending(0));
 
         let vector = chip.acknowledge(0);
@@ -446,7 +454,10 @@ mod tests {
         // raise_irq(0) should remap to IOAPIC pin 2 and deliver vector 0x22.
         chip.raise_irq(0);
         // pull_irr: merge shared state into local IRR (lock-free delivery path).
-        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
+        chip.lapics[0]
+            .lock()
+            .unwrap()
+            .pull_irr(&chip.shared_states[0]);
         assert!(chip.has_pending(0));
 
         let vector = chip.acknowledge(0);
@@ -513,7 +524,10 @@ mod tests {
         // Raise IRQ 3.
         chip.raise_irq(3);
         // pull_irr: merge shared state into local IRR (lock-free delivery path).
-        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
+        chip.lapics[0]
+            .lock()
+            .unwrap()
+            .pull_irr(&chip.shared_states[0]);
         let vector = chip.acknowledge(0);
         assert_eq!(vector, Some(0x33));
 
@@ -524,7 +538,10 @@ mod tests {
         chip.handle_mmio_write(0, LAPIC_MMIO_BASE + 0x0B0, 4, 0);
 
         // After EOI, the pin is still asserted → re-injection via shared state.
-        chip.lapics[0].lock().unwrap().pull_irr(&chip.shared_states[0]);
+        chip.lapics[0]
+            .lock()
+            .unwrap()
+            .pull_irr(&chip.shared_states[0]);
         assert!(chip.has_pending(0));
     }
 
@@ -566,7 +583,10 @@ mod tests {
         // Deliver IPI to vCPU 1.
         chip.deliver_ipi_interrupt(1, 0x40);
         // pull_irr: merge shared state into local IRR (lock-free delivery path).
-        chip.lapics[1].lock().unwrap().pull_irr(&chip.shared_states[1]);
+        chip.lapics[1]
+            .lock()
+            .unwrap()
+            .pull_irr(&chip.shared_states[1]);
         assert!(chip.has_pending(1));
         assert_eq!(chip.acknowledge(1), Some(0x40));
     }
@@ -642,7 +662,10 @@ mod tests {
         chip.raise_irq(1);
 
         // Before pull_irr, LAPIC has nothing.
-        assert_eq!(chip.lapics[0].lock().unwrap().get_highest_injectable(), None);
+        assert_eq!(
+            chip.lapics[0].lock().unwrap().get_highest_injectable(),
+            None
+        );
 
         // After pull_irr, LAPIC sees vector 49.
         let shared = chip.get_shared_state(0);
@@ -667,7 +690,10 @@ mod tests {
         chip.deliver_ipi_interrupt(1, 80);
 
         // Before pull_irr, LAPIC 1 has nothing.
-        assert_eq!(chip.lapics[1].lock().unwrap().get_highest_injectable(), None);
+        assert_eq!(
+            chip.lapics[1].lock().unwrap().get_highest_injectable(),
+            None
+        );
 
         // After pull_irr, LAPIC 1 sees vector 80.
         let shared = chip.get_shared_state(1);
@@ -680,6 +706,9 @@ mod tests {
         // LAPIC 0 should be unaffected.
         let shared0 = chip.get_shared_state(0);
         chip.lapics[0].lock().unwrap().pull_irr(&shared0);
-        assert_eq!(chip.lapics[0].lock().unwrap().get_highest_injectable(), None);
+        assert_eq!(
+            chip.lapics[0].lock().unwrap().get_highest_injectable(),
+            None
+        );
     }
 }

@@ -575,7 +575,10 @@ mod imp {
                 }
             }
             Err(ref e) => {
-                log::warn!("try_inject_interrupt_fast: interrupts_enabled() error: {:?}", e);
+                log::warn!(
+                    "try_inject_interrupt_fast: interrupts_enabled() error: {:?}",
+                    e
+                );
             }
         }
         Ok(())
@@ -891,7 +894,9 @@ mod imp {
                         if stats.consecutive_mmio_reads == 10_000 {
                             diag!(
                                 "BSP: tight MMIO read loop: addr={:#X} count={} exit={}",
-                                address, stats.consecutive_mmio_reads, stats.exit_count
+                                address,
+                                stats.consecutive_mmio_reads,
+                                stats.exit_count
                             );
                             if let Ok(regs) = vcpu.get_registers() {
                                 diag!("BSP: RIP={:#X} at tight MMIO loop", regs.rip);
@@ -926,7 +931,10 @@ mod imp {
                         LapicWriteFastResult::IpiAction(action) => {
                             // ICR fast path: dispatch IPI inline (lock-free).
                             match action {
-                                IpiAction::SendInterrupt { target_apic_id, vector } => {
+                                IpiAction::SendInterrupt {
+                                    target_apic_id,
+                                    vector,
+                                } => {
                                     let idx = target_apic_id as usize;
                                     if idx < all_shared.len() {
                                         all_shared[idx].request_interrupt(vector);
@@ -935,7 +943,10 @@ mod imp {
                                         }
                                     }
                                 }
-                                IpiAction::BroadcastInterrupt { source_apic_id, vector } => {
+                                IpiAction::BroadcastInterrupt {
+                                    source_apic_id,
+                                    vector,
+                                } => {
                                     // Broadcast to all vCPUs except source (lock-free).
                                     for idx in 0..all_shared.len() {
                                         if idx as u8 != source_apic_id {
@@ -974,7 +985,8 @@ mod imp {
                                     stats.start_time.elapsed().as_secs_f64() * 1000.0
                                 );
                             }
-                            let ipi_action = dm.handle_mmio_write(0, address, size, data, guest_mem);
+                            let ipi_action =
+                                dm.handle_mmio_write(0, address, size, data, guest_mem);
                             if !matches!(ipi_action, IpiAction::None) {
                                 dispatch_ipi(
                                     ipi_action,
@@ -1052,9 +1064,15 @@ mod imp {
                             diag!(
                                 "BSP HLT stuck: consecutive={} total_halt={} halt_w_irq={} \
                                  exits={} RIP={:#X} IF={} console={}B mmio={} vcpus={}",
-                                stats.halt_count, stats.total_halt_exits, stats.halt_with_irq,
-                                stats.exit_count, regs.rip,
-                                if_flag, console_len, stats.mmio_count, num_vcpus
+                                stats.halt_count,
+                                stats.total_halt_exits,
+                                stats.halt_with_irq,
+                                stats.exit_count,
+                                regs.rip,
+                                if_flag,
+                                console_len,
+                                stats.mmio_count,
+                                num_vcpus
                             );
                         }
                     }
@@ -1321,8 +1339,12 @@ mod imp {
             if shutdown.load(Ordering::Relaxed) || !run_config.should_run() {
                 diag!(
                     "AP{}: EXIT (shutdown) exits={} cancelled={} halt={} cpuid={} mmio={}",
-                    ap_id, stats.exit_count, stats.cancelled_count,
-                    stats.total_halt_exits, stats.cpuid_count, stats.mmio_count,
+                    ap_id,
+                    stats.exit_count,
+                    stats.cancelled_count,
+                    stats.total_halt_exits,
+                    stats.cpuid_count,
+                    stats.mmio_count,
                 );
                 return;
             }
@@ -1409,7 +1431,10 @@ mod imp {
                         if stats.consecutive_mmio_reads == 10_000 {
                             log::warn!(
                                 "AP{}: tight MMIO read loop: addr={:#X} count={} exit={}",
-                                ap_id, address, stats.consecutive_mmio_reads, stats.exit_count
+                                ap_id,
+                                address,
+                                stats.consecutive_mmio_reads,
+                                stats.exit_count
                             );
                             if let Ok(regs) = vcpu.get_registers() {
                                 log::warn!("AP{}: RIP={:#X} at tight MMIO loop", ap_id, regs.rip);
@@ -1444,7 +1469,10 @@ mod imp {
                         LapicWriteFastResult::IpiAction(action) => {
                             // ICR fast path: dispatch IPI inline (lock-free).
                             match action {
-                                IpiAction::SendInterrupt { target_apic_id, vector } => {
+                                IpiAction::SendInterrupt {
+                                    target_apic_id,
+                                    vector,
+                                } => {
                                     let idx = target_apic_id as usize;
                                     if idx < all_shared.len() {
                                         all_shared[idx].request_interrupt(vector);
@@ -1453,7 +1481,10 @@ mod imp {
                                         }
                                     }
                                 }
-                                IpiAction::BroadcastInterrupt { source_apic_id, vector } => {
+                                IpiAction::BroadcastInterrupt {
+                                    source_apic_id,
+                                    vector,
+                                } => {
                                     // Broadcast to all vCPUs except source (lock-free).
                                     for idx in 0..all_shared.len() {
                                         if idx as u8 != source_apic_id {
@@ -1570,10 +1601,7 @@ mod imp {
                     stats.cancelled_count += 1;
                     // Periodic AP progress logging (every 500 Cancelled exits ≈ every 500ms).
                     if stats.cancelled_count % 500 == 0 {
-                        let rip = vcpu
-                            .get_registers()
-                            .map(|r| r.rip)
-                            .unwrap_or(0xDEAD);
+                        let rip = vcpu.get_registers().map(|r| r.rip).unwrap_or(0xDEAD);
                         diag!(
                             "AP{} @ {:.1}s: exits={} cancelled={} halt={} cpuid={} mmio={} RIP={:#X}",
                             ap_id,
@@ -1679,8 +1707,12 @@ mod imp {
             if stats.exit_count >= MAX_EXITS {
                 diag!(
                     "AP{}: EXIT (max_exits) exits={} cancelled={} halt={} cpuid={} mmio={}",
-                    ap_id, stats.exit_count, stats.cancelled_count,
-                    stats.total_halt_exits, stats.cpuid_count, stats.mmio_count,
+                    ap_id,
+                    stats.exit_count,
+                    stats.cancelled_count,
+                    stats.total_halt_exits,
+                    stats.cpuid_count,
+                    stats.mmio_count,
                 );
                 return;
             }
@@ -2081,8 +2113,16 @@ mod tests {
     fn test_cpuid_leaf1_topology_bsp() {
         // BSP (vcpu 0) with 2 vCPUs.
         // input_rcx=0 (leaf 1 doesn't use sub-leaves).
-        let (rax, rbx, rcx, rdx) =
-            super::handle_cpuid(0, 2, 1, 0, 0x1234, 0x0000_0000_0000_5678, 0x8000_0001, 0xABCD);
+        let (rax, rbx, rcx, rdx) = super::handle_cpuid(
+            0,
+            2,
+            1,
+            0,
+            0x1234,
+            0x0000_0000_0000_5678,
+            0x8000_0001,
+            0xABCD,
+        );
         // EBX[23:16] = num_vcpus = 2, EBX[31:24] = vcpu_id = 0
         assert_eq!(rbx & 0x00FF_0000, 0x0002_0000, "EBX[23:16] should be 2");
         assert_eq!(
@@ -2189,7 +2229,11 @@ mod tests {
         for subleaf in 0..3u64 {
             let r_b = super::handle_cpuid(0, 4, 0xB, subleaf, 0, 0, 0, 0);
             let r_1f = super::handle_cpuid(0, 4, 0x1F, subleaf, 0, 0, 0, 0);
-            assert_eq!(r_b, r_1f, "Leaf 0xB and 0x1F should match for sub-leaf {}", subleaf);
+            assert_eq!(
+                r_b, r_1f,
+                "Leaf 0xB and 0x1F should match for sub-leaf {}",
+                subleaf
+            );
         }
     }
 
@@ -2249,5 +2293,4 @@ mod tests {
         assert_eq!(super::handle_msr_read(0, 0x174), 0);
         assert_eq!(super::handle_msr_read(1, 0xC000_0080), 0);
     }
-
 }

@@ -407,11 +407,7 @@ impl LocalApic {
         match dest_shorthand {
             0b01 => {
                 // Self: send to own LAPIC (used for self-IPI).
-                log::debug!(
-                    "LAPIC {} ICR: Self IPI vector={:#X}",
-                    self.id,
-                    vector
-                );
+                log::debug!("LAPIC {} ICR: Self IPI vector={:#X}", self.id, vector);
                 return IpiAction::SendInterrupt {
                     target_apic_id: self.id,
                     vector,
@@ -425,7 +421,11 @@ impl LocalApic {
                         "LAPIC {} ICR: Broadcast vector={:#X} (shorthand={})",
                         self.id,
                         vector,
-                        if dest_shorthand == 0b10 { "all-incl" } else { "all-excl" }
+                        if dest_shorthand == 0b10 {
+                            "all-incl"
+                        } else {
+                            "all-excl"
+                        }
                     );
                     return IpiAction::BroadcastInterrupt {
                         source_apic_id: self.id,
@@ -967,7 +967,6 @@ mod tests {
         assert_eq!(result.eoi_vector, None);
     }
 
-
     // ---- SharedApicState tests ----
 
     #[test]
@@ -976,7 +975,7 @@ mod tests {
         // Vector 32 → bank 1, bit 0.
         assert!(shared.request_interrupt(32)); // first set → true
         assert!(!shared.request_interrupt(32)); // already set → false
-        // Vector 33 → bank 1, bit 1.
+                                                // Vector 33 → bank 1, bit 1.
         assert!(shared.request_interrupt(33)); // different bit → true
     }
 
@@ -1020,7 +1019,7 @@ mod tests {
         let mut lapic = LocalApic::new();
         lapic.pull_irr(&shared);
         lapic.write_mmio(0x0F0, 0x1FF); // enable
-        // Highest should be 39.
+                                        // Highest should be 39.
         assert_eq!(lapic.get_highest_injectable(), Some(39));
     }
 

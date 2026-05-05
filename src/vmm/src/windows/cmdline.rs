@@ -464,5 +464,4 @@ mod tests {
         assert!(mmio_pos < sep_pos);
         assert!(!cmdline.contains("root=/dev/vda"));
     }
-
 }
