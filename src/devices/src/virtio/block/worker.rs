@@ -20,6 +20,7 @@ pub enum RequestError {
     DiscardingToZero(io::Error),
     FlushingToDisk(io::Error),
     InvalidDataLength,
+    InvalidRange,
     ReadingFromDescriptor(io::Error),
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
@@ -259,50 +260,110 @@ impl BlockWorker {
                     Ok(disk_id.len())
                 }
             }
+            // Discards may punch holes into the image file, which is only safe because this
+            // worker handles all requests of the disk one at a time (no I/O can be in flight
+            // on the discarded range).  Revisit this before adding more queues or workers.
             VIRTIO_BLK_T_DISCARD => {
-                let discard_write_data: DiscardWriteData = reader
-                    .read_obj()
-                    .map_err(RequestError::ReadingFromDescriptor)?;
+                let (offset, length) = self.read_discard_range(reader)?.0;
                 self.disk
                     .file
                     .lock()
                     .unwrap()
-                    .discard_to_any(
-                        discard_write_data.sector * 512,
-                        discard_write_data.num_sectors as u64 * 512,
-                    )
+                    .discard_to_any(offset, length)
                     .map_err(RequestError::Discarding)?;
                 Ok(0)
             }
             VIRTIO_BLK_T_WRITE_ZEROES => {
-                let discard_write_data: DiscardWriteData = reader
-                    .read_obj()
-                    .map_err(RequestError::ReadingFromDescriptor)?;
-                let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
+                let ((offset, length), flags) = self.read_discard_range(reader)?;
+                let unmap = (flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
                 if unmap {
                     self.disk
                         .file
                         .lock()
                         .unwrap()
-                        .discard_to_zero(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
+                        .discard_to_zero(offset, length)
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
                     self.disk
                         .file
                         .lock()
                         .unwrap()
-                        .write_zeroes(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
+                        .write_zeroes(offset, length)
                         .map_err(RequestError::WritingZeroes)?;
                 }
                 Ok(0)
             }
             _ => Err(RequestError::UnknownRequest),
         }
+    }
+
+    /// Read a DISCARD / WRITE_ZEROES segment, returning its byte range and flags.
+    ///
+    /// Fails if the range does not lie entirely within the disk.
+    fn read_discard_range(
+        &self,
+        reader: &mut Reader,
+    ) -> result::Result<((u64, u64), u32), RequestError> {
+        let data: DiscardWriteData = reader
+            .read_obj()
+            .map_err(RequestError::ReadingFromDescriptor)?;
+        let range = discard_byte_range(data.sector, data.num_sectors, self.disk.nsectors())?;
+        Ok((range, data.flags))
+    }
+}
+
+/// Byte range of a DISCARD / WRITE_ZEROES segment on a disk of `disk_sectors` sectors.
+///
+/// Both values come from the guest. Discards may punch holes into the image file, so a range
+/// past the end of the disk, or one whose byte offset would overflow and wrap around to the
+/// start of the disk, must be rejected rather than executed.
+fn discard_byte_range(
+    sector: u64,
+    num_sectors: u32,
+    disk_sectors: u64,
+) -> result::Result<(u64, u64), RequestError> {
+    match sector.checked_add(num_sectors as u64) {
+        Some(end) if end <= disk_sectors => Ok((sector * 512, num_sectors as u64 * 512)),
+        _ => Err(RequestError::InvalidRange),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DISK_SECTORS: u64 = 2048;
+
+    #[test]
+    fn discard_range_within_disk_is_converted_to_bytes() {
+        assert!(matches!(
+            discard_byte_range(8, 16, DISK_SECTORS),
+            Ok((4096, 8192))
+        ));
+        assert!(matches!(
+            discard_byte_range(DISK_SECTORS - 16, 16, DISK_SECTORS),
+            Ok((_, 8192))
+        ));
+    }
+
+    #[test]
+    fn discard_range_past_disk_end_is_rejected() {
+        assert!(matches!(
+            discard_byte_range(DISK_SECTORS - 8, 16, DISK_SECTORS),
+            Err(RequestError::InvalidRange)
+        ));
+    }
+
+    #[test]
+    fn discard_range_that_would_wrap_to_disk_start_is_rejected() {
+        // sector * 512 wraps around to byte offset 0
+        assert!(matches!(
+            discard_byte_range(1 << 55, 1, DISK_SECTORS),
+            Err(RequestError::InvalidRange)
+        ));
+        assert!(matches!(
+            discard_byte_range(u64::MAX, 1, DISK_SECTORS),
+            Err(RequestError::InvalidRange)
+        ));
     }
 }
