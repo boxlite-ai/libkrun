@@ -16,6 +16,8 @@ extern crate log;
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub(crate) mod ram_snapshot;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.
@@ -209,9 +211,35 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    ram_snapshot_topology: ram_snapshot::Topology,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    ram_snapshot_control: ram_snapshot::Control,
 }
 
 impl Vmm {
+    /// Save only ordinary RAM after the stage-1 no-writer topology check.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    pub(crate) fn save_ram_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), ram_snapshot::Error> {
+        self.mmio_device_manager.check_ram_snapshot()?;
+        if !self.exit_observers.is_empty() {
+            return Err(ram_snapshot::Error::Invalid(
+                "background device observers have no freeze contract",
+            ));
+        }
+        let kvm = vstate::KvmContext::new().map_err(ram_snapshot::Error::State)?;
+        self.ram_snapshot_control.save(
+            path,
+            &self.guest_memory,
+            &self.ram_snapshot_topology,
+            &self.vcpus_handles,
+            kvm.max_memslots(),
+        )
+    }
+
     /// Gets the the specified bus device.
     pub fn get_bus_device(
         &self,

@@ -946,6 +946,10 @@ pub fn build_microvm(
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
     let mut vmm = Vmm {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        ram_snapshot_topology: ram_snapshot_topology(vm_resources, &payload, &_shm_manager),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        ram_snapshot_control: crate::ram_snapshot::Control::default(),
         guest_memory,
         arch_memory_info,
         kernel_cmdline,
@@ -1420,6 +1424,48 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+fn ram_snapshot_topology(
+    resources: &VmResources,
+    payload: &Payload,
+    shm: &ShmManager,
+) -> crate::ram_snapshot::Topology {
+    let kernel = if matches!(payload, Payload::KernelMmap) {
+        resources
+            .kernel_bundle
+            .as_ref()
+            .map(|kernel| crate::ram_snapshot::KernelMapping {
+                gpa: kernel.guest_addr,
+                len: kernel.size as u64,
+                host: kernel.host_addr as usize,
+            })
+    } else {
+        None
+    };
+    crate::ram_snapshot::Topology {
+        kernel,
+        shared: shm
+            .regions()
+            .into_iter()
+            .map(|(guest_addr, size)| crate::device_manager::shm::ShmRegion { guest_addr, size })
+            .collect(),
+    }
+}
+
+/// Construct a controlled device-free RAM VM, independently of the normal boot recipe.
+/// No virtio/legacy devices, event subscribers or workers are constructed here.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub(crate) fn build_ram_snapshot_vm(
+    mem_size_mib: usize,
+    resources: &VmResources,
+    payload: &Payload,
+) -> std::result::Result<crate::ram_snapshot::RamSnapshotVm, StartMicrovmError> {
+    let (memory, _, shm, _) = create_guest_memory(mem_size_mib, resources, payload)?;
+    let topology = ram_snapshot_topology(resources, payload, &shm);
+    crate::ram_snapshot::RamSnapshotVm::from_memory(memory, topology)
+        .map_err(|e| StartMicrovmError::GuestMemoryMmap(e.to_string()))
 }
 
 pub fn create_guest_memory(
