@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::{ActivateResult, InterruptTransport, Queue};
+use super::{ActivateError, ActivateResult, InterruptTransport, Queue};
 use crate::virtio::AsAny;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
@@ -150,6 +150,21 @@ pub trait VirtioDevice: AsAny + Send {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult;
+
+    /// Performs activation for a device restored from a snapshot.
+    ///
+    /// Identical contract to `activate`, except background workers start
+    /// frozen so the owner can confirm the restored cut before resuming
+    /// queue processing. Devices without snapshot support must fail instead
+    /// of silently starting live workers.
+    fn activate_frozen(
+        &mut self,
+        _mem: GuestMemoryMmap,
+        _interrupt: InterruptTransport,
+        _queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        Err(ActivateError::BadActivate)
+    }
 
     /// Checks if the resources of this device are activated.
     fn is_activated(&self) -> bool;

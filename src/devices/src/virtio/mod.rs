@@ -29,6 +29,7 @@ pub mod gpu;
 pub mod input;
 pub mod linux_errno;
 mod mmio;
+pub mod persist;
 #[cfg(feature = "net")]
 pub mod net;
 mod queue;

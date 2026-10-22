@@ -348,7 +348,7 @@ pub struct Queue {
 
     /// The number of descriptor chains placed in the used ring via `add_used`
     /// since the last time `needs_notification` was called on the associated queue.
-    num_added: Wrapping<u16>,
+    pub(crate) num_added: Wrapping<u16>,
 }
 
 impl Queue {
@@ -581,6 +581,10 @@ impl Queue {
 
     pub fn set_event_idx(&mut self, enabled: bool) {
         self.event_idx_enabled = enabled;
+    }
+
+    pub fn is_event_idx_enabled(&self) -> bool {
+        self.event_idx_enabled
     }
 
     // Set the value of the `flags` field of the used ring, applying the specified ordering.

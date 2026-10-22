@@ -23,6 +23,9 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
 mod full;
 
+#[cfg(feature = "blk")]
+pub(crate) mod blk;
+
 #[derive(Debug)]
 pub(crate) enum Error {
     Io(io::Error),
@@ -389,7 +392,7 @@ impl Control {
     }
 }
 
-/// Owns a device-free VM. No mapping, VM fd, or vCPU handle escapes this owner.
+/// Owns the minimal VM. No mapping, VM fd, or vCPU handle escapes this owner.
 pub(crate) struct RamSnapshotVm {
     handles: Vec<VcpuHandle>,
     vm: Vm,
@@ -399,6 +402,12 @@ pub(crate) struct RamSnapshotVm {
     max_slots: usize,
     irqchip_ready: bool,
     paused: bool,
+    #[cfg(feature = "blk")]
+    bus: devices::Bus,
+    #[cfg(feature = "blk")]
+    disks: Vec<blk::BlkDevice>,
+    #[cfg(feature = "blk")]
+    imported: Option<blk::ImportedDir>,
 }
 
 impl RamSnapshotVm {
@@ -423,6 +432,12 @@ impl RamSnapshotVm {
             max_slots: kvm.max_memslots(),
             irqchip_ready: false,
             paused: true,
+            #[cfg(feature = "blk")]
+            bus: devices::Bus::new(),
+            #[cfg(feature = "blk")]
+            disks: Vec::new(),
+            #[cfg(feature = "blk")]
+            imported: None,
         })
     }
 
@@ -439,6 +454,12 @@ impl RamSnapshotVm {
                 "RAM save would resume a restored paused full VM",
             ));
         }
+        #[cfg(feature = "blk")]
+        if !self.disks.is_empty() {
+            return Err(Error::Invalid(
+                "RAM-only save is not a consistent cut for attached disks; use save_full",
+            ));
+        }
         self.control.save(
             path,
             &self.memory,
@@ -446,6 +467,53 @@ impl RamSnapshotVm {
             &self.handles,
             self.max_slots,
         )
+    }
+
+    /// Attach an internal disk (RAW/QCOW2/VMDK file) before vCPUs start.
+    #[cfg(feature = "blk")]
+    pub(crate) fn attach_disk(
+        &mut self,
+        path: &Path,
+        format: devices::virtio::block::ImageType,
+        read_only: bool,
+        writeback: bool,
+    ) -> Result<()> {
+        blk::attach_disk(self, path, format, read_only, writeback)
+    }
+
+    /// The stage-2 RAM alias probe, parameterized by the clones the owner's
+    /// own devices legitimately hold (transport plus, once activated, the
+    /// device state and the worker). External aliases always fail.
+    #[cfg(feature = "blk")]
+    pub(super) fn probe_ram_aliases(&self, expected_device_clones: usize) -> Result<()> {
+        for region in self.memory.iter() {
+            // remove_region returns a cloned collection plus the removed Arc;
+            // exactly two references means only this owner and this probe
+            // hold it, plus every clone the owner's own devices hold.
+            let (_remaining, mapping) = self
+                .memory
+                .remove_region(region.start_addr(), region.len())
+                .map_err(|e| Error::Full(format!("inspect RAM ownership: {e}")))?;
+            if std::sync::Arc::strong_count(&mapping) != 2 + expected_device_clones {
+                return Err(Error::Invalid(
+                    "full snapshot RAM has external aliases/writers",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the kernel irqchip/PIT once; later callers get the empty
+    /// userspace stub that only writes the interrupt eventfd.
+    #[cfg(feature = "blk")]
+    pub(super) fn ensure_kernel_irqchip(
+        &mut self,
+    ) -> Result<devices::legacy::KvmIoapic> {
+        if self.irqchip_ready {
+            return Ok(devices::legacy::KvmIoapic {});
+        }
+        self.setup_irqchip()?;
+        Ok(devices::legacy::KvmIoapic {})
     }
 
     /// Start a controlled real-mode RAM program, without boot loaders or devices.
@@ -473,6 +541,11 @@ impl RamSnapshotVm {
                     exit_evt,
                 )
                 .map_err(Error::State)?;
+                // The devices live on the MMIO bus, not the port-I/O bus;
+                // a Bus clone snapshots the device map, so the disks must
+                // already be attached here.
+                #[cfg(feature = "blk")]
+                cpu.set_mmio_bus(self.bus.clone());
                 cpu.configure_minimal(entry, count).map_err(Error::State)?;
                 self.handles
                     .push(cpu.start_threaded().map_err(Error::State)?);
@@ -494,11 +567,17 @@ impl RamSnapshotVm {
 
 impl Drop for RamSnapshotVm {
     fn drop(&mut self) {
-        // Joining is mandatory: a vCPU fd itself retains the KVM VM. Never free
-        // its registered host mappings while a thread can still enter KVM_RUN.
+        // vCPUs join first: a running CPU could otherwise still touch the
+        // devices while they stop. Workers join next; they hold guest RAM
+        // and the disk images. The imported guard removes only the files it
+        // created, after every thread has exited.
         for handle in &mut self.handles {
             handle.finish();
         }
+        #[cfg(feature = "blk")]
+        blk::stop_devices(self);
+        #[cfg(feature = "blk")]
+        drop(self.imported.take());
     }
 }
 

@@ -256,21 +256,24 @@ LD_LIBRARY_PATH=/usr/local/lib64 ./chroot_vm rootfs_fedora/ /bin/sh
 ## Internal minimal VM checkpoints (experimental)
 
 The private Linux x86_64/KVM `RamSnapshotVm` harness supports `save_full`,
-`restore_full` and explicit `resume` for ordinary RAM with a kernel irqchip/PIT
-and no userspace devices or background RAM writers. The harness supports
+`restore_full` and explicit `resume` for ordinary RAM with a kernel irqchip/PIT.
+Its base configuration is device-free (no userspace devices; uncontrolled
+background RAM writers are rejected); the optional `blk` feature described
+below adds internal block devices. The harness supports
 1–128 vCPUs, subject to the host KVM capacity and the existing
 CPUID package-sizing limit. Saved CPU ordering and topology must match this count.
 Restore returns paused; it does not reload a payload, write boot parameters, or
 initialize new guest CPUs.
 The existing RAM-only image and APIs retain their memory-only meaning.
 
-Full images use independent version 1 magic `KRUNVM\0\0`, a bounded 16 MiB JSON
-state section, and RAM copied in 64 KiB chunks into independent anonymous mappings.
-Files are created exclusively with mode 0600 and become valid only after all source
-vCPUs resume successfully. Errors attempt every source resume; uncertain control
-disables subsequent checkpoints. Partial imports stop and join created threads
-before releasing VM/RAM. External RAM aliases, TEE, nested virtualization, split
-irqchips, PMU/SMM and uncovered extended CPU states are unsupported.
+Device-free full images use independent version 1 magic `KRUNVM\0\0`, a bounded
+16 MiB JSON state section, and RAM copied in 64 KiB chunks into independent
+anonymous mappings. Files are created exclusively with mode 0600 and become
+valid only after all source vCPUs resume successfully. Errors attempt every
+source resume; uncertain control disables subsequent checkpoints. Partial
+imports stop and join created threads before releasing VM/RAM. External RAM
+aliases, TEE, nested virtualization, split irqchips, PMU/SMM and uncovered
+extended CPU states are unsupported.
 
 Compatibility is deliberately conservative: the supported CPU vendor/features,
 MSR set, XSAVE layout/size and required KVM capabilities must match; actual saved
@@ -284,8 +287,68 @@ TSC deadline becomes the saved TSC in the image only, with no per-tick replay.
 Clock restore uses `clock_realtime=false` and adds no snapshot storage wall time;
 pausing a source vCPU does not stop its hardware clocks. TSC frequency differences
 above 250 ppm require successful scaling. Multi-vCPU restore requires successful
-vCPU0-based TSC offset synchronization before VM clock restore. Future device
-support must drain/save device state before CPU/KVM/RAM capture.
+vCPU0-based TSC offset synchronization before VM clock restore. The `blk` path
+below already freezes/drains and saves its device state before CPU/KVM/RAM
+capture; additional device types remain future work.
+
+### Internal block-device checkpoints (stage 3, feature `blk`)
+
+With the `blk` cargo feature, the same private owner additionally supports
+`attach_disk` (before vCPUs start) for ordinary RAW/QCOW2/VMDK files through
+the existing imago backends, plus disk-bearing version-2 full images. Caller
+precondition: the source disk file and every backing file in its chain must
+have no writers outside this private owner for the lifetime of the
+attachment — the consistent cut assumes sole ownership; no lock or lease is
+taken. The internal device topology is fixed: at most eight disks, MMIO
+slots at 0xd0000000 in 4 KiB steps, kernel-irqchip GSIs 16–23; GSI 0–15 stay
+reserved for legacy devices.
+
+Version-2 images keep the same header layout and add an ordered disk table to
+the bounded JSON section, followed after the RAM payload by one raw segment
+per disk: the frozen guest-visible logical capacity with QCOW2/VMDK backing
+chains and readonly disks normalized into plain bytes. `save_full` keeps its
+single-file contract; version-1 images stay device-free. `restore_full`
+rejects version 2 explicitly; `restore_full_with_disks(path, destination)`
+imports the segments into a new 0700 destination directory of exclusive 0600
+`disk-N.raw` files, never taking paths from metadata, and the owner deletes
+the imported directory on partial failure and destruction.
+
+The save order is: configuration checks -> pause/ack all vCPUs -> freeze and
+flush every device (controls are checked before popping each descriptor, so a
+freeze lands between individual requests after the status write, used-ring
+update and interrupt; the single frozen flag and scoped mapping clones
+guarantee no ring write — including notification re-enables — after the
+confirmation; the disk is flushed and synced regardless of the guest cache
+mode, inactive disks included; the bounded command queue is part of the 30 s
+control timeout, which is never an I/O cancellation) -> the RAM alias probe
+at that quiescent boundary, counting only the clones of the owner's own
+devices -> per-device synchronous KVM irqfd deassign (Linux flushes the
+injection workqueue before the ioctl returns) and eventfd drain -> device
+(active rings validated against guest RAM), CPU, KVM, RAM and disk capture ->
+file sync -> irqfd reassign, device resume and CPU resume, each attempted for
+every resource and aggregated (any failure poisons the owner and never
+publishes) -> valid magic. Restores validate all metadata — including the
+exact offered-feature contract and read-only consistency — before creating
+anything, then the active rings against the loaded RAM, then import through
+an exclusive creation guard: a pre-existing destination directory is an error
+and is never touched; on any failure or owner drop, only the files the import
+itself created are removed, after every CPU and worker thread joined.
+Restored devices rebuild MMIO/ioeventfd/irqfd from the saved address and IRQ
+with new eventfds; already-injected interrupts come back with the kernel
+irqchip state, and transport interrupt status is restored without
+reinjecting. Restored active workers start frozen; explicit `resume` resumes
+devices first (actively re-examining their queues so drained notification
+counts cannot hang) and then the CPUs; an incomplete resume joins all CPUs
+and workers before returning the error. Reusable virtio queue/device/
+transport state (adapted from Firecracker's virtio persist structures)
+preserves every guest-writable selector verbatim and validates ring
+alignment/ranges and cursor consistency against guest RAM, including u16
+wrapping; inactive partially negotiated queues keep their not-ready
+configuration.
+
+This remains an internal closed loop for the minimal VM: no full BoxLite box
+restore, no virtio-fs/net/vsock/console support, and no runtime validation
+has been run for the block path.
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 
@@ -297,12 +360,23 @@ make snapshot-test SNAPSHOT_CARGO_FLAGS='--offline --no-run'
 make snapshot-test
 ```
 
-The default target is `x86_64-unknown-linux-gnu`; use `SNAPSHOT_TARGET` to override.
-Cross builds require matching native C libraries, linker and `CC_LINUX` settings
-(pass `CC_LINUX` on the make command line on macOS). `snapshot-guest` regenerates
-the real-mode test fixture using GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; timer tests
-use x2APIC MSRs. Linux checks/build were attempted from macOS; KVM execution is
-unverified until run on a compatible local Linux KVM host.
+The snapshot targets enable the `blk` feature and run the `krun-devices`
+virtio/block tests selected by the `snapshot` name filter alongside the
+krun-vmm suite. The default target is `x86_64-unknown-linux-gnu`; use
+`SNAPSHOT_TARGET` to override. Cross builds require matching native C
+libraries, linker and `CC_LINUX` settings (pass `CC_LINUX` on the make command
+line on macOS). `snapshot-guest` regenerates the real-mode timer fixture using
+GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; the block guest is emitted by an
+annotated byte emitter inside the stage-3 tests (a 16-bit-code unreal-mode
+segment setup with an exact GDT layout, virtio queue with header/data/
+status chains, IOAPIC/x2APIC interrupts, and a barrier that clears IF
+before the selected request is submitted and proves the pending interrupt
+was delivered after the restore through a dedicated post-STI marker) and
+must not be regenerated externally. Worker freeze boundaries are covered by
+one-shot, panic-safe request gates keyed per worker queue eventfd, so
+unrelated workers and tests never interfere. All stage-3 checks, builds,
+tests and KVM execution are **UNVERIFIED**: only source was written on
+macOS without running cargo, make targets, formatters or tests.
 
 ## Status
 

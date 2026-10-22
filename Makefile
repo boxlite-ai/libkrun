@@ -88,24 +88,26 @@ endif
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 
 # Internal minimal-VM snapshot checks; callers supply cross C/linker settings.
+# The blk feature enables the virtio-blk snapshot code and its device tests.
 SNAPSHOT_TARGET ?= x86_64-unknown-linux-gnu
 SNAPSHOT_FILTER ?= snapshot
 SNAPSHOT_CARGO_FLAGS ?= --offline
 SNAPSHOT_AS ?= as
 SNAPSHOT_OBJCOPY ?= objcopy
 SNAPSHOT_GUEST = src/vmm/src/ram_snapshot/full/guest
+SNAPSHOT_PKGS = -p krun-vmm --features blk -p krun-devices --features blk
 .PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-guest
 snapshot-fmt:
-	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs
+	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs
 
 snapshot-check:
-	cargo check $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --tests --target $(SNAPSHOT_TARGET)
+	cargo check $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --tests --target $(SNAPSHOT_TARGET)
 
 snapshot-build:
-	cargo build $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --target $(SNAPSHOT_TARGET)
+	cargo build $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --features blk --target $(SNAPSHOT_TARGET)
 
 snapshot-test:
-	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --target $(SNAPSHOT_TARGET) $(SNAPSHOT_FILTER) -- --test-threads=1
+	cargo test $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --target $(SNAPSHOT_TARGET) $(SNAPSHOT_FILTER) -- --test-threads=1
 
 snapshot-guest:
 	$(SNAPSHOT_AS) --32 $(SNAPSHOT_GUEST).S -o $(SNAPSHOT_GUEST).o

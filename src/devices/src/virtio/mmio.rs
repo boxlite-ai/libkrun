@@ -14,6 +14,7 @@ use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 use super::device_status;
+use super::persist;
 use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
@@ -236,6 +237,74 @@ impl MmioTransport {
     /// queue notifications with KVM.
     pub fn queue_evts(&self) -> &[Arc<EventFd>] {
         &self.queue_evts
+    }
+
+    /// Save the transport-owned negotiation registers and interrupt status.
+    ///
+    /// Callers must have frozen the device and drained its irqfd first:
+    /// interrupt status is only stable once no worker can signal it.
+    pub fn save_transport_state(&self) -> persist::MmioTransportState {
+        persist::MmioTransportState {
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            shm_region_select: self.shm_region_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst) as u32,
+        }
+    }
+
+    /// Queue state held by the transport; empty once the device owns the queues.
+    pub fn queue_states(&self) -> Vec<persist::QueueState> {
+        match &self.queues {
+            Some(queues) => queues.iter().map(persist::QueueState::from_queue).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Restore negotiation registers and transport-owned queues.
+    ///
+    /// The device must not be activated: active queues are handed over
+    /// through `activate_restored`, never recreated from `queue_config`.
+    pub fn restore_transport_state(
+        &mut self,
+        state: &persist::MmioTransportState,
+        queues: Vec<Queue>,
+    ) {
+        self.features_select = state.features_select;
+        self.acked_features_select = state.acked_features_select;
+        self.queue_select = state.queue_select;
+        self.shm_region_select = state.shm_region_select;
+        self.device_status = state.device_status;
+        self.config_generation = state.config_generation;
+        self.interrupt
+            .status()
+            .store(state.interrupt_status as usize, Ordering::SeqCst);
+        self.queues = Some(queues);
+    }
+
+    /// Activate the device from a restored (validated) queue set without
+    /// guest renegotiation or queue reset. Device workers start frozen.
+    pub fn activate_restored(&mut self) -> ActivateResult {
+        let Some(queues) = self.queues.take() else {
+            error!("cannot restore-activate without restored queues");
+            return Err(ActivateError::BadActivate);
+        };
+
+        let mut device_queues: Vec<DeviceQueue> = queues
+            .into_iter()
+            .zip(self.queue_evts.iter().cloned())
+            .map(|(queue, event)| DeviceQueue::new(queue, event))
+            .collect();
+
+        let mut locked_device = self.locked_device();
+        let event_idx_enabled =
+            (locked_device.acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+        for dq in &mut device_queues {
+            dq.queue.set_event_idx(event_idx_enabled);
+        }
+        locked_device.activate_frozen(self.mem.clone(), self.interrupt.clone(), device_queues)
     }
 
     fn check_device_status(&self, set: u32, clr: u32) -> bool {
@@ -1053,5 +1122,63 @@ pub(crate) mod tests {
         dummy_dev.set_avail_features(8);
         dummy_dev.ack_features_by_page(0, 8);
         assert_eq!(dummy_dev.acked_features(), 24);
+    }
+
+    #[test]
+    fn test_transport_snapshot_state_roundtrip() {
+        // Negotiate partially: selectors, queue fields and interrupt status
+        // must survive a save/restore without renegotiation or reset.
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut source = MmioTransport::new(
+            m.clone(),
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        source.queue_select = 1;
+        source.features_select = 1;
+        source.acked_features_select = 1;
+        source.shm_region_select = 2;
+        source.device_status = device_status::ACKNOWLEDGE | device_status::DRIVER;
+        source.config_generation = 7;
+        assert!(source.with_queue_mut(|q| q.size = 32));
+        assert!(source.with_queue_mut(|q| q.desc_table = GuestAddress(0x800)));
+        source
+            .interrupt
+            .status()
+            .store(0b11, Ordering::SeqCst);
+
+        let state = source.save_transport_state();
+        state.validate().unwrap();
+        assert_eq!(state.queue_select, 1);
+        assert_eq!(state.shm_region_select, 2);
+        assert_eq!(state.device_status, 0b11);
+        assert_eq!(state.config_generation, 7);
+        assert_eq!(state.interrupt_status, 0b11);
+        let queue_states = source.queue_states();
+        assert_eq!(queue_states.len(), 2);
+        assert_eq!(queue_states[1].size, 32);
+        assert_eq!(queue_states[1].desc_table, 0x800);
+        assert!(!queue_states[1].event_idx_enabled);
+
+        let mut restored = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        restored.restore_transport_state(
+            &state,
+            queue_states.iter().map(|q| q.to_queue()).collect(),
+        );
+        assert_eq!(restored.save_transport_state(), state);
+        assert_eq!(restored.queue_states(), queue_states);
+        // The restored interrupt status is visible through MMIO reads and
+        // was NOT reinjected through the interrupt eventfd.
+        let mut buf = [0; 4];
+        restored.read(0, 0x60, &mut buf);
+        assert_eq!(read_le_u32(&buf), 0b11);
+        // Restoring again must not activate anything implicitly.
+        assert!(!restored.locked_device().is_activated());
     }
 }
