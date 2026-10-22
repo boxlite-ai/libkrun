@@ -253,6 +253,57 @@ To avoid this problem, use the ```LD_LIBRARY_PATH``` environment variable to poi
 LD_LIBRARY_PATH=/usr/local/lib64 ./chroot_vm rootfs_fedora/ /bin/sh
 ```
 
+## Internal minimal VM checkpoints (experimental)
+
+The private Linux x86_64/KVM `RamSnapshotVm` harness supports `save_full`,
+`restore_full` and explicit `resume` for ordinary RAM with a kernel irqchip/PIT
+and no userspace devices or background RAM writers. The harness supports
+1–128 vCPUs, subject to the host KVM capacity and the existing
+CPUID package-sizing limit. Saved CPU ordering and topology must match this count.
+Restore returns paused; it does not reload a payload, write boot parameters, or
+initialize new guest CPUs.
+The existing RAM-only image and APIs retain their memory-only meaning.
+
+Full images use independent version 1 magic `KRUNVM\0\0`, a bounded 16 MiB JSON
+state section, and RAM copied in 64 KiB chunks into independent anonymous mappings.
+Files are created exclusively with mode 0600 and become valid only after all source
+vCPUs resume successfully. Errors attempt every source resume; uncertain control
+disables subsequent checkpoints. Partial imports stop and join created threads
+before releasing VM/RAM. External RAM aliases, TEE, nested virtualization, split
+irqchips, PMU/SMM and uncovered extended CPU states are unsupported.
+
+Compatibility is deliberately conservative: the supported CPU vendor/features,
+MSR set, XSAVE layout/size and required KVM capabilities must match; actual saved
+CPUID must fit the target. Dynamic XSAVE uses the current dependencies without
+truncating ioctl buffers. Fixed KVM records require exact serialized byte lengths,
+because kvm-bindings 0.12 otherwise zero-pads short records. MSRs use bounded
+chunks, check partial transfers, and restore TSC deadline after all other MSRs.
+
+Timer handling follows Firecracker's runtime migration semantics: a saved zero
+TSC deadline becomes the saved TSC in the image only, with no per-tick replay.
+Clock restore uses `clock_realtime=false` and adds no snapshot storage wall time;
+pausing a source vCPU does not stop its hardware clocks. TSC frequency differences
+above 250 ppm require successful scaling. Multi-vCPU restore requires successful
+vCPU0-based TSC offset synchronization before VM clock restore. Future device
+support must drain/save device state before CPU/KVM/RAM capture.
+
+Local contributor checks (no public ABI or SDK entry point is provided):
+
+```sh
+make snapshot-fmt
+make snapshot-check
+make snapshot-build
+make snapshot-test SNAPSHOT_CARGO_FLAGS='--offline --no-run'
+make snapshot-test
+```
+
+The default target is `x86_64-unknown-linux-gnu`; use `SNAPSHOT_TARGET` to override.
+Cross builds require matching native C libraries, linker and `CC_LINUX` settings
+(pass `CC_LINUX` on the make command line on macOS). `snapshot-guest` regenerates
+the real-mode test fixture using GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; timer tests
+use x2APIC MSRs. Linux checks/build were attempted from macOS; KVM execution is
+unverified until run on a compatible local Linux KVM host.
+
 ## Status
 
 ```libkrun``` has achieved maturity and starting version ```1.0.0``` the public API is guaranteed to be stable, following [SemVer](https://semver.org/).

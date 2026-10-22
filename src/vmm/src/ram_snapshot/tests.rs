@@ -11,6 +11,18 @@ thread_local! {
     static COPY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+pub(super) fn with_failed_payload_write<T>(bytes: usize, operation: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COPY_WRITE_LIMIT.with(|limit| limit.set(None));
+        }
+    }
+    COPY_WRITE_LIMIT.with(|limit| limit.set(Some(bytes)));
+    let _reset = Reset;
+    operation()
+}
+
 // Per-test-thread fault injection at the real payload File write, without
 // changing process resource limits or substituting the RAM copy implementation.
 pub(super) fn write_payload(file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -238,7 +250,7 @@ fn normal(event: VcpuEvent, responses: &Sender<VcpuResponse>) {
         .send(match event {
             VcpuEvent::Pause => VcpuResponse::Paused,
             VcpuEvent::Resume => VcpuResponse::Resumed,
-            VcpuEvent::Finish => unreachable!(),
+            VcpuEvent::Finish | VcpuEvent::Snapshot(_) => unreachable!(),
         })
         .unwrap();
 }
@@ -418,7 +430,7 @@ fn timeout_late_pause_and_exit_latch_controller_and_resume_all() {
                             }
                             responses.send(VcpuResponse::Resumed).unwrap();
                         }
-                        VcpuEvent::Finish => unreachable!(),
+                        VcpuEvent::Finish | VcpuEvent::Snapshot(_) => unreachable!(),
                     }
                 }),
                 cpu(move |event, responses| {
@@ -701,6 +713,7 @@ fn minimal_builder_has_a_reachable_no_device_save_path() {
 fn partial_cpu_start_joins_created_threads_and_disables_snapshots() {
     let dir = TempDir::new();
     let mut owner = RamSnapshotVm::from_memory(memory(), Topology::default()).unwrap();
+    owner.setup_irqchip().unwrap();
     // Occupy ID 1 so startup fails AFTER ID 0's real thread was created.
     let occupied = Vcpu::new_x86_64(
         1,
@@ -717,6 +730,17 @@ fn partial_cpu_start_joins_created_threads_and_disables_snapshots() {
     assert!(owner.save(&dir.path()).is_err());
     assert!(!dir.path().exists());
     drop(occupied);
+}
+
+#[test]
+fn minimal_cpu_count_rejects_zero_and_cpuid_overflow_before_creating_threads() {
+    let mut owner = RamSnapshotVm::from_memory(memory(), Topology::default()).unwrap();
+    for count in [0, 129, 255] {
+        assert!(owner.start_vcpus(count, 0).is_err());
+        assert!(owner.handles.is_empty());
+        assert!(!owner.control.unusable);
+        assert!(!owner.irqchip_ready);
+    }
 }
 
 #[test]

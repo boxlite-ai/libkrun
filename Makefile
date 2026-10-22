@@ -87,6 +87,31 @@ endif
 
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 
+# Internal minimal-VM snapshot checks; callers supply cross C/linker settings.
+SNAPSHOT_TARGET ?= x86_64-unknown-linux-gnu
+SNAPSHOT_FILTER ?= snapshot
+SNAPSHOT_CARGO_FLAGS ?= --offline
+SNAPSHOT_AS ?= as
+SNAPSHOT_OBJCOPY ?= objcopy
+SNAPSHOT_GUEST = src/vmm/src/ram_snapshot/full/guest
+.PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-guest
+snapshot-fmt:
+	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs
+
+snapshot-check:
+	cargo check $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --tests --target $(SNAPSHOT_TARGET)
+
+snapshot-build:
+	cargo build $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --target $(SNAPSHOT_TARGET)
+
+snapshot-test:
+	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-vmm --target $(SNAPSHOT_TARGET) $(SNAPSHOT_FILTER) -- --test-threads=1
+
+snapshot-guest:
+	$(SNAPSHOT_AS) --32 $(SNAPSHOT_GUEST).S -o $(SNAPSHOT_GUEST).o
+	$(SNAPSHOT_OBJCOPY) -O binary -j .text $(SNAPSHOT_GUEST).o $(SNAPSHOT_GUEST).bin
+	rm $(SNAPSHOT_GUEST).o
+
 debug: $(LIBRARY_DEBUG_$(OS)) libkrun.pc
 
 ifeq ($(OS),Darwin)

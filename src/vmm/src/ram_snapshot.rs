@@ -21,11 +21,14 @@ const PAGE_SIZE: u64 = 4096;
 const CHUNK_SIZE: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
+mod full;
+
 #[derive(Debug)]
 pub(crate) enum Error {
     Io(io::Error),
     Invalid(&'static str),
     Control(Vec<String>),
+    Full(String),
     State(crate::vstate::Error),
     Mapping(vm_memory::mmap::FromRangesError),
     Memory(vm_memory::GuestMemoryError),
@@ -41,6 +44,7 @@ impl std::fmt::Display for Error {
             Self::Io(e) => write!(f, "RAM snapshot I/O: {e}"),
             Self::Invalid(reason) => write!(f, "RAM snapshot: {reason}"),
             Self::Control(errors) => write!(f, "RAM snapshot vCPU control: {}", errors.join("; ")),
+            Self::Full(reason) => write!(f, "full snapshot: {reason}"),
             Self::State(e) => write!(f, "RAM snapshot KVM: {e}"),
             Self::Mapping(e) => write!(f, "RAM snapshot mapping allocation: {e}"),
             Self::Memory(e) => write!(f, "RAM snapshot memory access: {e}"),
@@ -115,7 +119,8 @@ impl Topology {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Region {
     gpa: u64,
     len: u64,
@@ -392,6 +397,8 @@ pub(crate) struct RamSnapshotVm {
     topology: Topology,
     control: Control,
     max_slots: usize,
+    irqchip_ready: bool,
+    paused: bool,
 }
 
 impl RamSnapshotVm {
@@ -414,6 +421,8 @@ impl RamSnapshotVm {
             topology,
             control: Control::default(),
             max_slots: kvm.max_memslots(),
+            irqchip_ready: false,
+            paused: true,
         })
     }
 
@@ -425,6 +434,11 @@ impl RamSnapshotVm {
     }
 
     pub(crate) fn save(&mut self, path: &Path) -> Result<()> {
+        if self.paused && !self.handles.is_empty() {
+            return Err(Error::Invalid(
+                "RAM save would resume a restored paused full VM",
+            ));
+        }
         self.control.save(
             path,
             &self.memory,
@@ -437,12 +451,17 @@ impl RamSnapshotVm {
     /// Start a controlled real-mode RAM program, without boot loaders or devices.
     /// This initializes CPUs; it does not restore CPU state from a RAM image.
     pub(crate) fn start_vcpus(&mut self, count: u8, entry: u16) -> Result<()> {
-        if self.control.unusable || count == 0 || !self.handles.is_empty() {
+        if self.control.unusable
+            || count == 0
+            || count as usize > crate::vstate::snapshot::MAX_CPUS
+            || !self.handles.is_empty()
+        {
             return Err(Error::Invalid("invalid minimal vCPU count/state"));
         }
         self.control.unusable = true;
         Vcpu::register_kick_signal_handler();
         let result = (|| {
+            self.setup_irqchip()?;
             for id in 0..count {
                 let exit_evt = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)?;
                 let mut cpu = Vcpu::new_x86_64(
@@ -454,7 +473,7 @@ impl RamSnapshotVm {
                     exit_evt,
                 )
                 .map_err(Error::State)?;
-                cpu.configure_minimal(entry).map_err(Error::State)?;
+                cpu.configure_minimal(entry, count).map_err(Error::State)?;
                 self.handles
                     .push(cpu.start_threaded().map_err(Error::State)?);
             }
@@ -467,6 +486,7 @@ impl RamSnapshotVm {
             self.handles.clear();
         } else {
             self.control.unusable = false;
+            self.paused = false;
         }
         result
     }

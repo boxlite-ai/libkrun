@@ -42,10 +42,8 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    kvm_clock_data, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state, kvm_pit_state2,
-    kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, MsrList, Msrs,
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES,
+    kvm_clock_data, kvm_irqchip, kvm_pit_state2, kvm_regs, CpuId, MsrList, KVM_CLOCK_TSC_STABLE,
+    KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES,
 };
 use kvm_bindings::{
     kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
@@ -68,6 +66,9 @@ use vm_memory::{
 
 #[cfg(feature = "amd-sev")]
 use super::tee::amdsnp::launch as snp;
+
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+pub(crate) mod snapshot;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
@@ -882,7 +883,6 @@ impl Vm {
         self.fd
             .set_pit2(&state.pitstate)
             .map_err(Error::VmSetPit2)?;
-        self.fd.set_clock(&state.clock).map_err(Error::VmSetClock)?;
         self.fd
             .set_irqchip(&state.pic_master)
             .map_err(Error::VmSetIrqChip)?;
@@ -892,6 +892,10 @@ impl Vm {
         self.fd
             .set_irqchip(&state.ioapic)
             .map_err(Error::VmSetIrqChip)?;
+        // clock_realtime=false: do not add elapsed wall time or rebase offsets.
+        let mut clock = state.clock;
+        clock.flags = 0;
+        self.fd.set_clock(&clock).map_err(Error::VmSetClock)?;
         Ok(())
     }
 }
@@ -899,11 +903,18 @@ impl Vm {
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
 /// Structure holding VM kvm state.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmState {
+    #[cfg_attr(not(feature = "tee"), serde(with = "snapshot::strict"))]
     pitstate: kvm_pit_state2,
+    #[cfg_attr(not(feature = "tee"), serde(with = "snapshot::strict"))]
     clock: kvm_clock_data,
+    #[cfg_attr(not(feature = "tee"), serde(with = "snapshot::strict"))]
     pic_master: kvm_irqchip,
+    #[cfg_attr(not(feature = "tee"), serde(with = "snapshot::strict"))]
     pic_slave: kvm_irqchip,
+    #[cfg_attr(not(feature = "tee"), serde(with = "snapshot::strict"))]
     ioapic: kvm_irqchip,
 }
 
@@ -940,6 +951,8 @@ pub struct Vcpu {
     msr_list: MsrList,
     #[cfg(target_arch = "x86_64")]
     kernel_enomem_workaround: bool,
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    snapshot_xsave_size: usize,
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
@@ -1074,6 +1087,9 @@ impl Vcpu {
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             fd: kvm_vcpu,
+            #[cfg(not(feature = "tee"))]
+            snapshot_xsave_size: snapshot::xsave_size(vm_fd.check_extension_int(Xsave2))
+                .map_err(|_| Error::KvmCap(Xsave2))?,
             id,
             mmio_bus: None,
             exit_evt,
@@ -1161,7 +1177,11 @@ impl Vcpu {
 
     /// Configure a small device-free real-mode program without writing guest RAM.
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    pub(crate) fn configure_minimal(&mut self, entry: u16) -> Result<()> {
+    pub(crate) fn configure_minimal(&mut self, entry: u16, count: u8) -> Result<()> {
+        let spec = VmSpec::new(self.id, count, false, false).map_err(Error::CpuId)?;
+        filter_cpuid(&mut self.cpuid, &spec).map_err(Error::CpuId)?;
+        self.minimal_cpuid()?;
+        arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
         let mut sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
         sregs.cs.base = 0;
         sregs.cs.selector = 0;
@@ -1170,9 +1190,15 @@ impl Vcpu {
             .set_regs(&kvm_regs {
                 rip: entry as u64,
                 rflags: 2,
+                rbx: self.id as u64,
                 ..Default::default()
             })
-            .map_err(Error::VcpuSetRegs)
+            .map_err(Error::VcpuSetRegs)?;
+        self.fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            })
+            .map_err(Error::VcpuSetMpState)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1322,124 +1348,6 @@ impl Vcpu {
             response_receiver,
             vcpu_thread,
         ))
-    }
-
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
-    fn save_state(&self) -> Result<VcpuState> {
-        /*
-         * Ordering requirements:
-         *
-         * KVM_GET_MP_STATE calls kvm_apic_accept_events(), which might modify
-         * vCPU/LAPIC state. As such, it must be done before most everything
-         * else, otherwise we cannot restore everything and expect it to work.
-         *
-         * KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
-         * still running.
-         *
-         * KVM_GET_LAPIC may change state of LAPIC before returning it.
-         *
-         * GET_VCPU_EVENTS should probably be last to save. The code looks as
-         * it might as well be affected by internal state modifications of the
-         * GET ioctls.
-         *
-         * SREGS saves/restores a pending interrupt, similar to what
-         * VCPU_EVENTS also does.
-         *
-         * GET_MSRS requires a pre-populated data structure to do something
-         * meaningful. For SET_MSRS it will then contain good data.
-         */
-
-        // Build the list of MSRs we want to save.
-        let num_msrs = self.msr_list.as_fam_struct_ref().nmsrs as usize;
-        let mut msrs = Msrs::new(num_msrs).unwrap();
-        {
-            let indices = self.msr_list.as_slice();
-            let msr_entries = msrs.as_mut_slice();
-            assert_eq!(indices.len(), msr_entries.len());
-            for (pos, index) in indices.iter().enumerate() {
-                msr_entries[pos].index = *index;
-            }
-        }
-        let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
-        let regs = self.fd.get_regs().map_err(Error::VcpuGetRegs)?;
-        let sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
-        let xsave = self.fd.get_xsave().map_err(Error::VcpuGetXsave)?;
-        let xcrs = self.fd.get_xcrs().map_err(Error::VcpuGetXcrs)?;
-        let debug_regs = self.fd.get_debug_regs().map_err(Error::VcpuGetDebugRegs)?;
-        let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
-        let nmsrs = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
-        assert_eq!(nmsrs, num_msrs);
-        let vcpu_events = self
-            .fd
-            .get_vcpu_events()
-            .map_err(Error::VcpuGetVcpuEvents)?;
-        Ok(VcpuState {
-            cpuid: self.cpuid.clone(),
-            msrs,
-            debug_regs,
-            lapic,
-            mp_state,
-            regs,
-            sregs,
-            vcpu_events,
-            xcrs,
-            xsave,
-        })
-    }
-
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
-    fn restore_state(&self, state: VcpuState) -> Result<()> {
-        /*
-         * Ordering requirements:
-         *
-         * KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
-         * still running.
-         *
-         * Some SET ioctls (like set_mp_state) depend on kvm_vcpu_is_bsp(), so
-         * if we ever change the BSP, we have to do that before restoring anything.
-         * The same seems to be true for CPUID stuff.
-         *
-         * SREGS saves/restores a pending interrupt, similar to what
-         * VCPU_EVENTS also does.
-         *
-         * SET_REGS clears pending exceptions unconditionally, thus, it must be
-         * done before SET_VCPU_EVENTS, which restores it.
-         *
-         * SET_LAPIC must come after SET_SREGS, because the latter restores
-         * the apic base msr.
-         *
-         * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
-         * only restores successfully, when the LAPIC is correctly configured.
-         */
-        self.fd
-            .set_cpuid2(&state.cpuid)
-            .map_err(Error::VcpuSetCpuid)?;
-        self.fd
-            .set_mp_state(state.mp_state)
-            .map_err(Error::VcpuSetMpState)?;
-        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
-        self.fd
-            .set_sregs(&state.sregs)
-            .map_err(Error::VcpuSetSregs)?;
-        unsafe {
-            self.fd
-                .set_xsave(&state.xsave)
-                .map_err(Error::VcpuSetXsave)?;
-        }
-        self.fd.set_xcrs(&state.xcrs).map_err(Error::VcpuSetXcrs)?;
-        self.fd
-            .set_debug_regs(&state.debug_regs)
-            .map_err(Error::VcpuSetDebugRegs)?;
-        self.fd
-            .set_lapic(&state.lapic)
-            .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
-        self.fd
-            .set_vcpu_events(&state.vcpu_events)
-            .map_err(Error::VcpuSetVcpuEvents)?;
-        Ok(())
     }
 
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
@@ -1626,24 +1534,36 @@ impl Vcpu {
     // cleared. Checking this queue after an IO/MMIO Handled exit would be unsafe.
     fn process_control(&mut self) -> StateMachine<Self> {
         let mut state = StateMachine::next(Self::running);
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        let mut paused = false;
         loop {
             match self.event_receiver.try_recv() {
                 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
                 Ok(VcpuEvent::Finish) => return StateMachine::finish(),
                 // Running ---- Pause ----> Paused
                 Ok(VcpuEvent::Pause) => {
-                    // Nothing special to do.
+                    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                    {
+                        paused = true;
+                    }
+                    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                    self.notify_clock();
                     self.response_sender
                         .send(VcpuResponse::Paused)
                         .expect("failed to send pause status");
 
-                    // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
-                    // TODO continued: the guest soft lockup watchdog does not panic on Resume.
-
                     // Move to 'paused' state.
                     state = StateMachine::next(Self::paused);
                 }
+                #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                Ok(VcpuEvent::Snapshot(request)) => request.execute(self, paused),
                 Ok(VcpuEvent::Resume) => {
+                    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                    {
+                        paused = false;
+                    }
+                    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                    self.notify_clock();
                     self.response_sender
                         .send(VcpuResponse::Resumed)
                         .expect("failed to send resume status");
@@ -1665,13 +1585,21 @@ impl Vcpu {
         match self.event_receiver.recv() {
             #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
             Ok(VcpuEvent::Finish) => StateMachine::finish(),
+            #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+            Ok(VcpuEvent::Snapshot(request)) => {
+                request.execute(self, true);
+                StateMachine::next(Self::paused)
+            }
             Ok(VcpuEvent::Pause) => {
+                #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                self.notify_clock();
                 let _ = self.response_sender.send(VcpuResponse::Paused);
                 StateMachine::next(Self::paused)
             }
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume) => {
-                // Nothing special to do.
+                #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+                self.notify_clock();
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
@@ -1743,22 +1671,14 @@ impl Drop for Vcpu {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-/// Structure holding VCPU kvm state.
-pub struct VcpuState {
-    cpuid: CpuId,
-    msrs: Msrs,
-    debug_regs: kvm_debugregs,
-    lapic: kvm_lapic_state,
-    mp_state: kvm_mp_state,
-    regs: kvm_regs,
-    sregs: kvm_sregs,
-    vcpu_events: kvm_vcpu_events,
-    xcrs: kvm_xcrs,
-    xsave: kvm_xsave,
-}
-
 #[derive(Debug)]
+#[cfg_attr(
+    all(target_arch = "x86_64", not(feature = "tee")),
+    expect(
+        private_interfaces,
+        reason = "Full snapshot requests remain internal to krun-vmm"
+    )
+)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
     /// Stop and join the device-free RAM harness without terminating the process.
@@ -1768,7 +1688,8 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    Snapshot(snapshot::Request),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1840,6 +1761,8 @@ enum VcpuEmulation {
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::unbounded;
+    #[cfg(target_arch = "x86_64")]
+    use kvm_bindings::kvm_mp_state;
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -2115,7 +2038,7 @@ mod tests {
         }
         for mmio in [false, true] {
             let (_vm, mut cpu, memory) = setup_vcpu(4096);
-            cpu.configure_minimal(0).unwrap();
+            cpu.configure_minimal(0, 2).unwrap();
             cpu.fd
                 .set_mp_state(kvm_mp_state {
                     mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
@@ -2174,7 +2097,7 @@ mod tests {
     fn queued_pause_resume_finish_are_drained_before_entering_guest() {
         use vm_memory::Bytes;
         let (_vm, mut cpu, memory) = setup_vcpu(4096);
-        cpu.configure_minimal(0).unwrap();
+        cpu.configure_minimal(0, 2).unwrap();
         cpu.fd
             .set_mp_state(kvm_mp_state {
                 mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
