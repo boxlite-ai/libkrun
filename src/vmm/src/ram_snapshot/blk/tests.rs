@@ -175,18 +175,18 @@ fn emit_guest() -> Vec<u8> {
     e.bytes(&[0x8e, 0xc0]); // mov es, ax
     e.bytes(&[0xbc, 0x00, 0x70]); // mov sp, 0x7000
     e.bytes(&[0xff, 0x06, 0x02, 0xb8]); // inc word [boot marker]
-    // Unreal-mode setup, exactly: the GDTR record sits at 0x500 (limit 23,
-    // base 0x520); the GDT at 0x520 holds a null entry, a 16-bit 4 GiB
-    // code descriptor (D=0 so the 16-bit code stays 16-bit, G=1) at
-    // selector 8, and a 4 GiB data descriptor at selector 0x10. PE is
-    // entered only long enough to cache DS/ES; after returning to real
-    // mode the data selectors are NOT reloaded (a reload would replace the
-    // cached 4 GiB limits with real-mode 64 KiB ones).
+                                        // Unreal-mode setup, exactly: the GDTR record sits at 0x500 (limit 23,
+                                        // base 0x520); the GDT at 0x520 holds a null entry, a 16-bit 4 GiB
+                                        // code descriptor (D=0 so the 16-bit code stays 16-bit, G=1) at
+                                        // selector 8, and a 4 GiB data descriptor at selector 0x10. PE is
+                                        // entered only long enough to cache DS/ES; after returning to real
+                                        // mode the data selectors are NOT reloaded (a reload would replace the
+                                        // cached 4 GiB limits with real-mode 64 KiB ones).
     e.store_word16(0x500, 23); // GDTR limit: 3 entries * 8 - 1
     e.store_word16(0x502, 0x520); // GDTR base low word
     e.store_word16(0x504, 0); // GDTR base high
-    // Null entry 0x520..0x527 stays zero (fresh RAM).
-    // Code @0x528: ff ff 00 00 00 9a 8f 00
+                              // Null entry 0x520..0x527 stays zero (fresh RAM).
+                              // Code @0x528: ff ff 00 00 00 9a 8f 00
     e.store_word16(0x528, 0xffff);
     e.store_word16(0x52a, 0x0000);
     e.store_word16(0x52c, 0x9a00);
@@ -237,10 +237,10 @@ fn emit_guest() -> Vec<u8> {
     e.store32(IOAPIC_WIN, 0x40); // vector 0x40, unmasked
     e.store32(IOAPIC_REGSEL, 0x31);
     e.store32(IOAPIC_WIN, 0); // physical destination APIC 0
-    // IVT vector 0x40 -> handler at 0x1400.
+                              // IVT vector 0x40 -> handler at 0x1400.
     e.bytes(&[0xc7, 0x06, 0x00, 0x01, 0x00, 0x14]); // mov word [0x100], 0x1400
     e.bytes(&[0xc7, 0x06, 0x02, 0x01, 0x00, 0x00]); // mov word [0x102], 0
-    // x2APIC enable + spurious vector (32-bit ops carry 0x66 in 16-bit).
+                                                    // x2APIC enable + spurious vector (32-bit ops carry 0x66 in 16-bit).
     e.bytes(&[0x66, 0xb9, 0x1b, 0x00, 0x00, 0x00]); // mov ecx, 0x1b
     e.bytes(&[0x0f, 0x32]); // rdmsr
     e.bytes(&[0x66, 0x0d, 0x00, 0x0c, 0x00, 0x00]); // or eax, 0xc00
@@ -311,7 +311,7 @@ fn emit_guest() -> Vec<u8> {
     e.bytes(&STATUS_BYTE.to_le_bytes()[..2]);
     e.bytes(&[0xee]);
     e.jcc(0x84, "fail"); // je fail (status write never happened)
-    // Read phases verify the data content of sector 1.
+                         // Read phases verify the data content of sector 1.
     e.bytes(&[0x80, 0x3e]); // cmp byte [phase], 0
     e.bytes(&PHASE.to_le_bytes()[..2]);
     e.bytes(&[0x00]);
@@ -341,9 +341,9 @@ fn emit_guest() -> Vec<u8> {
     e.bytes(&[0x3c]); // cmp al, BARRIER_REQUEST
     e.bytes(&[BARRIER_REQUEST]);
     e.jcc(0x85, "loop"); // jne loop
-    // The barrier round's device IRQ is pending: IF has been 0 since before
-    // its submission. A byte store marks the park (word-wide stores would
-    // clobber the adjacent release byte).
+                         // The barrier round's device IRQ is pending: IF has been 0 since before
+                         // its submission. A byte store marks the park (word-wide stores would
+                         // clobber the adjacent release byte).
     e.store8(BARRIER_MARKER, 1);
     e.label("barrier");
     e.bytes(&[0x80, 0x3e]); // cmp byte [release], 1
@@ -351,9 +351,9 @@ fn emit_guest() -> Vec<u8> {
     e.bytes(&[0x01]);
     e.jcc(0x85, "barrier"); // jne barrier
     e.bytes(&[0xfb]); // sti: the pending IRQ is delivered now
-    // Post-STI proof stage: wait until the interrupt counter moves — only
-    // the handler writes it and no new request exists yet — then set the
-    // delivered marker. A lost pending IRQ can never reach this marker.
+                      // Post-STI proof stage: wait until the interrupt counter moves — only
+                      // the handler writes it and no new request exists yet — then set the
+                      // delivered marker. A lost pending IRQ can never reach this marker.
     e.bytes(&[0x8b, 0x1e]); // mov bx, [interrupts]
     e.bytes(&INTERRUPTS.to_le_bytes()[..2]);
     e.label("delivered_wait");
@@ -378,17 +378,36 @@ fn emit_guest() -> Vec<u8> {
     // Handler at 0x1400: count the interrupt, x2APIC EOI, preserve all
     // touched registers (32-bit ops carry the 0x66 prefix in 16-bit mode).
     code.extend_from_slice(&[
-        0x66, 0x50, // push eax
-        0x66, 0x51, // push ecx
-        0x66, 0x52, // push edx
-        0xff, 0x06, INTERRUPTS as u8, (INTERRUPTS >> 8) as u8, // inc word [0xB804]
-        0x66, 0xb9, 0x0b, 0x08, 0x00, 0x00, // mov ecx, 0x80b (EOI)
-        0x66, 0x31, 0xc0, // xor eax, eax
-        0x66, 0x31, 0xd2, // xor edx, edx
-        0x0f, 0x30, // wrmsr
-        0x66, 0x5a, // pop edx
-        0x66, 0x59, // pop ecx
-        0x66, 0x58, // pop eax
+        0x66,
+        0x50, // push eax
+        0x66,
+        0x51, // push ecx
+        0x66,
+        0x52, // push edx
+        0xff,
+        0x06,
+        INTERRUPTS as u8,
+        (INTERRUPTS >> 8) as u8, // inc word [0xB804]
+        0x66,
+        0xb9,
+        0x0b,
+        0x08,
+        0x00,
+        0x00, // mov ecx, 0x80b (EOI)
+        0x66,
+        0x31,
+        0xc0, // xor eax, eax
+        0x66,
+        0x31,
+        0xd2, // xor edx, edx
+        0x0f,
+        0x30, // wrmsr
+        0x66,
+        0x5a, // pop edx
+        0x66,
+        0x59, // pop ecx
+        0x66,
+        0x58, // pop eax
         0xcf, // iret
     ]);
     code
@@ -448,8 +467,8 @@ fn qcow2_with_raw_backing(path: &Path, backing: &Path, virtual_size: u64) {
     be32(&mut image, 56, 1); // refcount_table_clusters
     be32(&mut image, 100, 4); // refcount_order: 16-bit refcounts
     be32(&mut image, 104, 112); // header_length (v3)
-    // Backing-format extension "raw", then the zero terminator, both 8-byte
-    // aligned, before the backing name area at 0x400.
+                                // Backing-format extension "raw", then the zero terminator, both 8-byte
+                                // aligned, before the backing name area at 0x400.
     be32(&mut image, 112, 0xE2792ACA); // ext: backing file format
     be32(&mut image, 116, 3); // length "raw"
     image[120..123].copy_from_slice(b"raw");
@@ -473,8 +492,8 @@ fn initialize_rings(vm: &RamSnapshotVm) {
     // per request at 0xC00C), status byte (writable).
     let descriptors = [
         (0xC000u64, 0xA000u64, 16u32, 1u16, 1u16), // hdr: flags NEXT, next 1
-        (0xC010, 0xB000, 512, 2, 2), // data: WRITE (read phase default), next 2
-        (0xC020, 0xB700, 1, 2, 0),  // status: WRITE, no next
+        (0xC010, 0xB000, 512, 2, 2),               // data: WRITE (read phase default), next 2
+        (0xC020, 0xB700, 1, 2, 0),                 // status: WRITE, no next
     ];
     for (desc_addr, buffer, len, flags, next) in descriptors {
         mem.write_obj(buffer, GuestAddress(desc_addr)).unwrap();
@@ -507,21 +526,18 @@ fn guest_vm(disks: &[(PathBuf, ImageType, bool)], park_at_barrier: bool) -> RamS
         .unwrap();
     initialize_rings(&vm);
     if !park_at_barrier {
-        vm.memory
-            .write_obj(1u8, GuestAddress(0xB815))
-            .unwrap();
+        vm.memory.write_obj(1u8, GuestAddress(0xB815)).unwrap();
     }
     for (path, format, read_only) in disks {
-        vm.attach_disk(path, *format, *read_only, false).unwrap();
+        vm.attach_disk(path, format.clone(), *read_only, false)
+            .unwrap();
     }
     vm.start_vcpus(1, GUEST_CODE_BASE as u16).unwrap();
     vm
 }
 
 fn read_u16(vm: &RamSnapshotVm, address: u64) -> u16 {
-    vm.memory
-        .read_obj::<u16>(GuestAddress(address))
-        .unwrap()
+    vm.memory.read_obj::<u16>(GuestAddress(address)).unwrap()
 }
 
 fn wait_requests(vm: &RamSnapshotVm, at_least: u16) -> u16 {
@@ -616,7 +632,10 @@ fn blk_snapshot_restores_readonly_qcow2_backing_without_sources() {
     // Same cut, read from the restored paused memory: no request was lost,
     // no cold reboot happened and the cut is not behind the observed state.
     let saved = read_u16(&restored, 0xB800);
-    assert!(saved >= before, "restored cut is behind the observed source");
+    assert!(
+        saved >= before,
+        "restored cut is behind the observed source"
+    );
     assert_eq!(read_u16(&restored, 0xB802), 1, "guest rebooted");
     assert_eq!(
         restored
@@ -753,16 +772,12 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
     bad_magic[3] = b'X';
     let bad_magic_path = dir.path("bad-magic");
     fs::write(&bad_magic_path, &bad_magic).unwrap();
-    assert!(
-        RamSnapshotVm::restore_full_with_disks(&bad_magic_path, &destination()).is_err()
-    );
+    assert!(RamSnapshotVm::restore_full_with_disks(&bad_magic_path, &destination()).is_err());
     let mut bad_version = valid.clone();
     bad_version[8..12].copy_from_slice(&7u32.to_le_bytes());
     let bad_version_path = dir.path("bad-version");
     fs::write(&bad_version_path, &bad_version).unwrap();
-    assert!(
-        RamSnapshotVm::restore_full_with_disks(&bad_version_path, &destination()).is_err()
-    );
+    assert!(RamSnapshotVm::restore_full_with_disks(&bad_version_path, &destination()).is_err());
 
     // Patch the JSON disk table with illegal values; rewrite the file with a
     // consistent length so only the content checks can fail. `extra_segment`
@@ -800,24 +815,22 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
     let capacity_mismatch = repack("capacity-mismatch", false, &|value| {
         value["disks"][0]["config"].as_array_mut().unwrap()[0] = serde_json::json!(1);
     });
-    assert!(
-        RamSnapshotVm::restore_full_with_disks(&capacity_mismatch, &destination()).is_err()
-    );
+    assert!(RamSnapshotVm::restore_full_with_disks(&capacity_mismatch, &destination()).is_err());
 
     let irq_out_of_window = repack("irq-window", false, &|value| {
         value["disks"][0]["irq"] = serde_json::json!(5);
     });
-    assert!(
-        RamSnapshotVm::restore_full_with_disks(&irq_out_of_window, &destination()).is_err()
-    );
+    assert!(RamSnapshotVm::restore_full_with_disks(&irq_out_of_window, &destination()).is_err());
 
     let foreign_features = repack("foreign-features", false, &|value| {
-        value["disks"][0]["device"]["avail_features"] =
-            serde_json::json!(value["disks"][0]["device"]["avail_features"].as_u64().unwrap() | 1);
+        value["disks"][0]["device"]["avail_features"] = serde_json::json!(
+            value["disks"][0]["device"]["avail_features"]
+                .as_u64()
+                .unwrap()
+                | 1
+        );
     });
-    assert!(
-        RamSnapshotVm::restore_full_with_disks(&foreign_features, &destination()).is_err()
-    );
+    assert!(RamSnapshotVm::restore_full_with_disks(&foreign_features, &destination()).is_err());
 
     // Duplicate identity with a consistent payload length: only the
     // identity/MMIO/IRQ conflict checks can reject this one.
@@ -828,9 +841,7 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
         disk["device_id"] = serde_json::json!("blk0");
         value["disks"].as_array_mut().unwrap().push(disk);
     });
-    assert!(
-        RamSnapshotVm::restore_full_with_disks(&duplicate_identity, &destination()).is_err()
-    );
+    assert!(RamSnapshotVm::restore_full_with_disks(&duplicate_identity, &destination()).is_err());
 }
 
 #[test]
@@ -863,9 +874,8 @@ fn blk_snapshot_save_write_failure_recovers_source_and_republishes() {
     let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
     let before = wait_requests(&vm, 6);
     let snapshot = dir.path("checkpoint");
-    let failed = super::super::tests::with_failed_payload_write(64 * 1024, || {
-        vm.save_full(&snapshot)
-    });
+    let failed =
+        super::super::tests::with_failed_payload_write(64 * 1024, || vm.save_full(&snapshot));
     assert!(failed.is_err());
     // The source VM recovered: the guest keeps completing requests and
     // nothing valid was published.

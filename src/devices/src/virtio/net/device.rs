@@ -4,22 +4,22 @@
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
-use crate::virtio::net::Result;
+use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
     VirtioDevice, TYPE_NET,
 };
-use crate::Error as DeviceError;
 
-use super::backend::{ReadError, WriteError};
-use super::worker::NetWorker;
+use super::worker::{NetWorker, NetWorkerControl, NetWorkerHandle};
 
 use std::cmp;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -35,17 +35,13 @@ pub enum FrontendError {
     ReadOnlyDescriptor,
 }
 
-#[derive(Debug)]
-pub enum RxError {
-    Backend(ReadError),
-    DeviceError(DeviceError),
-}
-
-#[derive(Debug)]
-pub enum TxError {
-    Backend(WriteError),
-    DeviceError(DeviceError),
-    QueueError(QueueError),
+/// The feature set `Net::new` offers for the caller's `features`: single
+/// source of truth for construction and snapshot validation.
+pub fn offered_features(features: u32) -> u64 {
+    features as u64
+        | (1 << VIRTIO_NET_F_MAC)
+        | (1 << VIRTIO_RING_F_EVENT_IDX)
+        | (1 << VIRTIO_F_VERSION_1)
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -58,6 +54,22 @@ struct VirtioNetConfig {
 
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioNetConfig {}
+
+impl VirtioNetConfig {
+    fn for_mac(mac: [u8; 6]) -> Self {
+        VirtioNetConfig {
+            mac,
+            status: 0,
+            max_virtqueue_pairs: 0,
+        }
+    }
+}
+
+/// The guest-visible config bytes `Net::new` exposes for `mac`: single
+/// source of truth for snapshot validation.
+pub fn config_bytes_for(mac: [u8; 6]) -> Vec<u8> {
+    VirtioNetConfig::for_mac(mac).as_slice().to_vec()
+}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
@@ -79,6 +91,10 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    worker_thread: Option<JoinHandle<()>>,
+    worker_stopfd: EventFd,
+    worker_control: Option<NetWorkerHandle>,
 }
 
 impl Net {
@@ -89,16 +105,9 @@ impl Net {
         mac: [u8; 6],
         features: u32,
     ) -> Result<Self> {
-        let avail_features = features as u64
-            | (1 << VIRTIO_NET_F_MAC)
-            | (1 << VIRTIO_RING_F_EVENT_IDX)
-            | (1 << VIRTIO_F_VERSION_1);
+        let avail_features = offered_features(features);
 
-        let config = VirtioNetConfig {
-            mac,
-            status: 0,
-            max_virtqueue_pairs: 0,
-        };
+        let config = VirtioNetConfig::for_mac(mac);
 
         Ok(Net {
             id,
@@ -109,6 +118,10 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
+            worker_control: None,
         })
     }
 
@@ -120,6 +133,95 @@ impl Net {
     /// Provides the virtio-net backend of this net device.
     pub fn backend(&self) -> &VirtioNetBackend {
         &self.cfg_backend
+    }
+
+    /// The complete guest-visible device configuration, byte-exact.
+    pub fn config_bytes(&self) -> Vec<u8> {
+        self.config.as_slice().to_vec()
+    }
+
+    /// Snapshot control handle for the activated worker, if any.
+    pub fn worker_control(&self) -> Option<&NetWorkerHandle> {
+        self.worker_control.as_ref()
+    }
+
+    /// Stop the worker and wait for its thread to exit, closing its backend
+    /// connection; frozen workers stop too. The device stays activated from
+    /// the transport's point of view: this is owner teardown, not a guest
+    /// reset, which this device still does not support.
+    pub fn stop_worker(&mut self) {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("error waiting for virtio-net worker thread: {e:?}");
+            }
+        }
+        self.worker_control = None;
+    }
+
+    fn activate_impl(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+        start_frozen: bool,
+    ) -> ActivateResult {
+        if self.worker_thread.is_some() {
+            error!("virtio-net ({}) worker thread already exists", self.id());
+            return Err(ActivateError::BadActivate);
+        }
+        let [rx_q, tx_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
+            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
+            ActivateError::BadActivate
+        })?;
+
+        let control_fd = EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?;
+        let (commands, command_receiver) = crossbeam_channel::bounded(16);
+        let control = NetWorkerControl {
+            stop_fd: self
+                .worker_stopfd
+                .try_clone()
+                .map_err(|_| ActivateError::BadActivate)?,
+            control_fd: control_fd
+                .try_clone()
+                .map_err(|_| ActivateError::BadActivate)?,
+            wake_fd: EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?,
+            commands: command_receiver,
+        };
+
+        match NetWorker::new(
+            rx_q,
+            tx_q,
+            interrupt.clone(),
+            mem.clone(),
+            self.acked_features,
+            self.cfg_backend.clone(),
+            control,
+        ) {
+            Ok(worker) => {
+                self.worker_thread = Some(worker.run(start_frozen));
+                self.worker_control = Some(NetWorkerHandle {
+                    control_fd,
+                    commands,
+                });
+                self.device_state = DeviceState::Activated(mem, interrupt);
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    "Error activating virtio-net ({}) backend: {err:?}",
+                    self.id()
+                );
+                Err(ActivateError::BadActivate)
+            }
+        }
+    }
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        // Never leave a detached worker writing guest RAM after its owner.
+        self.stop_worker();
     }
 }
 
@@ -176,32 +278,16 @@ impl VirtioDevice for Net {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [rx_q, tx_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
-            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
-            ActivateError::BadActivate
-        })?;
+        self.activate_impl(mem, interrupt, queues, false)
+    }
 
-        match NetWorker::new(
-            rx_q,
-            tx_q,
-            interrupt.clone(),
-            mem.clone(),
-            self.acked_features,
-            self.cfg_backend.clone(),
-        ) {
-            Ok(worker) => {
-                worker.run();
-                self.device_state = DeviceState::Activated(mem, interrupt);
-                Ok(())
-            }
-            Err(err) => {
-                error!(
-                    "Error activating virtio-net ({}) backend: {err:?}",
-                    self.id()
-                );
-                Err(ActivateError::BadActivate)
-            }
-        }
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate_impl(mem, interrupt, queues, true)
     }
 
     fn is_activated(&self) -> bool {

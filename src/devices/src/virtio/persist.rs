@@ -150,8 +150,10 @@ impl QueueState {
                 "ring address/range breaks alignment or guest memory bounds",
             ));
         }
-        let read_idx =
-            |addr: u64| mem.read_obj::<u16>(GuestAddress(addr)).map_err(PersistError::GuestMemory);
+        let read_idx = |addr: u64| {
+            mem.read_obj::<u16>(GuestAddress(addr))
+                .map_err(PersistError::GuestMemory)
+        };
         // The device mirrors used.idx in RAM after every add_used, so at a
         // freeze boundary both must be equal.
         let used_idx = read_idx(self.used_ring + 2)?;
@@ -169,6 +171,32 @@ impl QueueState {
             return Err(PersistError::InvalidQueue(
                 "available ring cursor is behind next_avail by more than the queue size",
             ));
+        }
+        Ok(())
+    }
+}
+
+impl QueueState {
+    /// Every chain the driver made available but the device has not
+    /// consumed must start at a valid descriptor index; callers use this
+    /// before completing those chains on the device's behalf. Requires a
+    /// state that passed `validate` for an activated queue.
+    pub fn validate_available_heads(&self, mem: &GuestMemoryMmap) -> Result<(), PersistError> {
+        let avail_idx: u16 = mem
+            .read_obj(GuestAddress(self.avail_ring + 2))
+            .map_err(PersistError::GuestMemory)?;
+        let mut position = Wrapping(self.next_avail);
+        while position.0 != avail_idx {
+            let slot = u64::from(position.0 % self.size);
+            let head: u16 = mem
+                .read_obj(GuestAddress(self.avail_ring + 4 + 2 * slot))
+                .map_err(PersistError::GuestMemory)?;
+            if head >= self.size {
+                return Err(PersistError::InvalidQueue(
+                    "available ring holds an invalid descriptor head",
+                ));
+            }
+            position += Wrapping(1);
         }
         Ok(())
     }
@@ -225,7 +253,11 @@ impl VirtioDeviceState {
         expected_num_queues: usize,
         expected_queue_max_size: u16,
     ) -> Result<(), PersistError> {
-        self.validate_structure(expected_device_type, expected_num_queues, expected_queue_max_size)?;
+        self.validate_structure(
+            expected_device_type,
+            expected_num_queues,
+            expected_queue_max_size,
+        )?;
         for queue in &self.queues {
             queue.validate(mem, self.activated)?;
         }
@@ -439,7 +471,9 @@ mod tests {
         // event_idx must match the negotiated feature bit on activated
         // devices (checked on the unmodified state, no normalization).
         let mut mismatch = base.clone();
+        mismatch.avail_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
         mismatch.acked_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
+        mismatch.queues[0].event_idx_enabled = true;
         assert!(mismatch.validate(&mem, 2, 1, 256).is_ok());
         mismatch.queues[0].event_idx_enabled = !mismatch.queues[0].event_idx_enabled;
         assert!(matches!(
@@ -449,6 +483,7 @@ mod tests {
         // Inactive queues never carry event_idx_enabled.
         let mut inactive = base;
         inactive.activated = false;
+        inactive.avail_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
         inactive.acked_features |= 1 << VIRTIO_RING_F_EVENT_IDX;
         assert!(inactive.validate(&mem, 2, 1, 256).is_ok());
         inactive.queues[0].event_idx_enabled = true;

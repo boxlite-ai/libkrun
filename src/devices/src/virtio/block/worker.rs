@@ -4,20 +4,21 @@ use crate::virtio::persist::QueueState;
 use super::super::DeviceQueue;
 use super::device::{Block, CacheType, DiskProperties};
 
+pub use crate::virtio::control::WorkerControlError;
+use crate::virtio::control::{self, CONTROL_TIMEOUT};
 use crate::virtio::InterruptTransport;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+#[cfg(test)]
+use crossbeam_channel::bounded;
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::result;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use virtio_bindings::virtio_blk::*;
 use vm_memory::{ByteValued, GuestMemoryMmap};
-
-/// How long snapshot controls wait for a worker confirmation.
-pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Test-only ONE-SHOT in-flight gates, keyed by each worker's queue eventfd
 /// (tests retain the same shared `Arc<EventFd>`). Installing a gate holds
@@ -27,7 +28,7 @@ pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// intercepted, and simultaneous installs for different workers coexist.
 #[cfg(test)]
 static REQUEST_GATES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::os::unix::fd::RawFd, RequestGate>>,
+    std::sync::Mutex<std::collections::HashMap<std::os::fd::RawFd, RequestGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
@@ -46,7 +47,7 @@ mod request_gate {
     /// RAII guard: removes this key's gate when dropped (including on
     /// panic), leaving other workers' gates untouched.
     pub struct Guard {
-        key: std::os::unix::fd::RawFd,
+        key: std::os::fd::RawFd,
     }
 
     impl Drop for Guard {
@@ -77,7 +78,11 @@ mod request_gate {
 fn hold_at_request_gate(queue_event: &utils::eventfd::EventFd) {
     // Take this worker's gate out of the map under the lock, then wait
     // WITHOUT holding it: the gate is one-shot by construction.
-    let Some(gate) = REQUEST_GATES.lock().unwrap().remove(&queue_event.as_raw_fd()) else {
+    let Some(gate) = REQUEST_GATES
+        .lock()
+        .unwrap()
+        .remove(&queue_event.as_raw_fd())
+    else {
         return;
     };
     let _ = gate.arrive.send(());
@@ -104,34 +109,6 @@ pub(crate) enum WorkerCommand {
     },
 }
 
-/// Why a worker control failed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum WorkerControlError {
-    /// The worker did not confirm within the control timeout. This is not an
-    /// I/O cancellation: live resources must stay owned and unpublished.
-    Timeout,
-    /// The worker exited or its control channel is gone.
-    WorkerGone,
-    /// The worker confirmed a freeze, but flushing the disk failed.
-    Frozen(String),
-}
-
-impl std::fmt::Display for WorkerControlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WorkerControlError::Timeout => {
-                write!(f, "block worker control timeout")
-            }
-            WorkerControlError::WorkerGone => {
-                write!(f, "block worker exited or control channel disconnected")
-            }
-            WorkerControlError::Frozen(why) => {
-                write!(f, "block worker freeze failed: {why}")
-            }
-        }
-    }
-}
-
 /// Controller side of the block worker snapshot control channel.
 pub struct BlockWorkerHandle {
     pub(crate) control_fd: EventFd,
@@ -148,30 +125,9 @@ impl BlockWorkerHandle {
         &self,
         timeout: Duration,
     ) -> result::Result<QueueState, WorkerControlError> {
-        let deadline = Instant::now() + timeout;
-        let (reply, response) = bounded(1);
-        // The bounded command queue is part of the control deadline: a plain
-        // send() could block forever before any reply wait starts.
-        self.commands
-            .send_timeout(WorkerCommand::Freeze { reply }, timeout)
-            .map_err(|e| match e {
-                crossbeam_channel::SendTimeoutError::Timeout(_) => WorkerControlError::Timeout,
-                crossbeam_channel::SendTimeoutError::Disconnected(_) => {
-                    WorkerControlError::WorkerGone
-                }
-            })?;
-        self.control_fd
-            .write(1)
-            .map_err(|_| WorkerControlError::WorkerGone)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match response.recv_timeout(remaining) {
-            Ok(Ok(state)) => Ok(state),
-            Ok(Err(why)) => Err(WorkerControlError::Frozen(why)),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(WorkerControlError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(WorkerControlError::WorkerGone)
-            }
-        }
+        control::request(&self.commands, &self.control_fd, timeout, |reply| {
+            WorkerCommand::Freeze { reply }
+        })
     }
 
     /// Resume the worker; the reply confirms the active queue examination
@@ -181,28 +137,9 @@ impl BlockWorkerHandle {
     }
 
     pub fn resume_with_timeout(&self, timeout: Duration) -> result::Result<(), WorkerControlError> {
-        let deadline = Instant::now() + timeout;
-        let (reply, response) = bounded(1);
-        self.commands
-            .send_timeout(WorkerCommand::Resume { reply }, timeout)
-            .map_err(|e| match e {
-                crossbeam_channel::SendTimeoutError::Timeout(_) => WorkerControlError::Timeout,
-                crossbeam_channel::SendTimeoutError::Disconnected(_) => {
-                    WorkerControlError::WorkerGone
-                }
-            })?;
-        self.control_fd
-            .write(1)
-            .map_err(|_| WorkerControlError::WorkerGone)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match response.recv_timeout(remaining) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(why)) => Err(WorkerControlError::Frozen(why)),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(WorkerControlError::Timeout),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(WorkerControlError::WorkerGone)
-            }
-        }
+        control::request(&self.commands, &self.control_fd, timeout, |reply| {
+            WorkerCommand::Resume { reply }
+        })
     }
 }
 
@@ -632,6 +569,7 @@ impl BlockWorker {
 
 #[cfg(test)]
 mod tests {
+    use super::request_gate;
     use super::*;
     use crate::legacy::DummyIrqChip;
     use crate::virtio::block::{ImageType, SyncMode};
@@ -639,7 +577,6 @@ mod tests {
     use crate::virtio::Descriptor;
     use crate::virtio::VirtioDevice;
     use std::fs;
-    use super::request_gate;
     use std::sync::Arc;
     use std::time::Instant;
     use utils::eventfd::EFD_NONBLOCK;
@@ -677,11 +614,10 @@ mod tests {
         queue.avail_ring = GuestAddress(AVAIL);
         queue.used_ring = GuestAddress(USED);
         for slot in 0..SLOTS {
-            let write_descriptor =
-                |index: u16, descriptor: Descriptor| {
-                    mem.write_obj(descriptor, GuestAddress(DESC + 16 * u64::from(index)))
-                        .unwrap();
-                };
+            let write_descriptor = |index: u16, descriptor: Descriptor| {
+                mem.write_obj(descriptor, GuestAddress(DESC + 16 * u64::from(index)))
+                    .unwrap();
+            };
             write_descriptor(
                 3 * slot,
                 Descriptor {
@@ -738,8 +674,7 @@ mod tests {
         let words: u32 = match request_type {
             VIRTIO_BLK_T_OUT => (u32::from(3 * slot + 2) << 16) | u32::from(VIRTQ_DESC_F_NEXT),
             _ => {
-                (u32::from(3 * slot + 2) << 16)
-                    | u32::from(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE)
+                (u32::from(3 * slot + 2) << 16) | u32::from(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE)
             }
         };
         mem.write_obj(
@@ -757,7 +692,8 @@ mod tests {
             GuestAddress(AVAIL + 4 + 2 * u64::from(avail_idx % QUEUE_SIZE)),
         )
         .unwrap();
-        mem.write_obj(avail_idx + 1, GuestAddress(AVAIL + 2)).unwrap();
+        mem.write_obj(avail_idx + 1, GuestAddress(AVAIL + 2))
+            .unwrap();
     }
 
     fn used_idx(mem: &GuestMemoryMmap) -> u16 {
@@ -765,7 +701,8 @@ mod tests {
     }
 
     fn status(mem: &GuestMemoryMmap, slot: u16) -> u8 {
-        mem.read_obj::<u8>(GuestAddress(STATUS + u64::from(slot))).unwrap()
+        mem.read_obj::<u8>(GuestAddress(STATUS + u64::from(slot)))
+            .unwrap()
     }
 
     fn wait_used(mem: &GuestMemoryMmap, target: u16) {
@@ -824,7 +761,8 @@ mod tests {
         let disk_before: Vec<u8> = (0..512 * SECTORS).map(|i| (i % 251) as u8).collect();
         fs::write(file.as_path(), &disk_before).unwrap();
         let mem = memory();
-        let (mut device, event) = activated_with_cache(&mem, file.as_path().to_str().unwrap(), writeback);
+        let (mut device, event) =
+            activated_with_cache(&mem, file.as_path().to_str().unwrap(), writeback);
         let handle = device.worker_control().unwrap();
 
         // One completed WRITE proves the data path before the gate engages.
@@ -835,7 +773,17 @@ mod tests {
 
         // Hold the selected request type after its descriptor was popped.
         let (arrived, release, _guard) = request_gate::install(&event);
-        submit(&mem, 1, request_type, if request_type == VIRTIO_BLK_T_IN { 2 } else { 1 }, 0xa1);
+        submit(
+            &mem,
+            1,
+            request_type,
+            if request_type == VIRTIO_BLK_T_IN {
+                2
+            } else {
+                1
+            },
+            0xa1,
+        );
         submit(&mem, 2, VIRTIO_BLK_T_OUT, 2, 0xa2);
         submit(&mem, 3, VIRTIO_BLK_T_FLUSH, 0, 0);
         event.write(1).unwrap();
@@ -948,7 +896,10 @@ mod tests {
         // The capture path reads the frozen image through the shared
         // SyncFormatAccess, bounded by the caller's buffer.
         let mut chunk = [0u8; 512];
-        assert_eq!(device.read_snapshot_chunk(512 * 2, &mut chunk).unwrap(), 512);
+        assert_eq!(
+            device.read_snapshot_chunk(512 * 2, &mut chunk).unwrap(),
+            512
+        );
         assert_eq!(&chunk[..], &disk[512 * 2..512 * 3]);
         handle.resume().unwrap();
         device.reset();

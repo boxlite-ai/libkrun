@@ -224,6 +224,12 @@ impl MmioTransport {
         self.interrupt.event()
     }
 
+    /// Raise a used-buffer interrupt for ring completions made on the
+    /// device's behalf (for example, a restore discarding cut-time requests).
+    pub fn signal_used_queue(&self) -> Result<(), crate::Error> {
+        self.interrupt.try_signal_used_queue()
+    }
+
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
         self.device.lock().expect("Poisoned device lock")
     }
@@ -1143,10 +1149,7 @@ pub(crate) mod tests {
         source.config_generation = 7;
         assert!(source.with_queue_mut(|q| q.size = 32));
         assert!(source.with_queue_mut(|q| q.desc_table = GuestAddress(0x800)));
-        source
-            .interrupt
-            .status()
-            .store(0b11, Ordering::SeqCst);
+        source.interrupt.status().store(0b11, Ordering::SeqCst);
 
         let state = source.save_transport_state();
         state.validate().unwrap();
@@ -1167,10 +1170,8 @@ pub(crate) mod tests {
             Arc::new(Mutex::new(DummyDevice::new())),
         )
         .unwrap();
-        restored.restore_transport_state(
-            &state,
-            queue_states.iter().map(|q| q.to_queue()).collect(),
-        );
+        restored
+            .restore_transport_state(&state, queue_states.iter().map(|q| q.to_queue()).collect());
         assert_eq!(restored.save_transport_state(), state);
         assert_eq!(restored.queue_states(), queue_states);
         // The restored interrupt status is visible through MMIO reads and

@@ -440,3 +440,60 @@ fn partial_import_kvm_failure_joins_threads_and_closes_fds() {
         "partial-import KVM/RAM FDs retained"
     );
 }
+
+/// Write a header-plus-JSON image of `version` without RAM or segments.
+fn write_header_only(path: &Path, version: u32, json: &[u8]) {
+    let mut file = File::create(path).unwrap();
+    file.write_all(FULL_MAGIC).unwrap();
+    file.write_all(&version.to_le_bytes()).unwrap();
+    file.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
+    file.write_all(json).unwrap();
+}
+
+fn rejection(result: Result<impl Sized>) -> String {
+    match result {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("image was accepted"),
+    }
+}
+
+#[test]
+fn snapshot_versions_are_rejected_by_entries_that_cannot_restore_them() {
+    let dir = TempDir::new();
+    let path = dir.path();
+    let open = || File::open(&path).unwrap();
+    // The device-free reader names the right entry for v2 and v3.
+    write_header_only(&path, FULL_VERSION_V3, b"{}");
+    assert!(rejection(read_metadata(&mut open(), 32, 32)).contains("restore_full_with_net"));
+    write_header_only(&path, FULL_VERSION_V2, b"{}");
+    assert!(rejection(read_metadata(&mut open(), 32, 32)).contains("restore_full_with_disks"));
+    // The disk reader rejects v3 the same way, before parsing JSON.
+    #[cfg(feature = "blk")]
+    {
+        write_header_only(&path, FULL_VERSION_V3, b"{}");
+        assert!(rejection(read_metadata_v2(&mut open(), 32, 32)).contains("restore_full_with_net"));
+    }
+    // The NIC reader rejects NIC-free versions.
+    #[cfg(all(feature = "blk", feature = "net"))]
+    for version in [FULL_VERSION, FULL_VERSION_V2] {
+        write_header_only(&path, version, b"{}");
+        assert!(read_metadata_v3(&mut open(), 32, 32).is_err());
+    }
+}
+
+#[cfg(all(feature = "blk", feature = "net"))]
+#[test]
+fn snapshot_malformed_v3_metadata_is_rejected_before_any_resource() {
+    let dir = TempDir::new();
+    let path = dir.path();
+    // Truncated JSON, a v2 document without the NIC section, and an unknown
+    // top-level field all fail in the metadata reader.
+    for json in [
+        &b"{\"compatibility\":"[..],
+        br#"{"compatibility":{},"cpus":[],"vm":{},"regions":[],"disks":[]}"#,
+        br#"{"compatibility":{},"cpus":[],"vm":{},"regions":[],"disks":[],"nic":{},"backend":"/tmp/x"}"#,
+    ] {
+        write_header_only(&path, FULL_VERSION_V3, json);
+        assert!(read_metadata_v3(&mut File::open(&path).unwrap(), 32, 32).is_err());
+    }
+}

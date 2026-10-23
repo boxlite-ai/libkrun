@@ -369,9 +369,7 @@ impl Block {
 
     /// The shared image handle; used to flush inactive devices during a
     /// snapshot cut when no worker owns the disk.
-    pub fn shared_image(
-        &self,
-    ) -> &Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>> {
+    pub fn shared_image(&self) -> &Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>> {
         &self.disk_image
     }
 
@@ -423,7 +421,7 @@ impl Block {
         // The slice array is bound locally: the returned vector and guard
         // borrow it (and `buffer`) for as long as they live.
         let length = buffer.len();
-        let slices = [VolatileSlice::new(buffer)];
+        let slices = [VolatileSlice::from(buffer)];
         let (iovec, _guard) = IoVectorMut::from_volatile_slice(&slices);
         self.disk_image.lock().unwrap().readv(iovec, offset)?;
         Ok(length)
@@ -547,7 +545,10 @@ impl Block {
             command_receiver,
         );
         self.worker_thread = Some(worker.run(start_frozen));
-        self.worker_control = Some(BlockWorkerHandle { control_fd, commands });
+        self.worker_control = Some(BlockWorkerHandle {
+            control_fd,
+            commands,
+        });
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())

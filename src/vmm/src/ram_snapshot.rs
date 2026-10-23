@@ -26,6 +26,11 @@ mod full;
 #[cfg(feature = "blk")]
 pub(crate) mod blk;
 
+/// The internal NIC reuses the block device plumbing (MMIO window, irqfd
+/// drain, import guard), so it needs both features.
+#[cfg(all(feature = "blk", feature = "net"))]
+pub(crate) mod nic;
+
 #[derive(Debug)]
 pub(crate) enum Error {
     Io(io::Error),
@@ -408,6 +413,8 @@ pub(crate) struct RamSnapshotVm {
     disks: Vec<blk::BlkDevice>,
     #[cfg(feature = "blk")]
     imported: Option<blk::ImportedDir>,
+    #[cfg(all(feature = "blk", feature = "net"))]
+    nic: Option<nic::NicDevice>,
 }
 
 impl RamSnapshotVm {
@@ -438,6 +445,8 @@ impl RamSnapshotVm {
             disks: Vec::new(),
             #[cfg(feature = "blk")]
             imported: None,
+            #[cfg(all(feature = "blk", feature = "net"))]
+            nic: None,
         })
     }
 
@@ -455,9 +464,9 @@ impl RamSnapshotVm {
             ));
         }
         #[cfg(feature = "blk")]
-        if !self.disks.is_empty() {
+        if self.has_devices() {
             return Err(Error::Invalid(
-                "RAM-only save is not a consistent cut for attached disks; use save_full",
+                "RAM-only save is not a consistent cut for attached devices; use save_full",
             ));
         }
         self.control.save(
@@ -479,6 +488,55 @@ impl RamSnapshotVm {
         writeback: bool,
     ) -> Result<()> {
         blk::attach_disk(self, path, format, read_only, writeback)
+    }
+
+    /// Attach the internal UnixStream NIC before vCPUs start.
+    #[cfg(all(feature = "blk", feature = "net"))]
+    pub(crate) fn attach_net(
+        &mut self,
+        socket_path: &Path,
+        mac: [u8; 6],
+        features: u32,
+    ) -> Result<()> {
+        nic::attach_net(self, socket_path, mac, features)
+    }
+
+    /// Whether any userspace device (disk or NIC) is attached.
+    #[cfg(feature = "blk")]
+    pub(super) fn has_devices(&self) -> bool {
+        #[cfg(feature = "net")]
+        if self.nic.is_some() {
+            return true;
+        }
+        !self.disks.is_empty()
+    }
+
+    /// Disk slots left by the internal NIC, which takes the last GSI.
+    #[cfg(feature = "blk")]
+    pub(super) fn disk_capacity(&self) -> usize {
+        #[cfg(feature = "net")]
+        if self.nic.is_some() {
+            return nic::MAX_DISKS_WITH_NIC;
+        }
+        blk::MAX_DISKS
+    }
+
+    /// Mapping clones every attached device legitimately holds.
+    #[cfg(feature = "blk")]
+    pub(super) fn expected_device_clones(&self) -> usize {
+        #[cfg(feature = "net")]
+        let nic = nic::expected_alias_clones(self);
+        #[cfg(not(feature = "net"))]
+        let nic = 0;
+        blk::expected_alias_clones(self) + nic
+    }
+
+    /// Stop and join every device worker (disks and NIC).
+    #[cfg(feature = "blk")]
+    pub(super) fn stop_devices(&self) {
+        blk::stop_devices(self);
+        #[cfg(feature = "net")]
+        nic::stop(self);
     }
 
     /// The stage-2 RAM alias probe, parameterized by the clones the owner's
@@ -506,9 +564,7 @@ impl RamSnapshotVm {
     /// Create the kernel irqchip/PIT once; later callers get the empty
     /// userspace stub that only writes the interrupt eventfd.
     #[cfg(feature = "blk")]
-    pub(super) fn ensure_kernel_irqchip(
-        &mut self,
-    ) -> Result<devices::legacy::KvmIoapic> {
+    pub(super) fn ensure_kernel_irqchip(&mut self) -> Result<devices::legacy::KvmIoapic> {
         if self.irqchip_ready {
             return Ok(devices::legacy::KvmIoapic {});
         }
@@ -568,14 +624,14 @@ impl RamSnapshotVm {
 impl Drop for RamSnapshotVm {
     fn drop(&mut self) {
         // vCPUs join first: a running CPU could otherwise still touch the
-        // devices while they stop. Workers join next; they hold guest RAM
-        // and the disk images. The imported guard removes only the files it
-        // created, after every thread has exited.
+        // devices while they stop. Workers join next; they hold guest RAM,
+        // the disk images and the NIC backend connection. The imported guard
+        // removes only the files it created, after every thread has exited.
         for handle in &mut self.handles {
             handle.finish();
         }
         #[cfg(feature = "blk")]
-        blk::stop_devices(self);
+        self.stop_devices();
         #[cfg(feature = "blk")]
         drop(self.imported.take());
     }

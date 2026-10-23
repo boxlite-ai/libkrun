@@ -5,7 +5,10 @@
 //! Version 1 (`KRUNVM\0\0`, version field 1) is the device-free stage-2
 //! image: header, bounded JSON state, RAM payload. Version 2 adds ordered
 //! raw disk segments after the RAM payload for block devices attached to
-//! the owner; `restore_full` rejects version 2 explicitly.
+//! the owner. Version 3 adds the internal NIC to the JSON state (disk
+//! segments stay optional); it is written only when a NIC is attached, so
+//! NIC-free owners keep writing versions 1 and 2. Each restore entry
+//! rejects the versions it cannot restore explicitly.
 
 use super::*;
 use crate::vstate::snapshot::{self, Compatibility, CpuState, Request};
@@ -15,10 +18,13 @@ use serde::{Deserialize, Serialize};
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
 const FULL_VERSION: u32 = 1;
 const FULL_VERSION_V2: u32 = 2;
+const FULL_VERSION_V3: u32 = 3;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
 use crate::ram_snapshot::blk;
+#[cfg(all(feature = "blk", feature = "net"))]
+use crate::ram_snapshot::nic;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +45,41 @@ struct MetadataV2 {
     vm: VmState,
     regions: Vec<Region>,
     disks: Vec<blk::DiskMeta>,
+}
+
+/// Version-3 metadata: version-2 sections plus the internal NIC.
+#[cfg(all(feature = "blk", feature = "net"))]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataV3 {
+    compatibility: Compatibility,
+    cpus: Vec<CpuState>,
+    vm: VmState,
+    regions: Vec<Region>,
+    disks: Vec<blk::DiskMeta>,
+    nic: nic::NicMeta,
+}
+
+/// Explicit rejection for a restore entry that cannot take `version`.
+fn reject_version(version: u32) -> Error {
+    match version {
+        FULL_VERSION_V2 => {
+            Error::Invalid("full snapshot version 2 contains disks; use restore_full_with_disks")
+        }
+        FULL_VERSION_V3 => Error::Invalid(
+            "full snapshot version 3 contains a network device; use restore_full_with_net",
+        ),
+        _ => Error::Invalid("unsupported full snapshot version"),
+    }
+}
+
+/// Which irqfds a capture deassigned, recorded even on failure so recovery
+/// reassigns exactly those.
+#[cfg(feature = "blk")]
+#[derive(Default)]
+struct Drained {
+    disks: Vec<usize>,
+    nic: bool,
 }
 
 struct BoundedMetadata(Vec<u8>);
@@ -70,10 +111,7 @@ fn read_header(file: &mut File) -> Result<(u32, usize)> {
     if len == 0 || len > MAX_METADATA {
         return Err(Error::Invalid("full metadata exceeds 16 MiB or is empty"));
     }
-    Ok((
-        u32::from_le_bytes(header[8..12].try_into().unwrap()),
-        len,
-    ))
+    Ok((u32::from_le_bytes(header[8..12].try_into().unwrap()), len))
 }
 
 fn validate_metadata_common(
@@ -95,19 +133,20 @@ fn validate_metadata_common(
 
 fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<Metadata> {
     let (version, len) = read_header(file)?;
-    if version == FULL_VERSION_V2 {
-        return Err(Error::Invalid(
-            "full snapshot version 2 contains disks; use restore_full_with_disks",
-        ));
-    }
     if version != FULL_VERSION {
-        return Err(Error::Invalid("unsupported full snapshot version"));
+        return Err(reject_version(version));
     }
     let mut encoded = vec![0; len];
     file.read_exact(&mut encoded)?;
     let metadata: Metadata =
         serde_json::from_slice(&encoded).map_err(|e| Error::Full(format!("metadata JSON: {e}")))?;
-    validate_metadata_common(&metadata.cpus, &metadata.vm, &metadata.regions, max_cpus, max_slots)?;
+    validate_metadata_common(
+        &metadata.cpus,
+        &metadata.vm,
+        &metadata.regions,
+        max_cpus,
+        max_slots,
+    )?;
     let expected = (16 + len as u64)
         .checked_add(payload_len(&metadata.regions, max_slots)?)
         .ok_or(Error::Invalid("full snapshot length overflow"))?;
@@ -117,25 +156,31 @@ fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<M
     Ok(metadata)
 }
 
-/// Read version-2 metadata and validate the exact total length, including
-/// every disk segment, before any target resource is created.
+/// Read device-image metadata of `version` and validate the exact total
+/// length, including every disk segment, before any target resource is
+/// created; `validate` adds the version's own metadata checks.
 #[cfg(feature = "blk")]
-fn read_metadata_v2(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<MetadataV2> {
-    let (version, len) = read_header(file)?;
-    if version != FULL_VERSION_V2 {
-        return Err(Error::Invalid(
-            "full snapshot version 2 required for restore_full_with_disks",
-        ));
+fn read_device_metadata<M: serde::de::DeserializeOwned>(
+    file: &mut File,
+    version: u32,
+    max_slots: usize,
+    max_cpus: usize,
+    sections: impl Fn(&M) -> (&[CpuState], &VmState, &[Region], &[blk::DiskMeta]),
+) -> Result<M> {
+    let (found, len) = read_header(file)?;
+    if found != version {
+        return Err(reject_version(found));
     }
     let mut encoded = vec![0; len];
     file.read_exact(&mut encoded)?;
-    let metadata: MetadataV2 = serde_json::from_slice(&encoded)
-        .map_err(|e| Error::Full(format!("metadata JSON: {e}")))?;
-    validate_metadata_common(&metadata.cpus, &metadata.vm, &metadata.regions, max_cpus, max_slots)?;
+    let metadata: M =
+        serde_json::from_slice(&encoded).map_err(|e| Error::Full(format!("metadata JSON: {e}")))?;
+    let (cpus, vm, regions, disks) = sections(&metadata);
+    validate_metadata_common(cpus, vm, regions, max_cpus, max_slots)?;
     let mut expected = (16 + len as u64)
-        .checked_add(payload_len(&metadata.regions, max_slots)?)
+        .checked_add(payload_len(regions, max_slots)?)
         .ok_or(Error::Invalid("full snapshot length overflow"))?;
-    for disk in &metadata.disks {
+    for disk in disks {
         expected = expected
             .checked_add(disk.disk_bytes)
             .ok_or(Error::Invalid("full snapshot disk length overflow"))?;
@@ -145,7 +190,31 @@ fn read_metadata_v2(file: &mut File, max_slots: usize, max_cpus: usize) -> Resul
             "full snapshot length differs from metadata and disk segments",
         ));
     }
-    blk::validate_disk_metadata(&metadata.disks, &metadata.regions)?;
+    blk::validate_disk_metadata(disks, regions)?;
+    Ok(metadata)
+}
+
+#[cfg(feature = "blk")]
+fn read_metadata_v2(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<MetadataV2> {
+    read_device_metadata(
+        file,
+        FULL_VERSION_V2,
+        max_slots,
+        max_cpus,
+        |m: &MetadataV2| (&m.cpus, &m.vm, &m.regions, &m.disks),
+    )
+}
+
+#[cfg(all(feature = "blk", feature = "net"))]
+fn read_metadata_v3(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<MetadataV3> {
+    let metadata = read_device_metadata(
+        file,
+        FULL_VERSION_V3,
+        max_slots,
+        max_cpus,
+        |m: &MetadataV3| (&m.cpus, &m.vm, &m.regions, &m.disks),
+    )?;
+    nic::validate_nic_metadata(&metadata.nic, &metadata.disks, &metadata.regions)?;
     Ok(metadata)
 }
 
@@ -172,11 +241,7 @@ fn read_ram(file: &mut File, regions: &[Region]) -> Result<GuestMemoryMmap> {
 
 /// Create the 0600 exclusive image with an invalid magic placeholder and
 /// write the versioned header plus JSON state.
-fn write_header_and_metadata(
-    path: &Path,
-    version: u32,
-    encoded: &[u8],
-) -> Result<PendingSnapshot> {
+fn write_header_and_metadata(path: &Path, version: u32, encoded: &[u8]) -> Result<PendingSnapshot> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -233,24 +298,43 @@ fn write_pending(
     Ok(pending)
 }
 
-/// Version-2 writer: header, JSON, RAM, then ordered raw disk segments.
+/// Version-2/3 writer: header, JSON, RAM, then ordered raw disk segments.
 #[cfg(feature = "blk")]
-fn write_pending_v2(
+fn write_pending_with_disks<M: Serialize>(
     path: &Path,
+    version: u32,
     memory: &GuestMemoryMmap,
-    metadata: &MetadataV2,
+    metadata: &M,
+    regions: &[Region],
     disks: &[blk::BlkDevice],
+    disk_metas: &[blk::DiskMeta],
 ) -> Result<PendingSnapshot> {
     let mut encoded = BoundedMetadata(Vec::new());
     serde_json::to_writer(&mut encoded, metadata)
         .map_err(|e| Error::Full(format!("metadata encoding: {e}")))?;
-    let mut pending = write_header_and_metadata(path, FULL_VERSION_V2, &encoded.0)?;
-    write_ram_regions(&mut pending, memory, &metadata.regions)?;
-    blk::copy_disk_segments(&mut pending.file, disks, &metadata.disks)?;
+    let mut pending = write_header_and_metadata(path, version, &encoded.0)?;
+    write_ram_regions(&mut pending, memory, regions)?;
+    blk::copy_disk_segments(&mut pending.file, disks, disk_metas)?;
     pending.file.sync_all()?;
     Ok(pending)
 }
 
+/// Capture the target's compatibility and check the saved CPUs against it.
+fn validate_target(
+    kvm: &KvmContext,
+    saved: &Compatibility,
+    cpus: &[CpuState],
+) -> Result<Compatibility> {
+    let target = Compatibility::capture(kvm.fd()).map_err(Error::Full)?;
+    saved.validate_target(&target).map_err(Error::Full)?;
+    for (id, state) in cpus.iter().enumerate() {
+        target.validate_cpu(state).map_err(Error::Full)?;
+        target
+            .validate_topology(state, id, cpus.len())
+            .map_err(Error::Full)?;
+    }
+    Ok(target)
+}
 
 /// Fold up to three recovery results into one error: the first failure is
 /// the operation error, one further failure becomes its recovery error.
@@ -287,8 +371,8 @@ impl RamSnapshotVm {
 
     pub(crate) fn save_full(&mut self, path: &Path) -> Result<()> {
         #[cfg(feature = "blk")]
-        if !self.disks.is_empty() {
-            return self.save_full_with_disks(path);
+        if self.has_devices() {
+            return self.save_full_with_devices(path);
         }
         if self.control.unusable || self.paused || self.handles.is_empty() || !self.irqchip_ready {
             return Err(Error::Invalid(
@@ -371,15 +455,17 @@ impl RamSnapshotVm {
         }
     }
 
-    /// Version-2 save with attached disks.
+    /// Version-2 (disks) or version-3 (NIC, optional disks) save.
     ///
-    /// Order: configuration checks -> pause/ack ALL vCPUs -> freeze/flush ALL
-    /// devices -> RAM alias probe at the quiescent boundary -> interrupt
-    /// drain (synchronous KVM deassign) -> device, CPU, KVM, RAM and disk
-    /// capture -> sync file -> reassign source irqfds, resume ALL devices,
-    /// resume ALL CPUs (each attempted independently) -> publish valid magic.
+    /// Order: configuration checks -> pause/ack ALL vCPUs -> freeze ALL
+    /// devices (every disk, then the NIC) -> ONE RAM alias probe at the
+    /// quiescent boundary -> interrupt drain (synchronous KVM deassign) ->
+    /// device, CPU, KVM, RAM and disk capture -> sync file -> reassign
+    /// source irqfds, resume ALL devices, resume ALL CPUs (each attempted
+    /// independently) -> publish valid magic. The source NIC keeps its
+    /// backend connection and worker buffers across the save.
     #[cfg(feature = "blk")]
-    fn save_full_with_disks(&mut self, path: &Path) -> Result<()> {
+    fn save_full_with_devices(&mut self, path: &Path) -> Result<()> {
         if self.control.unusable || self.paused || self.handles.is_empty() || !self.irqchip_ready {
             return Err(Error::Invalid(
                 "full save requires a running usable kernel-irqchip VM",
@@ -401,14 +487,21 @@ impl RamSnapshotVm {
         if pause.is_err() {
             self.control.unusable = true;
         }
-        // Which irqfds a capture deassigned, recorded even on failure so
-        // recovery reassigns exactly those.
-        let mut drained = Vec::new();
+        let mut drained = Drained::default();
         let operation = pause.and_then(|_| {
             // vCPUs are paused: device activation cannot race the expected
-            // clone count, and the RAM alias probe runs inside the capture
-            // at the quiescent post-freeze boundary.
-            let disks = blk::freeze_capture_devices(self, &regions, &mut drained)?;
+            // clone count. Every worker is frozen before the single probe,
+            // so no transient mapping clone is alive when it counts.
+            let frozen_disks = blk::freeze_disks(self)?;
+            #[cfg(feature = "net")]
+            let frozen_nic = nic::freeze(self)?;
+            self.probe_ram_aliases(self.expected_device_clones())?;
+            blk::drain_disk_irqfds(self, &mut drained.disks)?;
+            #[cfg(feature = "net")]
+            nic::drain_irqfd(self, &mut drained.nic)?;
+            let disks = blk::capture_disks(self, &frozen_disks, &regions)?;
+            #[cfg(feature = "net")]
+            let nic = nic::capture(self, frozen_nic, &disks, &regions)?;
             let mut cpus = Vec::with_capacity(self.handles.len());
             for (id, handle) in self.handles.iter().enumerate() {
                 let state = snapshot::request(handle, |reply| Request::Save {
@@ -423,17 +516,41 @@ impl RamSnapshotVm {
                 cpus.push(state);
             }
             let vm = self.vm.save_state().map_err(Error::State)?;
-            write_pending_v2(
-                path,
-                &self.memory,
-                &MetadataV2 {
+            #[cfg(feature = "net")]
+            if let Some(nic) = nic {
+                let metadata = MetadataV3 {
                     compatibility,
                     cpus,
                     vm,
                     regions,
                     disks,
-                },
+                    nic,
+                };
+                return write_pending_with_disks(
+                    path,
+                    FULL_VERSION_V3,
+                    &self.memory,
+                    &metadata,
+                    &metadata.regions,
+                    &self.disks,
+                    &metadata.disks,
+                );
+            }
+            let metadata = MetadataV2 {
+                compatibility,
+                cpus,
+                vm,
+                regions,
+                disks,
+            };
+            write_pending_with_disks(
+                path,
+                FULL_VERSION_V2,
+                &self.memory,
+                &metadata,
+                &metadata.regions,
                 &self.disks,
+                &metadata.disks,
             )
         });
         // Restore source devices and ALL CPUs before deciding publication,
@@ -443,8 +560,8 @@ impl RamSnapshotVm {
         // cannot signal an unregistered eventfd), resume every device
         // (also on the success path: a saved source VM keeps running),
         // then resume every CPU.
-        let irqfds = blk::reassign_irqfds(self, &drained);
-        let devices = blk::resume_devices(self);
+        let irqfds = self.reassign_irqfds(&drained);
+        let devices = self.resume_devices();
         let resume = Control::transition(&self.handles, false, CONTROL_TIMEOUT);
         if irqfds.is_err() || devices.is_err() || resume.is_err() {
             self.control.unusable = true;
@@ -469,6 +586,30 @@ impl RamSnapshotVm {
             }),
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
+    }
+
+    /// Reassign every drained irqfd (disks, then the NIC); a single failure
+    /// must not skip the rest.
+    #[cfg(feature = "blk")]
+    fn reassign_irqfds(&self, drained: &Drained) -> Result<()> {
+        let disks = blk::reassign_irqfds(self, &drained.disks);
+        #[cfg(feature = "net")]
+        let nic = nic::reassign_irqfd(self, drained.nic);
+        #[cfg(not(feature = "net"))]
+        let nic: Result<()> = Ok(());
+        disks.and(nic)
+    }
+
+    /// Resume every device worker (disks, then the NIC); each actively
+    /// re-examines its queues, and one failure does not skip the rest.
+    #[cfg(feature = "blk")]
+    fn resume_devices(&self) -> Result<()> {
+        let disks = blk::resume_devices(self);
+        #[cfg(feature = "net")]
+        let nic = nic::resume(self);
+        #[cfg(not(feature = "net"))]
+        let nic: Result<()> = Ok(());
+        disks.and(nic)
     }
 
     /// Restore scaffolding: new VM/irqchip. Devices must be attached (blk)
@@ -525,17 +666,7 @@ impl RamSnapshotVm {
         let kvm = KvmContext::new().map_err(Error::State)?;
         let mut file = File::open(path)?;
         let metadata = read_metadata(&mut file, kvm.max_memslots(), kvm.fd().get_max_vcpus())?;
-        let target = Compatibility::capture(kvm.fd()).map_err(Error::Full)?;
-        metadata
-            .compatibility
-            .validate_target(&target)
-            .map_err(Error::Full)?;
-        for (id, state) in metadata.cpus.iter().enumerate() {
-            target.validate_cpu(state).map_err(Error::Full)?;
-            target
-                .validate_topology(state, id, metadata.cpus.len())
-                .map_err(Error::Full)?;
-        }
+        let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
         let memory = read_ram(&mut file, &metadata.regions)?;
         let mut owner = Self::restore_scaffold(&kvm, memory)?;
         owner.restore_cpus_and_vm(&target, metadata.cpus, metadata.vm)?;
@@ -555,21 +686,11 @@ impl RamSnapshotVm {
             return Self::restore_full(path);
         }
         if version != FULL_VERSION_V2 {
-            return Err(Error::Invalid("unsupported full snapshot version"));
+            return Err(reject_version(version));
         }
         file.seek(SeekFrom::Start(0))?;
         let metadata = read_metadata_v2(&mut file, kvm.max_memslots(), kvm.fd().get_max_vcpus())?;
-        let target = Compatibility::capture(kvm.fd()).map_err(Error::Full)?;
-        metadata
-            .compatibility
-            .validate_target(&target)
-            .map_err(Error::Full)?;
-        for (id, state) in metadata.cpus.iter().enumerate() {
-            target.validate_cpu(state).map_err(Error::Full)?;
-            target
-                .validate_topology(state, id, metadata.cpus.len())
-                .map_err(Error::Full)?;
-        }
+        let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
         // RAM first (file order), then validate the active rings against the
         // loaded memory, and only then create the destination directory.
         let memory = read_ram(&mut file, &metadata.regions)?;
@@ -595,18 +716,64 @@ impl RamSnapshotVm {
         restore
     }
 
+    /// Restore a version-3 checkpoint with the internal NIC, connecting a
+    /// freshly started compatible UnixStream backend at `socket_path`.
+    /// Disk segments, if any, are imported as in `restore_full_with_disks`
+    /// (no destination is created for a disk-free image). Versions 1 and 2
+    /// have no NIC and are rejected. Returns a paused owner: cut-time TX the
+    /// source had not consumed is already completed as dropped and its
+    /// interrupt raised into the restored irqchip; `resume` starts it.
+    #[cfg(all(feature = "blk", feature = "net"))]
+    pub(crate) fn restore_full_with_net(
+        path: &Path,
+        disk_destination: &Path,
+        socket_path: &Path,
+    ) -> Result<Self> {
+        let kvm = KvmContext::new().map_err(Error::State)?;
+        let mut file = File::open(path)?;
+        let metadata = read_metadata_v3(&mut file, kvm.max_memslots(), kvm.fd().get_max_vcpus())?;
+        let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
+        // RAM first (file order), then every ring against the loaded memory,
+        // and only then any directory, socket or thread.
+        let memory = read_ram(&mut file, &metadata.regions)?;
+        blk::validate_disk_rings(&metadata.disks, &memory)?;
+        nic::validate_nic_rings(&metadata.nic, &memory)?;
+        // As in restore_full_with_disks, the owner takes the import guard
+        // before any worker starts; a failure drops the half-built owner,
+        // which joins CPUs, then workers, then removes imported files.
+        let (imported, paths) = if metadata.disks.is_empty() {
+            (None, Vec::new())
+        } else {
+            let (imported, paths) =
+                blk::import_disks(&mut file, &metadata.disks, disk_destination)?;
+            (Some(imported), paths)
+        };
+        let mut owner = Self::restore_scaffold(&kvm, memory)?;
+        owner.imported = imported;
+        // Devices attach BEFORE the vCPU threads snapshot the bus.
+        blk::restore_devices(&mut owner, &metadata.disks, &paths)?;
+        nic::restore_nic(&mut owner, &metadata.nic, socket_path)?;
+        owner.restore_cpus_and_vm(&target, metadata.cpus, metadata.vm)?;
+        // Only now: loading the irqchip state would overwrite an earlier
+        // injection. The vCPUs stay paused.
+        nic::signal_discarded_tx(&mut owner)?;
+        Ok(owner)
+    }
+
     pub(crate) fn resume(&mut self) -> Result<()> {
         if !self.paused || self.control.unusable || self.handles.is_empty() {
             return Err(Error::Invalid("resume requires a restored paused full VM"));
         }
         // Devices first: their resumed workers actively re-examine queues,
-        // so no kick count is lost when the CPUs start running.
+        // so no kick count is lost when the CPUs start running. If any
+        // device fails to resume, no vCPU is resumed at all.
         #[cfg(feature = "blk")]
-        let devices = blk::resume_devices(self);
+        let devices = self.resume_devices();
         #[cfg(not(feature = "blk"))]
         let devices: Result<()> = Ok(());
-        let result = Control::transition(&self.handles, false, CONTROL_TIMEOUT);
-        if devices.is_err() || result.is_err() {
+        let result =
+            devices.and_then(|_| Control::transition(&self.handles, false, CONTROL_TIMEOUT));
+        if result.is_err() {
             // Incomplete resume: no thread keeps running. CPUs join first
             // (they could still touch devices), then the workers join; the
             // imported guard removal stays with the owner drop.
@@ -615,8 +782,8 @@ impl RamSnapshotVm {
                 handle.finish();
             }
             #[cfg(feature = "blk")]
-            blk::stop_devices(self);
-            return devices.and(result);
+            self.stop_devices();
+            return result;
         }
         self.paused = false;
         result

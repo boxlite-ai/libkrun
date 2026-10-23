@@ -493,6 +493,37 @@ impl Queue {
             .inspect(|_| self.next_avail += Wrapping(1))
     }
 
+    /// Complete every chain the driver made available but the device has
+    /// not consumed with used length 0 and return how many were completed.
+    /// Only the avail ring is read: each head index is checked and used as
+    /// is, and the chains' descriptors (old buffers) are never parsed. The
+    /// count is fixed by the avail index read once on entry, so a racing
+    /// driver cannot extend it. Fails without completing anything if the
+    /// count exceeds the queue or a head is not a valid descriptor index.
+    pub fn discard_available(&mut self, mem: &GuestMemoryMmap) -> Result<u16, Error> {
+        let size = self.actual_size();
+        let pending = (self.avail_idx(mem, Ordering::Acquire)? - self.next_avail).0;
+        if pending > size {
+            return Err(Error::InvalidSize);
+        }
+        let mut heads = Vec::with_capacity(usize::from(pending));
+        for offset in 0..pending {
+            let slot = (self.next_avail.0.wrapping_add(offset) % size) as u64;
+            let head: u16 = mem
+                .read_obj(self.avail_ring.unchecked_add(4 + 2 * slot))
+                .map_err(Error::GuestMemory)?;
+            if head >= size {
+                return Err(Error::InvalidDescriptorIndex);
+            }
+            heads.push(head);
+        }
+        for head in heads {
+            self.next_avail += Wrapping(1);
+            self.add_used(mem, head, 0)?;
+        }
+        Ok(pending)
+    }
+
     /// Undo the effects of the last `self.pop()` call.
     /// The caller can use this, if it was unable to consume the last popped descriptor chain.
     pub fn undo_pop(&mut self) {
@@ -1143,5 +1174,64 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    /// A restore drops cut-time chains by head index alone: old descriptor
+    /// bodies may be garbage (a NEXT link out of range here) without
+    /// failing the discard, cursors wrap in u16 space, and a head outside
+    /// the table fails before anything is completed.
+    #[test]
+    fn snapshot_net_queue_discard_uses_heads_not_descriptor_bodies() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut queue = Queue::new(16);
+        queue.size = 16;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x2000);
+        queue.used_ring = GuestAddress(0x3000);
+        queue.next_avail = Wrapping(0xfffe);
+        queue.next_used = Wrapping(0xfffe);
+        mem.write_obj(0xfffe_u16, GuestAddress(0x3002)).unwrap();
+        // Three chains across the u16 wrap; head 4 links to descriptor 500.
+        for (offset, head) in [(0u16, 4u16), (1, 7), (2, 9)] {
+            let slot = u64::from(0xfffe_u16.wrapping_add(offset) % 16);
+            mem.write_obj(head, GuestAddress(0x2004 + 2 * slot))
+                .unwrap();
+        }
+        mem.write_obj(0xfffe_u16.wrapping_add(3), GuestAddress(0x2002))
+            .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0xdead_0000_0000,
+                len: u32::MAX,
+                flags: VIRTQ_DESC_F_NEXT,
+                next: 500,
+            },
+            GuestAddress(0x1000 + 16 * 4),
+        )
+        .unwrap();
+
+        assert_eq!(queue.discard_available(&mem).unwrap(), 3);
+        assert_eq!(queue.next_avail, Wrapping(1));
+        let used_idx: u16 = mem.read_obj(GuestAddress(0x3002)).unwrap();
+        assert_eq!(used_idx, 1);
+        for (offset, head) in [(0u16, 4u32), (1, 7), (2, 9)] {
+            let slot = u64::from(0xfffe_u16.wrapping_add(offset) % 16);
+            let elem: (u32, u32) = (
+                mem.read_obj(GuestAddress(0x3004 + 8 * slot)).unwrap(),
+                mem.read_obj(GuestAddress(0x3008 + 8 * slot)).unwrap(),
+            );
+            assert_eq!(elem, (head, 0));
+        }
+        assert_eq!(queue.discard_available(&mem).unwrap(), 0);
+
+        // An invalid head fails before any completion.
+        mem.write_obj(16u16, GuestAddress(0x2004 + 2)).unwrap();
+        mem.write_obj(2u16, GuestAddress(0x2002)).unwrap();
+        mem.write_obj(3u16, GuestAddress(0x2004)).unwrap();
+        assert!(queue.discard_available(&mem).is_err());
+        assert_eq!(queue.next_avail, Wrapping(1));
+        let used_idx: u16 = mem.read_obj(GuestAddress(0x3002)).unwrap();
+        assert_eq!(used_idx, 1);
     }
 }

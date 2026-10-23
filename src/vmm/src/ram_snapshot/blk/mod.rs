@@ -12,14 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use devices::virtio::block::device::VIRTIO_BLK_CONFIG_SIZE;
-use devices::virtio::block::{snapshot_offered_features, snapshot_sync_mode, Block, ImageType, SyncMode};
+use devices::virtio::block::{
+    snapshot_offered_features, snapshot_sync_mode, Block, ImageType, SyncMode,
+};
 use devices::virtio::persist::{MmioTransportState, QueueState, VirtioDeviceState};
 use devices::virtio::{CacheType, MmioTransport, VirtioDevice, TYPE_BLOCK};
 use kvm_ioctls::IoEventAddress;
 use serde::{Deserialize, Serialize};
 use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
-use super::{Error, Region, Result, RamSnapshotVm, CHUNK_SIZE};
+use super::{Error, RamSnapshotVm, Region, Result, CHUNK_SIZE};
 
 /// Fixed internal MMIO window for snapshot disks, above ordinary guest RAM.
 pub(super) const MMIO_BASE: u64 = 0xd000_0000;
@@ -102,7 +104,9 @@ pub(super) fn validate_disk_metadata(disks: &[DiskMeta], regions: &[Region]) -> 
             ));
         }
         if !addrs.insert(disk.mmio_addr) || !irqs.insert(disk.irq) {
-            return Err(Error::Invalid("disk MMIO/IRQ conflicts with another device"));
+            return Err(Error::Invalid(
+                "disk MMIO/IRQ conflicts with another device",
+            ));
         }
         for region in regions {
             let end = region.gpa + region.len;
@@ -116,7 +120,9 @@ pub(super) fn validate_disk_metadata(disks: &[DiskMeta], regions: &[Region]) -> 
             ));
         }
         if disk.disk_bytes == 0 || disk.disk_bytes % SECTOR_SIZE != 0 {
-            return Err(Error::Invalid("disk segment length is not a sector multiple"));
+            return Err(Error::Invalid(
+                "disk segment length is not a sector multiple",
+            ));
         }
         // Capacity multiplication must reproduce the exact segment length.
         let capacity = u64::from_le_bytes(disk.config[0..8].try_into().unwrap());
@@ -128,9 +134,9 @@ pub(super) fn validate_disk_metadata(disks: &[DiskMeta], regions: &[Region]) -> 
                 "disk capacity does not match the captured segment length",
             ));
         }
-        disk.transport
-            .validate()
-            .map_err(|_| Error::Invalid("disk transport registers are outside the state machine"))?;
+        disk.transport.validate().map_err(|_| {
+            Error::Invalid("disk transport registers are outside the state machine")
+        })?;
         disk.device
             .validate_structure(TYPE_BLOCK, 1, QUEUE_MAX_SIZE)
             .map_err(|_| Error::Invalid("disk virtio state is structurally inconsistent"))?;
@@ -184,20 +190,25 @@ pub(super) fn attach_disk(
         ));
     }
     if !vm.handles.is_empty() {
-        return Err(Error::Invalid("internal disks attach only before vCPU start"));
+        return Err(Error::Invalid(
+            "internal disks attach only before vCPU start",
+        ));
     }
-    if vm.disks.len() >= MAX_DISKS {
+    if vm.disks.len() >= vm.disk_capacity() {
         return Err(Error::Invalid("internal disk window is full"));
     }
     // Reject nonregular sources before anything is opened or registered.
-    if !fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false) {
+    if !fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+    {
         return Err(Error::Invalid("internal disk source is not a regular file"));
     }
     let attach = (|| -> Result<BlkDevice> {
         // The stage-2 alias protection, parameterized by the clones the
         // already-attached devices legitimately hold (none activated here:
         // no guest has run yet).
-        vm.probe_ram_aliases(expected_alias_clones(vm))?;
+        vm.probe_ram_aliases(vm.expected_device_clones())?;
         let index = vm.disks.len();
         let mmio_addr = MMIO_BASE + index as u64 * MMIO_LEN;
         let irq = IRQ_BASE + index as u32;
@@ -233,8 +244,9 @@ pub(super) fn attach_disk(
         )
         .map_err(|e| Error::Full(format!("open internal disk: {e}")))?;
         let block = Arc::new(Mutex::new(block));
-        let intc: devices::legacy::IrqChip =
-            Arc::new(Mutex::new(devices::legacy::IrqChipDevice::new(Box::new(ioapic))));
+        let intc: devices::legacy::IrqChip = Arc::new(Mutex::new(
+            devices::legacy::IrqChipDevice::new(Box::new(ioapic)),
+        ));
         let transport = Arc::new(Mutex::new(
             MmioTransport::new(vm.memory.clone(), intc, block.clone())
                 .map_err(|e| Error::Full(format!("create block transport: {e}")))?,
@@ -262,7 +274,7 @@ pub(super) fn attach_disk(
 
 /// Register ioeventfd/irqfd at a fixed address and IRQ and put the transport
 /// on the bus. On failure every registration made here is rolled back.
-fn register_device(
+pub(super) fn register_device(
     vm: &mut RamSnapshotVm,
     transport: &Arc<Mutex<MmioTransport>>,
     mmio_addr: u64,
@@ -312,25 +324,21 @@ fn rollback_registrations(
     irq: u32,
 ) {
     for (queue, queue_evt) in transport.queue_evts().iter().enumerate() {
-        let _ = vm.vm.fd().unregister_ioevent(queue_evt, io_addr, queue as u32);
+        let _ = vm
+            .vm
+            .fd()
+            .unregister_ioevent(queue_evt, io_addr, queue as u32);
     }
     let _ = vm.vm.fd().unregister_irqfd(transport.interrupt_evt(), irq);
 }
 
-/// Freeze every device, then verify RAM ownership at the now-quiescent
-/// boundary, then drain interrupts and capture. `drained` records which
-/// irqfds were deassigned even on failure, so recovery reassigns them.
-pub(super) fn freeze_capture_devices(
-    vm: &mut RamSnapshotVm,
-    regions: &[Region],
-    drained: &mut Vec<usize>,
-) -> Result<Vec<DiskMeta>> {
-    // 1. Freeze ALL devices: each freeze lands after the in-flight request
-    //    finished its status write, used-ring update and interrupt, and the
-    //    disk was flushed and synced regardless of the guest cache mode.
-    //    Inactive devices hold no worker; their shared image is flushed
-    //    directly.
-    let mut frozen_queues: Vec<Option<QueueState>> = Vec::with_capacity(vm.disks.len());
+/// Freeze every disk: each freeze lands after the in-flight request
+/// finished its status write, used-ring update and interrupt, and the disk
+/// was flushed and synced regardless of the guest cache mode. Inactive
+/// devices hold no worker; their shared image is flushed directly. Returns
+/// the frozen worker queue per disk (None when inactive).
+pub(super) fn freeze_disks(vm: &RamSnapshotVm) -> Result<Vec<Option<QueueState>>> {
+    let mut frozen_queues = Vec::with_capacity(vm.disks.len());
     for (index, device) in vm.disks.iter().enumerate() {
         let block = device.block.lock().unwrap();
         let frozen_queue = if block.is_activated() {
@@ -358,14 +366,15 @@ pub(super) fn freeze_capture_devices(
         };
         frozen_queues.push(frozen_queue);
     }
+    Ok(frozen_queues)
+}
 
-    // 2. RAM ownership at a quiescent boundary: every freeze is confirmed,
-    //    so no worker holds a transient mapping clone.
-    vm.probe_ram_aliases(expected_alias_clones(vm))?;
-
-    // 3. Interrupt drain: KVM_IRQFD DEASSIGN flushes the injection workqueue
-    //    before returning (Linux v6.12 virt/kvm/eventfd.c contract), then the
-    //    stale eventfd counts are drained so a later reassign stays clean.
+/// Deassign every disk irqfd and drain its count. KVM_IRQFD DEASSIGN
+/// flushes the injection workqueue before returning (Linux v6.12
+/// virt/kvm/eventfd.c contract), so the transport interrupt status includes
+/// every completed injection afterwards. `drained` records each deassigned
+/// disk even on failure, so recovery reassigns exactly those.
+pub(super) fn drain_disk_irqfds(vm: &RamSnapshotVm, drained: &mut Vec<usize>) -> Result<()> {
     for (index, device) in vm.disks.iter().enumerate() {
         let transport = device.transport.lock().unwrap();
         vm.vm
@@ -375,9 +384,16 @@ pub(super) fn freeze_capture_devices(
         drained.push(index);
         drain_eventfd_count(transport.interrupt_evt());
     }
+    Ok(())
+}
 
-    // 4. Capture device state with interrupts drained: interrupt_status now
-    //    includes every injection the kernel completed before the deassign.
+/// Capture every frozen, drained disk and validate the result against the
+/// rings in guest RAM.
+pub(super) fn capture_disks(
+    vm: &RamSnapshotVm,
+    frozen_queues: &[Option<QueueState>],
+    regions: &[Region],
+) -> Result<Vec<DiskMeta>> {
     let mut metas = Vec::with_capacity(vm.disks.len());
     for (index, device) in vm.disks.iter().enumerate() {
         let transport = device.transport.lock().unwrap();
@@ -421,7 +437,11 @@ pub(super) fn reassign_irqfds(vm: &RamSnapshotVm, drained: &[usize]) -> Result<(
     for index in drained {
         let device = &vm.disks[*index];
         let transport = device.transport.lock().unwrap();
-        if let Err(e) = vm.vm.fd().register_irqfd(transport.interrupt_evt(), device.irq) {
+        if let Err(e) = vm
+            .vm
+            .fd()
+            .register_irqfd(transport.interrupt_evt(), device.irq)
+        {
             if first.is_none() {
                 first = Some(Error::Full(format!("reassign irqfd {index}: {e}")));
             }
@@ -605,8 +625,9 @@ pub(super) fn restore_devices(
             .map_err(|e| Error::Full(format!("restore disk {index} identity: {e:?}")))?;
         block.set_acked_features(meta.device.acked_features);
         let block = Arc::new(Mutex::new(block));
-        let intc: devices::legacy::IrqChip =
-            Arc::new(Mutex::new(devices::legacy::IrqChipDevice::new(Box::new(ioapic))));
+        let intc: devices::legacy::IrqChip = Arc::new(Mutex::new(
+            devices::legacy::IrqChipDevice::new(Box::new(ioapic)),
+        ));
         let transport = Arc::new(Mutex::new(
             MmioTransport::new(vm.memory.clone(), intc, block.clone())
                 .map_err(|e| Error::Full(format!("create restored transport {index}: {e}")))?,
@@ -654,7 +675,7 @@ pub(super) fn stop_devices(vm: &RamSnapshotVm) {
 mod tests;
 
 /// Read the current eventfd count without blocking, if any.
-fn drain_eventfd_count(fd: &utils::eventfd::EventFd) {
+pub(super) fn drain_eventfd_count(fd: &utils::eventfd::EventFd) {
     let mut pollfd = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
