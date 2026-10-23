@@ -255,12 +255,12 @@ pub(super) fn freeze(vm: &RamSnapshotVm) -> Result<Option<NetQueueStates>> {
         .map_err(|e| Error::Full(format!("freeze NIC: {e}")))
 }
 
-/// Capture the frozen, drained NIC. Worker-private buffers (deferred RX
-/// frame, partial backend frames, unfinished TX writes) are deliberately
-/// not captured.
+/// Capture the frozen, drained NIC from the cursors its freeze returned.
+/// Worker-private buffers (deferred RX frame, partial backend frames,
+/// unfinished TX writes) are deliberately not captured.
 pub(super) fn capture(
     vm: &RamSnapshotVm,
-    frozen: Option<NetQueueStates>,
+    frozen: Option<&NetQueueStates>,
     disks: &[DiskMeta],
     regions: &[Region],
 ) -> Result<Option<NicMeta>> {
@@ -270,7 +270,7 @@ pub(super) fn capture(
     let transport = nic.transport.lock().unwrap();
     let net = nic.net.lock().unwrap();
     let queues = match frozen {
-        Some(states) => vec![states.rx, states.tx],
+        Some(states) => vec![states.rx.clone(), states.tx.clone()],
         None => transport.queue_states(),
     };
     let meta = NicMeta {

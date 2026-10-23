@@ -1,17 +1,16 @@
-use std::collections::HashMap;
+use std::io;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use super::super::Queue as VirtQueue;
+use super::gate::VsockGate;
 use super::muxer::{push_packet, MuxerRx, ProxyMap};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
-use crate::virtio::vsock::defs;
-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::vsock::unix::UnixProxy;
 use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
 use rand::{rng, rngs::ThreadRng, Rng};
@@ -20,47 +19,46 @@ use vm_memory::GuestMemoryMmap;
 
 pub struct MuxerThread {
     cid: u64,
-    pub epoll: Epoll,
+    pub epoll: Arc<Epoll>,
+    gate: Arc<VsockGate>,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
-    unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
 }
 
 impl MuxerThread {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cid: u64,
-        epoll: Epoll,
+        epoll: Arc<Epoll>,
+        gate: Arc<VsockGate>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
-        unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
     ) -> Self {
         MuxerThread {
             cid,
             epoll,
+            gate,
             rxq,
             proxy_map,
             mem,
             queue,
             interrupt,
             reaper_sender,
-            unix_ipc_port_map,
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock muxer".into())
             .spawn(|| self.work())
-            .unwrap();
     }
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
@@ -122,7 +120,7 @@ impl MuxerThread {
                     self.queue.clone(),
                     self.rxq.clone(),
                 )),
-                NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
+                NewProxyType::Unix => match UnixProxy::new_reverse(
                     new_id,
                     self.cid,
                     local_port,
@@ -131,7 +129,15 @@ impl MuxerThread {
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),
-                )),
+                    &self.gate,
+                ) {
+                    Ok(proxy) => Box::new(proxy),
+                    // Dropping the accepted socket closes the host connection.
+                    Err(e) => {
+                        debug!("dropping accepted unix connection: {e}");
+                        return;
+                    }
+                },
             };
             self.proxy_map
                 .write()
@@ -149,32 +155,8 @@ impl MuxerThread {
         }
     }
 
-    fn create_lisening_ipc_sockets(&self) {
-        for (port, (path, do_listen)) in &self.unix_ipc_port_map {
-            if !do_listen {
-                continue;
-            }
-            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
-                Ok(proxy) => proxy,
-                Err(e) => {
-                    warn!("Failed to create listening proxy at {path:?}: {e:?}");
-                    continue;
-                }
-            };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(id, Mutex::new(Box::new(proxy)));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().as_raw_fd(), EventSet::IN);
-            };
-        }
-    }
-
     fn work(self) {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
@@ -183,6 +165,11 @@ impl MuxerThread {
             {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
+                        // Quiescing closes the gate before it writes the wake
+                        // eventfd; nothing is accepted or handled afterwards.
+                        if !self.gate.is_open() {
+                            return;
+                        }
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();

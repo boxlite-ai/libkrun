@@ -375,10 +375,12 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
     assert_eq!(Driver::used_idx(&source, TX_USED), 2);
 
     let image = dir.path("checkpoint");
-    source.save_full(&image).unwrap();
+    source.pause().unwrap();
+    source.export(&image).unwrap();
 
-    // The saved source keeps its backend and buffers: the partial frame
+    // The resumed source keeps its backend and buffers: the partial frame
     // completes and the cut-time TX is sent there, then the guest runs on.
+    source.resume().unwrap();
     stream.write_all(&partial[400..]).unwrap();
     Driver::wait_used(&source, RX_USED, 2);
     assert_eq!(Driver::rx_frame(&source, 1), partial);
@@ -393,7 +395,7 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
 
     // Restore with a freshly started backend.
     let new = Backend::start(dir.path("b.sock"));
-    let mut restored = RamSnapshotVm::restore_full(&image, resources(None, &new.path)).unwrap();
+    let mut restored = RamSnapshotVm::import(&image, resources(None, &new.path)).unwrap();
     let mut stream = new.accept();
 
     // Before any vCPU runs: the cut-time TX is completed as dropped exactly
@@ -446,7 +448,8 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
     );
 
     // The restored owner checkpoints again.
-    restored.save_full(&dir.path("second")).unwrap();
+    restored.pause().unwrap();
+    restored.export(&dir.path("second")).unwrap();
 }
 
 #[test]
@@ -460,14 +463,14 @@ fn snapshot_nic_kvm_inactive_nic_with_disk_activates_after_restore() {
     let source = source(&dir.path("absent.sock"), &[disk.clone()]);
     let image = dir.path("checkpoint");
     let mut source = source;
-    source.save_full(&image).unwrap();
+    source.pause().unwrap();
+    source.export(&image).unwrap();
     drop(source);
 
     // An inactive NIC connects nothing at restore time.
     let destination = dir.path("disks");
     let mut restored =
-        RamSnapshotVm::restore_full(&image, resources(Some(&destination), &dir.path("b.sock")))
-            .unwrap();
+        RamSnapshotVm::import(&image, resources(Some(&destination), &dir.path("b.sock"))).unwrap();
     assert_eq!(fs::read(destination.join("disk-0.raw")).unwrap(), bytes);
     restored.resume().unwrap();
     wait_counter(&restored, counter(&restored));
@@ -500,7 +503,8 @@ fn snapshot_nic_kvm_backend_failure_and_resource_mismatch_clean_up() {
     Driver::activate(&source);
     let _stream = old.accept();
     let image = dir.path("checkpoint");
-    source.save_full(&image).unwrap();
+    source.pause().unwrap();
+    source.export(&image).unwrap();
     drop(source);
 
     // Resources without the NIC socket are rejected before any import.
@@ -509,13 +513,13 @@ fn snapshot_nic_kvm_backend_failure_and_resource_mismatch_clean_up() {
         disk_dir: Some(destination.clone()),
         ..Default::default()
     };
-    assert!(RamSnapshotVm::restore_full(&image, disks_only).is_err());
+    assert!(RamSnapshotVm::import(&image, disks_only).is_err());
     assert!(!destination.exists());
 
     // No backend listening: the restore fails after importing the disk and
     // removes everything it created.
     let missing = dir.path("missing.sock");
-    assert!(RamSnapshotVm::restore_full(&image, resources(Some(&destination), &missing)).is_err());
+    assert!(RamSnapshotVm::import(&image, resources(Some(&destination), &missing)).is_err());
     assert!(!destination.exists(), "failed restore left imported disks");
 
     // A NIC-free image takes no NIC socket.
@@ -531,15 +535,16 @@ fn snapshot_nic_kvm_backend_failure_and_resource_mismatch_clean_up() {
             .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
             .unwrap();
         vm.start_vcpus(1, 0x1000).unwrap();
-        vm.save_full(&plain).unwrap();
+        vm.pause().unwrap();
+        vm.export(&plain).unwrap();
     }
     let new = Backend::start(dir.path("b.sock"));
-    assert!(RamSnapshotVm::restore_full(&plain, resources(None, &new.path)).is_err());
+    assert!(RamSnapshotVm::import(&plain, resources(None, &new.path)).is_err());
     assert!(!destination.exists());
 }
 
 #[test]
-fn snapshot_nic_kvm_save_failure_resumes_source_network() {
+fn snapshot_nic_kvm_export_failure_keeps_network_paused_until_resume() {
     let dir = TempDir::new();
     let old = Backend::start(dir.path("a.sock"));
     let mut source = source(&old.path, &[]);
@@ -549,23 +554,39 @@ fn snapshot_nic_kvm_save_failure_resumes_source_network() {
     driver.post_rx(&source, 4);
     Driver::kick(&source, 0);
 
+    source.pause().unwrap();
     let image = dir.path("checkpoint");
-    let failed = with_failed_payload_write(64 * 1024, || source.save_full(&image));
+    let failed = with_failed_payload_write(64 * 1024, || source.export(&image));
     assert!(failed.is_err());
-    assert!(!image.exists(), "a failed save published an image");
+    assert!(!image.exists(), "a failed export published an image");
 
-    // Every source resource resumed: the CPU runs and the NIC still moves
-    // frames on its original backend.
-    wait_counter(&source, counter(&source));
+    // Still paused: the CPU stays still and the frozen NIC delivers no
+    // frame, so a retried export captures the same cut.
+    let paused_at = counter(&source);
     let inbound = payload(7, 90);
     send_frame(&mut stream, &inbound);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        counter(&source),
+        paused_at,
+        "a failed export resumed the CPU"
+    );
+    assert_eq!(
+        Driver::used_idx(&source, RX_USED),
+        0,
+        "a frozen NIC delivered"
+    );
+    source.export(&image).unwrap();
+
+    // Resume: the CPU runs and the NIC moves frames on its original backend.
+    source.resume().unwrap();
+    wait_counter(&source, paused_at);
     Driver::wait_used(&source, RX_USED, 1);
     assert_eq!(Driver::rx_frame(&source, 0), inbound);
     let outbound = payload(8, 90);
     driver.submit_tx(&source, &outbound);
     Driver::kick(&source, 1);
     assert_eq!(recv_frame(&mut stream), outbound);
-    source.save_full(&image).unwrap();
 }
 
 #[test]

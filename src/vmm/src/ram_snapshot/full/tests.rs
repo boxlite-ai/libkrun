@@ -82,21 +82,22 @@ fn destroyed_source_multi_cpu_continues_register_stack_and_simd_without_reboot()
     for id in 0..2 {
         wait_changed(&owner, 0x8000 + id * 64, 0);
     }
-    owner.save_full(&dir.path()).unwrap();
+    owner.pause().unwrap();
+    owner.export(&dir.path()).unwrap();
     assert_eq!(
         fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
         0o600
     );
     drop(owner);
-    let mut restored =
-        RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
+    let mut restored = RamSnapshotVm::import(&dir.path(), RestoreResources::default()).unwrap();
     let counters: Vec<_> = (0..2).map(|id| read(&restored, 0x8000 + id * 64)).collect();
+    // A RAM-only save of the paused import neither fails nor resumes it.
+    restored.save(&dir.0.join("ram-while-paused")).unwrap();
     std::thread::sleep(Duration::from_millis(30));
     for id in 0..2 {
         assert_eq!(read(&restored, 0x8000 + id * 64), counters[id as usize]);
         assert_eq!(read(&restored, 0x8004 + id * 64), 1);
     }
-    assert!(restored.save(&dir.0.join("ram-while-paused")).is_err());
     restored.resume().unwrap();
     for id in 0..2 {
         wait_changed(&restored, 0x8000 + id * 64, counters[id as usize]);
@@ -111,7 +112,8 @@ fn destroyed_source_multi_cpu_continues_register_stack_and_simd_without_reboot()
             "cold initialization reran"
         );
     }
-    restored.save_full(&dir.0.join("second")).unwrap();
+    restored.pause().unwrap();
+    restored.export(&dir.0.join("second")).unwrap();
     assert!(restored
         .handles
         .iter()
@@ -124,15 +126,15 @@ fn halted_pit_lapic_and_deadline_continue_after_long_offline_pause() {
         let dir = TempDir::new();
         let mut owner = source(1, entry);
         wait_changed(&owner, 0x9000, 0);
-        // Keep CPU stopped while hardware may mature a pending interrupt; the
-        // subsequent full save uses the same idempotent Pause handshake.
-        Control::transition(&owner.handles, true, CONTROL_TIMEOUT).unwrap();
+        // Keep the CPU paused while hardware may mature a pending
+        // interrupt; the export captures that same pause.
+        owner.pause().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         if entry == 0x1200 {
             owner.vm.fd().set_irq_line(0, false).unwrap();
             owner.vm.fd().set_irq_line(0, true).unwrap();
         }
-        owner.save_full(&dir.path()).unwrap();
+        owner.export(&dir.path()).unwrap();
         let saved =
             read_metadata(&mut File::open(dir.path()).unwrap(), owner.max_slots, 32).unwrap();
         if entry == 0x1200 {
@@ -144,8 +146,7 @@ fn halted_pit_lapic_and_deadline_continue_after_long_offline_pause() {
         drop(owner);
         std::thread::sleep(Duration::from_millis(250));
         let restore_started = Instant::now();
-        let mut restored =
-            RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
+        let mut restored = RamSnapshotVm::import(&dir.path(), RestoreResources::default()).unwrap();
         let before = read(&restored, 0x9000);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
@@ -178,7 +179,8 @@ fn halted_pit_lapic_and_deadline_continue_after_long_offline_pause() {
         restored.resume().unwrap();
         wait_changed(&restored, 0x9000, before);
         // Repeated timer/save scheduling must not leave duplicate control replies.
-        restored.save_full(&dir.0.join("second")).unwrap();
+        restored.pause().unwrap();
+        restored.export(&dir.0.join("second")).unwrap();
         assert!(restored.handles[0].response_receiver().is_empty());
     }
 }
@@ -192,31 +194,31 @@ fn halted_mp_state_round_trips_without_guest_entry() {
     let size = Compatibility::capture(kvm.fd()).unwrap().xsave_size;
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        Control::transition(&owner.handles, true, CONTROL_TIMEOUT).unwrap();
+        owner.pause().unwrap();
         let state =
             snapshot::request(&owner.handles[0], |reply| Request::Save { size, reply }).unwrap();
         if state.test_halted() {
             break;
         }
-        Control::transition(&owner.handles, false, CONTROL_TIMEOUT).unwrap();
+        owner.resume().unwrap();
         assert!(
             Instant::now() < deadline,
             "guest did not enter KVM halted MP state"
         );
         std::thread::yield_now();
     }
-    owner.save_full(&dir.path()).unwrap();
+    owner.export(&dir.path()).unwrap();
     let saved = read_metadata(&mut File::open(dir.path()).unwrap(), owner.max_slots, 32).unwrap();
     assert!(saved.cpus[0].test_halted());
     drop(owner);
-    let restored = RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
+    let restored = RamSnapshotVm::import(&dir.path(), RestoreResources::default()).unwrap();
     let state = snapshot::request(&restored.handles[0], |reply| Request::Save {
         size: saved.compatibility.xsave_size,
         reply,
     })
     .unwrap();
     assert!(state.test_halted());
-    assert!(restored.paused);
+    assert!(restored.is_paused());
 }
 
 fn fake_cpu(
@@ -236,74 +238,210 @@ fn fake_cpu(
     VcpuHandle::new(sender, receiver, thread)
 }
 
+fn counters(owner: &RamSnapshotVm) -> Vec<u16> {
+    (0..owner.handles.len() as u64)
+        .map(|id| read(owner, 0x8000 + id * 64))
+        .collect()
+}
+
+/// The RAM payload of a full image: everything after the JSON section.
+fn ram_and_segments(path: &Path) -> Vec<u8> {
+    let bytes = fs::read(path).unwrap();
+    let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    bytes[16 + len..].to_vec()
+}
+
+/// Export needs a confirmed pause and never resumes: repeated exports
+/// capture the same cut while the guest stays still, an import can be
+/// exported again before it ever runs, and every image continues the guest.
 #[test]
-fn full_pause_timeout_and_resume_failure_attempt_all_cpus_without_valid_marker() {
-    use std::sync::Arc;
-    for resume_failure in [false, true] {
+fn snapshot_lifecycle_export_requires_pause_and_repeats_without_resuming() {
+    let dir = TempDir::new();
+    let mut owner = source(2, 0x1000);
+    for id in 0..2 {
+        wait_changed(&owner, 0x8000 + id * 64, 0);
+    }
+    let error = owner.export(&dir.path()).unwrap_err();
+    assert!(error.to_string().contains("requires a paused"), "{error}");
+    assert!(!dir.path().exists());
+    assert!(owner.resume().is_err(), "resume of a running owner");
+    owner.pause().unwrap();
+    assert!(owner.pause().is_err(), "a second pause was accepted");
+    let cut = counters(&owner);
+    let (first, second) = (dir.0.join("first"), dir.0.join("second"));
+    owner.export(&first).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    owner.export(&second).unwrap();
+    assert_eq!(counters(&owner), cut, "an export resumed the guest");
+    assert!(owner.is_paused());
+    assert_eq!(ram_and_segments(&first), ram_and_segments(&second));
+    owner.resume().unwrap();
+    for id in 0..2 {
+        wait_changed(&owner, 0x8000 + id * 64, cut[id as usize]);
+    }
+    owner.pause().unwrap();
+    owner.export(&dir.0.join("after-resume")).unwrap();
+    drop(owner);
+
+    let imported = RamSnapshotVm::import(&first, RestoreResources::default()).unwrap();
+    assert_eq!(counters(&imported), cut);
+    drop(imported);
+    let mut imported = RamSnapshotVm::import(&second, RestoreResources::default()).unwrap();
+    let again = dir.0.join("again");
+    imported.export(&again).unwrap();
+    assert_eq!(ram_and_segments(&again), ram_and_segments(&second));
+    drop(imported);
+    let mut restored = RamSnapshotVm::import(&again, RestoreResources::default()).unwrap();
+    assert_eq!(counters(&restored), cut);
+    restored.resume().unwrap();
+    for id in 0..2 {
+        wait_changed(&restored, 0x8000 + id * 64, cut[id as usize]);
+        assert_eq!(
+            read(&restored, 0x8004 + id * 64),
+            1,
+            "cold initialization reran"
+        );
+    }
+}
+
+/// How the fake vCPUs below fail one lifecycle step.
+#[derive(Clone, Copy, PartialEq)]
+enum Fault {
+    PauseTimeout,
+    ResumeExit,
+    SaveTimeout,
+    SaveRejected,
+}
+
+/// Replace the owner's vCPUs with fakes that acknowledge controls and
+/// answer state requests unless `fault` says otherwise; returns the count
+/// of Resume events they received. The event thread holds the real vCPUs'
+/// stop handles, so it is joined before them and restarted armed with the
+/// fakes' handles.
+fn fake_cpus(owner: &mut RamSnapshotVm, fault: Fault) -> std::sync::Arc<AtomicUsize> {
+    let resumed = std::sync::Arc::new(AtomicUsize::new(0));
+    owner.events.take().unwrap().stop();
+    for handle in &mut owner.handles {
+        handle.finish();
+    }
+    let count = owner.handles.len();
+    owner.handles.clear();
+    for id in 0..count {
+        let resumed = resumed.clone();
+        // Unanswered requests stay alive so the requester times out.
+        let mut held = Vec::new();
+        owner
+            .handles
+            .push(fake_cpu(move |event, responses| match event {
+                VcpuEvent::Pause if fault == Fault::PauseTimeout && id == 0 => (),
+                VcpuEvent::Pause => responses.send(VcpuResponse::Paused).unwrap(),
+                VcpuEvent::Resume => {
+                    resumed.fetch_add(1, Ordering::Relaxed);
+                    let exited = fault == Fault::ResumeExit && id == 1;
+                    responses
+                        .send(if exited {
+                            VcpuResponse::Exited(1)
+                        } else {
+                            VcpuResponse::Resumed
+                        })
+                        .unwrap();
+                }
+                VcpuEvent::Snapshot(Request::Save { reply, .. }) if fault == Fault::SaveTimeout => {
+                    held.push(reply)
+                }
+                VcpuEvent::Snapshot(Request::Save { reply, .. }) => {
+                    let _ = reply.try_send(Err("injected state failure".into()));
+                }
+                _ => panic!("unexpected lifecycle event"),
+            }));
+    }
+    owner.start_event_thread(events::Start::Running).unwrap();
+    let stops = owner.handles.iter().map(VcpuHandle::stop_handle).collect();
+    owner.events.as_ref().unwrap().arm(stops).unwrap();
+    resumed
+}
+
+fn assert_disabled(owner: &mut RamSnapshotVm, path: &Path) {
+    assert!(owner.control.unusable);
+    assert!(
+        owner.handles.iter().all(VcpuHandle::is_finished),
+        "a vCPU thread outlived the failed control"
+    );
+    assert!(owner.export(path).is_err());
+    assert!(owner.resume().is_err());
+    assert!(owner.pause().is_err());
+    assert!(!path.exists());
+}
+
+/// Unconfirmed lifecycle control — a pause or vCPU state request without
+/// an answer, a vCPU that exits on resume — disables the owner and joins
+/// every thread; a vCPU that answers its state request with an error only
+/// fails that export and leaves the pause retryable.
+#[test]
+fn snapshot_lifecycle_uncertain_control_disables_and_joins_threads() {
+    for fault in [
+        Fault::PauseTimeout,
+        Fault::ResumeExit,
+        Fault::SaveTimeout,
+        Fault::SaveRejected,
+    ] {
         let dir = TempDir::new();
         let mut owner = source(2, 0x1000);
         for id in 0..2 {
             wait_changed(&owner, 0x8000 + id * 64, 0);
         }
-        owner.save_full(&dir.path()).unwrap();
-        let saved =
-            read_metadata(&mut File::open(dir.path()).unwrap(), owner.max_slots, 32).unwrap();
-        for handle in &mut owner.handles {
-            handle.finish();
+        let resumed = fake_cpus(&mut owner, fault);
+        let image = dir.path();
+        match fault {
+            Fault::PauseTimeout => {
+                assert!(owner.pause().is_err());
+                assert_disabled(&mut owner, &image);
+            }
+            Fault::ResumeExit => {
+                owner.pause().unwrap();
+                assert!(owner.resume().is_err());
+                assert_eq!(
+                    resumed.load(Ordering::Relaxed),
+                    2,
+                    "a vCPU resume was skipped"
+                );
+                assert_disabled(&mut owner, &image);
+            }
+            Fault::SaveTimeout => {
+                owner.pause().unwrap();
+                let error = owner.export(&image).unwrap_err();
+                assert!(matches!(error, Error::Control(_)), "{error}");
+                assert_disabled(&mut owner, &image);
+            }
+            Fault::SaveRejected => {
+                owner.pause().unwrap();
+                let error = owner.export(&image).unwrap_err();
+                assert!(
+                    error.to_string().contains("injected state failure"),
+                    "{error}"
+                );
+                assert!(!image.exists());
+                assert!(owner.is_paused() && !owner.control.unusable);
+                owner.resume().unwrap();
+                assert_eq!(resumed.load(Ordering::Relaxed), 2);
+            }
         }
-        owner.handles.clear();
-        let resumed = Arc::new(AtomicUsize::new(0));
-        // Fake only communication failures. State replies contain actual
-        // production-captured KVM state, and the real full save transaction
-        // controls file publication and recovery.
-        for (id, state) in saved.cpus.into_iter().enumerate() {
-            let state = serde_json::to_vec(&state).unwrap();
-            let resumed = resumed.clone();
-            owner
-                .handles
-                .push(fake_cpu(move |event, responses| match event {
-                    VcpuEvent::Pause if !resume_failure && id == 0 => (),
-                    VcpuEvent::Pause => {
-                        responses.send(VcpuResponse::Paused).unwrap();
-                    }
-                    VcpuEvent::Resume => {
-                        resumed.fetch_add(1, Ordering::Relaxed);
-                        if !resume_failure && id == 0 {
-                            responses.send(VcpuResponse::Paused).unwrap();
-                        }
-                        responses
-                            .send(if resume_failure && id == 1 {
-                                VcpuResponse::Exited(1)
-                            } else {
-                                VcpuResponse::Resumed
-                            })
-                            .unwrap();
-                    }
-                    VcpuEvent::Snapshot(Request::Save { reply, .. }) => {
-                        let _ = reply.try_send(Ok(serde_json::from_slice(&state).unwrap()));
-                    }
-                    _ => panic!("unexpected snapshot communication event"),
-                }));
-        }
-        let failed = dir.0.join("failed");
-        assert!(owner.save_full(&failed).is_err());
-        assert_eq!(resumed.load(Ordering::Relaxed), 2);
-        assert!(owner.control.unusable);
-        assert!(!failed.exists());
     }
 }
 
 #[test]
-fn full_save_rejects_an_actual_external_ram_alias() {
+fn full_export_rejects_an_actual_external_ram_alias_and_stays_paused() {
     let dir = TempDir::new();
     let mut owner = source(1, 0x1000);
     wait_changed(&owner, 0x8000, 0);
+    owner.pause().unwrap();
     let alias = owner.memory.clone();
-    let error = owner.save_full(&dir.path()).unwrap_err();
+    let error = owner.export(&dir.path()).unwrap_err();
     assert!(error.to_string().contains("external aliases"));
     assert!(!dir.path().exists());
+    assert!(owner.is_paused());
     drop(alias);
-    owner.save_full(&dir.path()).unwrap();
+    owner.export(&dir.path()).unwrap();
 }
 
 #[test]
@@ -331,11 +469,11 @@ fn one_shot_lapic_and_deadline_complete_once_after_source_destruction() {
         let dir = TempDir::new();
         let mut owner = source(1, entry);
         wait_changed(&owner, 0x9004, 0);
-        owner.save_full(&dir.path()).unwrap();
+        owner.pause().unwrap();
+        owner.export(&dir.path()).unwrap();
         drop(owner);
         std::thread::sleep(Duration::from_millis(250));
-        let mut restored =
-            RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
+        let mut restored = RamSnapshotVm::import(&dir.path(), RestoreResources::default()).unwrap();
         assert_eq!(
             read(&restored, 0x9000),
             0,
@@ -353,7 +491,8 @@ fn full_files_reject_wrong_capabilities_trailing_bytes_and_incomplete_marker() {
     let dir = TempDir::new();
     let mut owner = source(1, 0x1000);
     wait_changed(&owner, 0x8000, 0);
-    owner.save_full(&dir.path()).unwrap();
+    owner.pause().unwrap();
+    owner.export(&dir.path()).unwrap();
     let original = fs::read(dir.path()).unwrap();
     let len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
     let mut metadata: Metadata = serde_json::from_slice(&original[16..16 + len]).unwrap();
@@ -364,9 +503,7 @@ fn full_files_reject_wrong_capabilities_trailing_bytes_and_incomplete_marker() {
     malformed.extend_from_slice(&encoded);
     malformed.extend_from_slice(&original[16 + len..]);
     fs::write(dir.0.join("mismatch"), &malformed).unwrap();
-    assert!(
-        RamSnapshotVm::restore_full(&dir.0.join("mismatch"), RestoreResources::default()).is_err()
-    );
+    assert!(RamSnapshotVm::import(&dir.0.join("mismatch"), RestoreResources::default()).is_err());
     let mut trailing = original.clone();
     trailing.push(0);
     fs::write(dir.0.join("trailing"), &trailing).unwrap();
@@ -377,31 +514,33 @@ fn full_files_reject_wrong_capabilities_trailing_bytes_and_incomplete_marker() {
     assert!(read_metadata(&mut File::open(dir.0.join("incomplete")).unwrap(), 32, 32).is_err());
 }
 
+/// A failed export never overwrites an existing file, removes its partial
+/// image and keeps the guest paused; a retry publishes, and only `resume`
+/// runs the guest again.
 #[test]
-fn full_save_error_resumes_all_cpus_and_never_overwrites_existing_file() {
+fn full_export_failure_stays_paused_and_never_overwrites_existing_file() {
     let dir = TempDir::new();
     let mut owner = source(2, 0x1000);
     for id in 0..2 {
         wait_changed(&owner, 0x8000 + id * 64, 0);
     }
+    owner.pause().unwrap();
+    let cut = counters(&owner);
     fs::write(dir.path(), b"keep existing file").unwrap();
-    assert!(owner.save_full(&dir.path()).is_err());
+    assert!(owner.export(&dir.path()).is_err());
     assert_eq!(fs::read(dir.path()).unwrap(), b"keep existing file");
-    for id in 0..2 {
-        let before = read(&owner, 0x8000 + id * 64);
-        wait_changed(&owner, 0x8000 + id * 64, before);
-    }
-    owner.save_full(&dir.0.join("next")).unwrap();
     let failed_path = dir.0.join("mid-copy");
-    let result =
-        super::super::tests::with_failed_payload_write(17, || owner.save_full(&failed_path));
+    let result = super::super::tests::with_failed_payload_write(17, || owner.export(&failed_path));
     assert!(result.is_err());
     assert!(!failed_path.exists());
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(counters(&owner), cut, "a failed export resumed the guest");
+    assert!(owner.is_paused() && !owner.control.unusable);
+    owner.export(&dir.0.join("after-write-failure")).unwrap();
+    owner.resume().unwrap();
     for id in 0..2 {
-        let before = read(&owner, 0x8000 + id * 64);
-        wait_changed(&owner, 0x8000 + id * 64, before);
+        wait_changed(&owner, 0x8000 + id * 64, cut[id as usize]);
     }
-    owner.save_full(&dir.0.join("after-write-failure")).unwrap();
 }
 
 #[test]
@@ -411,7 +550,8 @@ fn partial_import_kvm_failure_joins_threads_and_closes_fds() {
     for id in 0..2 {
         wait_changed(&owner, 0x8000 + id * 64, 0);
     }
-    owner.save_full(&dir.path()).unwrap();
+    owner.pause().unwrap();
+    owner.export(&dir.path()).unwrap();
     drop(owner);
     let original = fs::read(dir.path()).unwrap();
     let length = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
@@ -433,13 +573,11 @@ fn partial_import_kvm_failure_joins_threads_and_closes_fds() {
     let count = |path| fs::read_dir(path).unwrap().count();
     let threads = count("/proc/self/task");
     let fds = count("/proc/self/fd");
-    let error = match RamSnapshotVm::restore_full(
-        &dir.0.join("partial-import"),
-        RestoreResources::default(),
-    ) {
-        Ok(_) => panic!("invalid CR0 restored"),
-        Err(error) => error,
-    };
+    let error =
+        match RamSnapshotVm::import(&dir.0.join("partial-import"), RestoreResources::default()) {
+            Ok(_) => panic!("invalid CR0 restored"),
+            Err(error) => error,
+        };
     assert!(
         error.to_string().contains("vCPU 1 state restore"),
         "{error}"
@@ -472,12 +610,13 @@ fn rejection(result: Result<impl Sized>) -> String {
     }
 }
 
-/// Versions 1–3 are rejected by version before their JSON is parsed.
+/// Versions 1–4 (4 had no vsock section) are rejected by version before
+/// their JSON is parsed.
 #[test]
 fn snapshot_full_rejects_pre_unified_versions() {
     let dir = TempDir::new();
     let path = dir.path();
-    for old in 1..=3 {
+    for old in 1..=4 {
         write_header_only(&path, old, b"{}");
         let error = rejection(read_metadata(&mut File::open(&path).unwrap(), 32, 32));
         assert!(
@@ -493,6 +632,7 @@ fn snapshot_full_restore_resources_must_match_devices() {
     let none = Requirements {
         disks: false,
         nic: false,
+        vsock: false,
         legacy: false,
     };
     none.check(&RestoreResources::default()).unwrap();
@@ -519,6 +659,17 @@ fn snapshot_full_restore_resources_must_match_devices() {
         ..Default::default()
     };
     assert!(none.check(&serial).is_err());
+    let with_vsock = Requirements {
+        vsock: true,
+        ..none
+    };
+    assert!(with_vsock.check(&RestoreResources::default()).is_err());
+    let ports = RestoreResources {
+        vsock_ports: Some(Default::default()),
+        ..Default::default()
+    };
+    with_vsock.check(&ports).unwrap();
+    assert!(none.check(&ports).is_err());
 }
 
 /// A nonblocking owner end and a blocking-with-timeout test end.
@@ -537,8 +688,8 @@ fn serial_pair() -> (
 /// The legacy fixture writes COM1 output and scratch, then counts. Its
 /// UART/CMOS/i8042 state survives a destroyed source; the target endpoint
 /// gets no replayed output, and the restored guest continues until its
-/// i8042 reset latches the exit and stops the vCPU, after which no save or
-/// resume is accepted.
+/// i8042 reset latches the exit and stops the vCPU, after which no pause,
+/// export or resume is accepted.
 #[test]
 fn snapshot_legacy_restored_vm_continues_then_reset_stops_it() {
     let dir = TempDir::new();
@@ -550,7 +701,8 @@ fn snapshot_legacy_restored_vm_continues_then_reset_stops_it() {
     let mut output = [0u8];
     theirs.read_exact(&mut output).unwrap();
     assert_eq!(&output, b"K");
-    owner.save_full(&dir.path()).unwrap();
+    owner.pause().unwrap();
+    owner.export(&dir.path()).unwrap();
     let saved = read_metadata(&mut File::open(dir.path()).unwrap(), owner.max_slots, 32).unwrap();
     let saved_legacy =
         serde_json::to_value(saved.legacy.as_ref().expect("legacy section")).unwrap();
@@ -561,7 +713,7 @@ fn snapshot_legacy_restored_vm_continues_then_reset_stops_it() {
         serial: Some([Some(ours), None, None, None]),
         ..Default::default()
     };
-    let mut restored = RamSnapshotVm::restore_full(&dir.path(), resources).unwrap();
+    let mut restored = RamSnapshotVm::import(&dir.path(), resources).unwrap();
     let restored_legacy = legacy::capture(&restored, &saved.regions).unwrap();
     assert_eq!(serde_json::to_value(restored_legacy).unwrap(), saved_legacy);
     assert_eq!(restored.serial_dropped_output_bytes(), Some([0; 4]));
@@ -593,8 +745,9 @@ fn snapshot_legacy_restored_vm_continues_then_reset_stops_it() {
     let stopped = read(&restored, 0x9000);
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(read(&restored, 0x9000), stopped, "vCPU ran after reset");
-    let error = restored.save_full(&dir.0.join("after-reset")).unwrap_err();
-    assert!(error.to_string().contains("requested exit"), "{error}");
+    let error = restored.pause().unwrap_err();
+    assert!(error.to_string().contains("is exiting"), "{error}");
+    assert!(restored.export(&dir.0.join("after-reset")).is_err());
     assert!(!dir.0.join("after-reset").exists());
     assert!(restored.resume().is_err());
 }

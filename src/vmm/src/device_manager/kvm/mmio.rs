@@ -87,20 +87,6 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    pub(crate) fn check_ram_snapshot(&self) -> std::result::Result<(), crate::ram_snapshot::Error> {
-        if self
-            .id_to_dev_info
-            .keys()
-            .any(|(kind, _)| matches!(kind, DeviceType::Virtio(_)))
-        {
-            return Err(crate::ram_snapshot::Error::Invalid(
-                "virtio devices have no stage-1 freeze contract",
-            ));
-        }
-        Ok(())
-    }
-
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
@@ -345,23 +331,6 @@ mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     const QUEUE_CONFIG: &[QueueConfig] = &[QueueConfig::new(64)];
-
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    #[test]
-    fn actual_virtio_registration_rejects_stage_one_ram_snapshot() {
-        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
-        let vm = builder::setup_vm(&memory, false).unwrap();
-        let _irqchip = KvmIoapic::new(vm.fd()).unwrap();
-        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
-        assert!(manager.check_ram_snapshot().is_ok());
-        let rng = Arc::new(Mutex::new(devices::virtio::Rng::new().unwrap()));
-        let transport =
-            devices::virtio::MmioTransport::new(memory, DummyIrqChip::new().into(), rng).unwrap();
-        manager
-            .register_mmio_device(vm.fd(), transport, 4, "rng".into())
-            .unwrap();
-        assert!(manager.check_ram_snapshot().is_err());
-    }
 
     impl MMIODeviceManager {
         fn register_virtio_device(

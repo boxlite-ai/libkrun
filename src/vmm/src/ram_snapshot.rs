@@ -17,6 +17,7 @@ use crate::device_manager::shm::ShmRegion;
 use crate::vstate::{KvmContext, Vcpu, VcpuEvent, VcpuHandle, VcpuResponse, Vm};
 
 pub(crate) use legacy::SerialEndpoints;
+pub(crate) use vsock::VsockPorts;
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
 const VERSION: u32 = 1;
@@ -30,6 +31,8 @@ mod event_devices;
 mod events;
 mod full;
 mod legacy;
+mod lifecycle;
+mod vsock;
 mod wiring;
 
 #[cfg(feature = "blk")]
@@ -49,10 +52,6 @@ pub(crate) enum Error {
     State(crate::vstate::Error),
     Mapping(vm_memory::mmap::FromRangesError),
     Memory(vm_memory::GuestMemoryError),
-    Recovery {
-        operation: Box<Error>,
-        resume: Box<Error>,
-    },
 }
 
 impl std::fmt::Display for Error {
@@ -65,9 +64,6 @@ impl std::fmt::Display for Error {
             Self::State(e) => write!(f, "RAM snapshot KVM: {e}"),
             Self::Mapping(e) => write!(f, "RAM snapshot mapping allocation: {e}"),
             Self::Memory(e) => write!(f, "RAM snapshot memory access: {e}"),
-            Self::Recovery { operation, resume } => {
-                write!(f, "{operation}; recovery failed: {resume}")
-            }
         }
     }
 }
@@ -289,9 +285,10 @@ impl PendingSnapshot {
         Ok(pending)
     }
 
-    fn finish(mut self) -> Result<()> {
+    /// Publish the image: only now does it carry its valid `magic`.
+    fn finish(mut self, magic: &[u8; 8]) -> Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(MAGIC)?;
+        self.file.write_all(magic)?;
         self.file.sync_all()?;
         self.complete = true;
         Ok(())
@@ -310,13 +307,27 @@ impl Drop for PendingSnapshot {
     }
 }
 
+/// Write a RAM-only image of `memory`; publishes it only when complete.
+fn write_ram_image(
+    path: &Path,
+    memory: &GuestMemoryMmap,
+    topology: &Topology,
+    max_slots: usize,
+) -> Result<()> {
+    let regions = topology.regions(memory)?;
+    validate_regions(&regions, max_slots)?;
+    PendingSnapshot::write(path, memory, &regions)?.finish(MAGIC)
+}
+
 /// An uncertain control operation permanently disables subsequent snapshots.
 #[derive(Default)]
-pub(crate) struct Control {
+struct Control {
     unusable: bool,
 }
 
 impl Control {
+    /// Pause or resume every vCPU. Every handle is attempted, even after
+    /// another send or acknowledgment failed.
     fn transition(handles: &[VcpuHandle], pause: bool, timeout: Duration) -> Result<()> {
         let mut errors = Vec::new();
         for (index, handle) in handles.iter().enumerate() {
@@ -329,7 +340,6 @@ impl Control {
                 errors.push(format!("vCPU {index} send: {e}"));
             }
         }
-        // Every handle is attempted, even after another send or acknowledgment failed.
         for (index, handle) in handles.iter().enumerate() {
             let deadline = Instant::now() + timeout;
             loop {
@@ -354,56 +364,6 @@ impl Control {
             Err(Error::Control(errors))
         }
     }
-
-    pub(crate) fn save(
-        &mut self,
-        path: &Path,
-        memory: &GuestMemoryMmap,
-        topology: &Topology,
-        handles: &[VcpuHandle],
-        max_slots: usize,
-    ) -> Result<()> {
-        self.save_with_timeout(path, memory, topology, handles, max_slots, CONTROL_TIMEOUT)
-    }
-
-    fn save_with_timeout(
-        &mut self,
-        path: &Path,
-        memory: &GuestMemoryMmap,
-        topology: &Topology,
-        handles: &[VcpuHandle],
-        max_slots: usize,
-        timeout: Duration,
-    ) -> Result<()> {
-        if self.unusable {
-            return Err(Error::Invalid(
-                "vCPU control is uncertain; reconstruct VM before snapshot",
-            ));
-        }
-        let regions = topology.regions(memory)?;
-        validate_regions(&regions, max_slots)?;
-        let pause = if handles.iter().any(|h| !h.response_receiver().is_empty()) {
-            Err(Error::Invalid("unconsumed vCPU response before pause"))
-        } else {
-            Self::transition(handles, true, timeout)
-        };
-        if pause.is_err() {
-            self.unusable = true;
-        }
-        let operation = pause.and_then(|_| PendingSnapshot::write(path, memory, &regions));
-        let resume = Self::transition(handles, false, timeout);
-        if resume.is_err() {
-            self.unusable = true;
-        }
-        match (operation, resume) {
-            (Ok(pending), Ok(())) => pending.finish(),
-            (Err(operation), Err(resume)) => Err(Error::Recovery {
-                operation: Box::new(operation),
-                resume: Box::new(resume),
-            }),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
-    }
 }
 
 /// Target resources a full restore needs. Images never name host paths or
@@ -420,6 +380,9 @@ pub(crate) struct RestoreResources {
     /// port order; each must already be nonblocking, and a port without one
     /// discards output and reads no input.
     pub(crate) serial: Option<SerialEndpoints>,
+    /// New host socket paths of the vsock's ports; the ports and their
+    /// roles must equal the image's.
+    pub(crate) vsock_ports: Option<VsockPorts>,
 }
 
 /// Owns the minimal VM. No mapping, VM fd, or vCPU handle escapes this owner.
@@ -431,7 +394,8 @@ pub(crate) struct RamSnapshotVm {
     control: Control,
     max_slots: usize,
     irqchip_ready: bool,
-    paused: bool,
+    /// Present exactly while a confirmed pause holds every vCPU and device.
+    pause: Option<lifecycle::Paused>,
     bus: devices::Bus,
     /// Port-I/O bus: empty unless the legacy devices are attached.
     io_bus: devices::Bus,
@@ -445,6 +409,7 @@ pub(crate) struct RamSnapshotVm {
     nic: Option<nic::NicDevice>,
     rng: Option<events::EventDevice<devices::virtio::Rng>>,
     balloon: Option<events::EventDevice<devices::virtio::Balloon>>,
+    vsock: Option<vsock::VsockDevice>,
     events: Option<events::EventThread>,
 }
 
@@ -469,7 +434,7 @@ impl RamSnapshotVm {
             control: Control::default(),
             max_slots: kvm.max_memslots(),
             irqchip_ready: false,
-            paused: true,
+            pause: None,
             bus: devices::Bus::new(),
             io_bus: devices::Bus::new(),
             legacy: None,
@@ -482,6 +447,7 @@ impl RamSnapshotVm {
             nic: None,
             rng: None,
             balloon: None,
+            vsock: None,
             events: None,
         })
     }
@@ -493,27 +459,27 @@ impl RamSnapshotVm {
         Self::register(memory, Topology::default(), &kvm)
     }
 
+    /// Save guest RAM only, for an owner without vCPUs or one that `pause`
+    /// holds; it never resumes anything. A failure removes the partial image
+    /// and leaves a paused owner paused.
     pub(crate) fn save(&mut self, path: &Path) -> Result<()> {
-        if self.paused && !self.handles.is_empty() {
+        if self.control.unusable {
             return Err(Error::Invalid(
-                "RAM save would resume a restored paused full VM",
+                "vCPU control is uncertain; reconstruct VM before snapshot",
             ));
+        }
+        if !self.handles.is_empty() && self.pause.is_none() {
+            return Err(Error::Invalid("RAM-only save requires paused vCPUs"));
         }
         if self.has_devices() {
             return Err(Error::Invalid(
-                "RAM-only save is not a consistent cut for attached devices; use save_full",
+                "RAM-only save is not a consistent cut for attached devices; use export",
             ));
         }
         if self.exit.requested() {
-            return Err(Error::Invalid("the guest requested exit"));
+            return Err(Error::Invalid("the VM is exiting"));
         }
-        self.control.save(
-            path,
-            &self.memory,
-            &self.topology,
-            &self.handles,
-            self.max_slots,
-        )
+        write_ram_image(path, &self.memory, &self.topology, self.max_slots)
     }
 
     /// Attach an internal disk (RAW/QCOW2/VMDK file) before vCPUs start.
@@ -550,6 +516,12 @@ impl RamSnapshotVm {
         event_devices::attach_balloon(self)
     }
 
+    /// Attach the internal Unix IPC vsock with guest `cid` before vCPUs
+    /// start; `ports` maps each vsock port to its host socket and role.
+    pub(crate) fn attach_vsock(&mut self, cid: u64, ports: &VsockPorts) -> Result<()> {
+        vsock::attach(self, cid, ports)
+    }
+
     /// Attach COM1–COM4, CMOS and the i8042 before vCPUs start. Each
     /// endpoint must already be nonblocking; its flags are never changed.
     pub(crate) fn attach_legacy(&mut self, serial: SerialEndpoints) -> Result<()> {
@@ -570,7 +542,7 @@ impl RamSnapshotVm {
     }
 
     /// Every attached MMIO device as (transport, MMIO address, GSI), in the
-    /// fixed order disks, NIC, RNG, balloon.
+    /// fixed order disks, NIC, RNG, balloon, vsock.
     pub(super) fn mmio_devices(&self) -> Vec<(&Arc<Mutex<MmioTransport>>, u64, u32)> {
         let mut devices = Vec::new();
         #[cfg(feature = "blk")]
@@ -591,6 +563,7 @@ impl RamSnapshotVm {
                 .iter()
                 .map(|balloon| (&balloon.transport, balloon.mmio_addr, balloon.irq)),
         );
+        devices.extend(self.vsock.iter().map(vsock::slot));
         devices
     }
 
@@ -614,16 +587,20 @@ impl RamSnapshotVm {
         let nic = nic::expected_alias_clones(self);
         #[cfg(not(all(feature = "blk", feature = "net")))]
         let nic = 0;
-        disks + nic + event_devices::expected_alias_clones(self)
+        disks
+            + nic
+            + event_devices::expected_alias_clones(self)
+            + vsock::expected_alias_clones(self)
     }
 
     /// Start the event thread: the exit watch, plus the attached RNG,
-    /// balloon and UART input.
+    /// balloon, vsock and UART input.
     fn start_event_thread(&mut self, start: events::Start) -> Result<()> {
         let devices = events::Devices {
             exit: self.exit.clone(),
             rng: self.rng.as_ref().map(|rng| rng.device.clone()),
             balloon: self.balloon.as_ref().map(|balloon| balloon.device.clone()),
+            vsock: vsock::event_device(self),
             serials: self
                 .legacy
                 .as_ref()
@@ -665,12 +642,16 @@ impl RamSnapshotVm {
             .arm(stops)
     }
 
-    /// Stop every thread: the event thread first (it holds vCPU stop handles
-    /// whose pthread IDs are valid only until the vCPUs are joined), then
-    /// the vCPUs (they could still touch the devices), then the disk and NIC
-    /// workers, which hold guest RAM, the disk images and the NIC backend
-    /// connection. Every startup, restore and resume failure ends here.
+    /// Stop every thread: first cancel any vsock send blocked under the
+    /// device lock (the event thread or a vCPU could wait on that lock
+    /// forever), then the event thread (it holds vCPU stop handles whose
+    /// pthread IDs are valid only until the vCPUs are joined), then the
+    /// vCPUs (they could still touch the devices), then the disk, NIC and
+    /// vsock workers, which hold guest RAM, the disk images and the backend
+    /// connections. Every startup, import, pause and resume failure ends
+    /// here.
     fn stop_threads(&mut self) {
+        vsock::quiesce_gate(self);
         if let Some(events) = &mut self.events {
             events.stop();
         }
@@ -681,6 +662,7 @@ impl RamSnapshotVm {
         blk::stop_devices(self);
         #[cfg(all(feature = "blk", feature = "net"))]
         nic::stop(self);
+        vsock::teardown(self);
     }
 
     /// The stage-2 RAM alias probe, parameterized by the clones the owner's
@@ -737,7 +719,6 @@ impl RamSnapshotVm {
             self.handles.clear();
         } else {
             self.control.unusable = false;
-            self.paused = false;
         }
         result
     }

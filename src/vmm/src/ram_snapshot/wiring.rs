@@ -3,7 +3,7 @@
 //! KVM and bus wiring shared by every internal device of the private
 //! minimal-VM owner: fixed-slot collision checks, ioeventfd/irqfd
 //! registration with rollback, and the irqfd drain/reassign pair around a
-//! capture, covering MMIO devices and the legacy UART/keyboard lines. Each
+//! pause, covering MMIO devices and the legacy UART/keyboard lines. Each
 //! device keeps its own fixed slot and state handling.
 
 use std::os::fd::AsRawFd;
@@ -150,20 +150,21 @@ pub(super) fn register_irqfds(vm: &RamSnapshotVm, irqfds: &[(&EventFd, u32, &str
 /// injection workqueue before returning (Linux v6.12 virt/kvm/eventfd.c
 /// contract), so each device's interrupt state includes every completed
 /// injection afterwards and an injected interrupt lives only in the KVM
-/// irqchip state: nothing is replayed. `drained` counts the deassigned
-/// irqfds in `for_each_irqfd` order even on failure, so recovery reassigns
-/// exactly those. Shared GSIs (COM1/COM3, COM2/COM4) have one irqfd per
-/// UART.
-pub(super) fn drain_irqfds(vm: &RamSnapshotVm, drained: &mut usize) -> Result<()> {
+/// irqchip state: nothing is replayed. Returns how many irqfds were
+/// deassigned, in `for_each_irqfd` order, for `reassign_irqfds`. Shared
+/// GSIs (COM1/COM3, COM2/COM4) have one irqfd per UART.
+pub(super) fn drain_irqfds(vm: &RamSnapshotVm) -> Result<usize> {
+    let mut drained = 0;
     for_each_irqfd(vm, |evt, irq, name| {
         vm.vm
             .fd()
             .unregister_irqfd(evt, irq)
             .map_err(|e| Error::Full(format!("deassign irqfd of {name}: {e}")))?;
-        *drained += 1;
+        drained += 1;
         drain_eventfd_count(evt);
         Ok(())
-    })
+    })?;
+    Ok(drained)
 }
 
 /// Reassign the first `drained` irqfds; a single failure must not skip the

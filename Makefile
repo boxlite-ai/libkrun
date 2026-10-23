@@ -104,9 +104,11 @@ SNAPSHOT_RUNNER ?=
 SNAPSHOT_RUNNER_VAR = CARGO_TARGET_$(shell echo '$(SNAPSHOT_TARGET)' | tr 'a-z-' 'A-Z_')_RUNNER
 # Host-native virtio-net worker/backend tests (macOS or Linux, no KVM).
 SNAPSHOT_NET_FILTER ?= snapshot_net
-.PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-guest snapshot-net-host-test
+# Host-native vsock Unix IPC backend lifecycle tests (macOS or Linux, no KVM).
+SNAPSHOT_VSOCK_FILTER ?= snapshot_vsock
+.PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-guest snapshot-net-host-test snapshot-vsock-host-test
 snapshot-fmt:
-	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs src/devices/src/virtio/control.rs src/devices/src/virtio/net/backend.rs src/devices/src/virtio/net/device.rs src/devices/src/virtio/net/mod.rs src/devices/src/virtio/net/unixstream.rs src/devices/src/virtio/net/worker.rs src/devices/src/virtio/rng/mod.rs src/devices/src/virtio/rng/device.rs src/devices/src/virtio/balloon/mod.rs src/devices/src/virtio/balloon/device.rs src/devices/src/legacy/x86_64/serial.rs src/devices/src/legacy/x86_64/cmos.rs src/devices/src/legacy/i8042.rs
+	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs src/devices/src/virtio/control.rs src/devices/src/virtio/net/backend.rs src/devices/src/virtio/net/device.rs src/devices/src/virtio/net/mod.rs src/devices/src/virtio/net/unixstream.rs src/devices/src/virtio/net/worker.rs src/devices/src/virtio/rng/mod.rs src/devices/src/virtio/rng/device.rs src/devices/src/virtio/balloon/mod.rs src/devices/src/virtio/balloon/device.rs src/devices/src/legacy/x86_64/serial.rs src/devices/src/legacy/x86_64/cmos.rs src/devices/src/legacy/i8042.rs src/devices/src/virtio/vsock/mod.rs src/vmm/src/ram_snapshot/vsock.rs
 
 snapshot-check:
 	cargo check $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --tests --target $(SNAPSHOT_TARGET)
@@ -119,6 +121,9 @@ snapshot-test:
 
 snapshot-net-host-test:
 	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-devices --features net $(SNAPSHOT_NET_FILTER) -- --test-threads=1
+
+snapshot-vsock-host-test:
+	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-devices $(SNAPSHOT_VSOCK_FILTER) -- --test-threads=1
 
 snapshot-guest:
 	$(SNAPSHOT_AS) --32 $(SNAPSHOT_GUEST).S -o $(SNAPSHOT_GUEST).o

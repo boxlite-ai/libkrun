@@ -404,13 +404,23 @@ pub(crate) fn request<T>(
     handle: &VcpuHandle,
     build: impl FnOnce(Sender<Result<T>>) -> Request,
 ) -> Result<T> {
+    answer(handle, build)?
+}
+
+/// Send a request and wait for the vCPU's answer. The outer error means the
+/// vCPU never answered (not delivered, timed out, thread gone), so its
+/// control state is uncertain; the inner result is the answer itself.
+pub(crate) fn answer<T>(
+    handle: &VcpuHandle,
+    build: impl FnOnce(Sender<Result<T>>) -> Request,
+) -> Result<Result<T>> {
     let (reply, response) = bounded(1);
     handle
         .send_event(VcpuEvent::Snapshot(build(reply)))
         .map_err(|e| e.to_string())?;
     response
         .recv_timeout(TIMEOUT)
-        .map_err(|e| format!("vCPU state reply timeout/exit/disconnect: {e}"))?
+        .map_err(|e| format!("vCPU state reply timeout/exit/disconnect: {e}"))
 }
 
 fn allocate_xsave(size: usize) -> Result<Xsave> {

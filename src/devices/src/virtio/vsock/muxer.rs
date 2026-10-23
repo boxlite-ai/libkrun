@@ -1,11 +1,14 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::io;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::thread::JoinHandle;
 
 use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
+use super::gate::VsockGate;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
@@ -15,17 +18,23 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::unix::{UnixAcceptorProxy, UnixProxy};
 use super::TsiFlags;
 use super::VsockError;
 use crossbeam_channel::{unbounded, Sender};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
+
+/// Epoll data of the muxer wake eventfd. It is never looked up as a proxy:
+/// the wake is written only after the gate closed, and the muxer thread
+/// exits on a closed gate before it handles any event.
+const MUXER_WAKE_TOKEN: u64 = u64::MAX;
 
 /// A muxer RX queue item.
 #[derive(Debug)]
@@ -102,12 +111,26 @@ pub struct VsockMuxer {
     queue: Option<Arc<Mutex<VirtQueue>>>,
     mem: Option<GuestMemoryMmap>,
     rxq: Arc<Mutex<MuxerRxQ>>,
-    epoll: Epoll,
+    /// Shared, not cloned: an `Epoll` clone closes the same descriptor on
+    /// drop, and the muxer thread now exits before this owner.
+    epoll: Arc<Epoll>,
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    gate: Arc<VsockGate>,
+    /// The running backend's threads, joined by `stop`.
+    threads: Vec<JoinHandle<()>>,
+    /// Registered in `epoll` until the muxer thread is joined; the gate
+    /// writes a duplicate.
+    muxer_wake: Option<EventFd>,
+    #[cfg(target_os = "macos")]
+    timesync_stop: Option<Sender<()>>,
+    /// Set once a worker panicked or the backend failed to open on an
+    /// event-queue kick, and never cleared: the backend's state is unknown,
+    /// so every later stop reports it and it never restarts.
+    failed: bool,
 }
 
 impl VsockMuxer {
@@ -123,50 +146,186 @@ impl VsockMuxer {
             queue: None,
             mem: None,
             rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
-            epoll: Epoll::new().unwrap(),
+            epoll: Arc::new(Epoll::new().unwrap()),
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            gate: VsockGate::new(),
+            threads: Vec::new(),
+            muxer_wake: None,
+            #[cfg(target_os = "macos")]
+            timesync_stop: None,
+            failed: false,
         }
     }
 
-    pub(crate) fn activate(
+    pub(crate) fn tsi_flags(&self) -> TsiFlags {
+        self.tsi_flags
+    }
+
+    pub(crate) fn gate(&self) -> &Arc<VsockGate> {
+        &self.gate
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.mem.is_some()
+    }
+
+    pub(crate) fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Record a backend failure no caller could be told about; like a
+    /// worker panic, every later stop reports it.
+    pub(crate) fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    /// Start a backend from the original configuration on a fresh epoll:
+    /// bind the listening paths, then the workers. A listener that cannot be
+    /// bound fails the start when `require_listeners` is set (a snapshot
+    /// restart must serve every original path) and is skipped with a warning
+    /// otherwise (the activation policy). A failure stops whatever already
+    /// started.
+    pub(crate) fn start(
         &mut self,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-    ) {
+        require_listeners: bool,
+    ) -> io::Result<()> {
+        let started = self.start_workers(mem, queue, interrupt, require_listeners);
+        if started.is_err() {
+            if let Err(e) = self.stop() {
+                error!("vsock backend stop after a failed start: {e:?}");
+            }
+        }
+        started
+    }
+
+    fn start_workers(
+        &mut self,
+        mem: GuestMemoryMmap,
+        queue: Arc<Mutex<VirtQueue>>,
+        interrupt: InterruptTransport,
+        require_listeners: bool,
+    ) -> io::Result<()> {
+        self.epoll = Arc::new(Epoll::new()?);
+        let wake = EventFd::new(EFD_NONBLOCK)?;
+        self.epoll.ctl(
+            ControlOperation::Add,
+            wake.as_raw_fd(),
+            &EpollEvent::new(EventSet::IN, MUXER_WAKE_TOKEN),
+        )?;
+        self.gate.open(wake.try_clone()?);
+        self.muxer_wake = Some(wake);
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
+        self.create_listening_ipc_sockets(require_listeners)?;
 
         #[cfg(target_os = "macos")]
         {
+            let (stop, stopped) = crossbeam_channel::bounded(0);
+            self.timesync_stop = Some(stop);
             let timesync =
                 TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
-            timesync.run();
+            self.threads.push(timesync.run(stopped)?);
         }
 
         let (sender, receiver) = unbounded();
+        self.reaper_sender = Some(sender.clone());
+        let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
+        self.threads.push(reaper.run()?);
 
         let thread = MuxerThread::new(
             self.cid,
             self.epoll.clone(),
+            self.gate.clone(),
             self.rxq.clone(),
             self.proxy_map.clone(),
             mem,
             queue,
-            interrupt.clone(),
-            sender.clone(),
-            self.unix_ipc_port_map.clone().unwrap_or_default(),
+            interrupt,
+            sender,
         );
-        thread.run();
+        self.threads.push(thread.run()?);
+        Ok(())
+    }
 
-        self.reaper_sender = Some(sender);
-        let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
-        reaper.run();
+    /// Stop and join every worker, then release the proxies (closing their
+    /// sockets and removing the paths this backend bound), the pending RX
+    /// packets and every guest RAM reference. A worker panic does not cut
+    /// this short; it is reported with `BackendFailed`, by this stop and
+    /// every later one. Idempotent.
+    pub(crate) fn stop(&mut self) -> super::Result<()> {
+        self.gate.quiesce();
+        // The reaper exits once the muxer thread dropped its sender too.
+        self.reaper_sender = None;
+        #[cfg(target_os = "macos")]
+        {
+            self.timesync_stop = None;
+        }
+        for thread in self.threads.drain(..) {
+            if let Err(e) = thread.join() {
+                error!("vsock worker thread panicked: {e:?}");
+                self.failed = true;
+            }
+        }
+        self.muxer_wake = None;
+        // A panicked worker may have poisoned these; release them anyway.
+        self.proxy_map
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        *self.rxq.lock().unwrap_or_else(PoisonError::into_inner) = MuxerRxQ::new();
+        self.mem = None;
+        self.queue = None;
+        self.interrupt = None;
+        if self.failed {
+            return Err(VsockError::BackendFailed);
+        }
+        Ok(())
+    }
+
+    /// Join `worker` first on the next stop, ahead of the real workers.
+    #[cfg(test)]
+    pub(crate) fn adopt_worker_for_test(&mut self, worker: JoinHandle<()>) {
+        self.threads.insert(0, worker);
+    }
+
+    fn create_listening_ipc_sockets(&self, required: bool) -> io::Result<()> {
+        let Some(ipc_map) = &self.unix_ipc_port_map else {
+            return Ok(());
+        };
+        for (port, (path, do_listen)) in ipc_map {
+            if !do_listen {
+                continue;
+            }
+            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            // A proxy dropped on failure removes only a path it bound.
+            let listener = UnixAcceptorProxy::new(id, path, *port)
+                .map_err(|e| io::Error::other(format!("listen at {path:?}: {e}")))
+                .and_then(|proxy| {
+                    let event = EpollEvent::new(EventSet::IN, id);
+                    self.epoll
+                        .ctl(ControlOperation::Add, proxy.as_raw_fd(), &event)?;
+                    Ok(proxy)
+                });
+            match listener {
+                Ok(proxy) => {
+                    self.proxy_map
+                        .write()
+                        .unwrap()
+                        .insert(id, Mutex::new(Box::new(proxy)));
+                }
+                Err(e) if required => return Err(e),
+                Err(e) => warn!("Failed to create listening proxy: {e}"),
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -560,7 +719,7 @@ impl VsockMuxer {
                 }
                 let rxq = self.rxq.clone();
 
-                let mut unix = UnixProxy::new(
+                let mut unix = match UnixProxy::new(
                     id,
                     self.cid,
                     pkt.dst_port(),
@@ -569,8 +728,19 @@ impl VsockMuxer {
                     queue.clone(),
                     rxq,
                     path.to_path_buf(),
-                )
-                .unwrap();
+                    &self.gate,
+                ) {
+                    Ok(unix) => unix,
+                    Err(e) => {
+                        warn!("refusing unix connection, sending rst: {e}");
+                        let rx = MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        };
+                        push_packet(self.cid, rx, &self.rxq, queue, mem);
+                        return;
+                    }
+                };
                 let tsi = TsiConnectReq {
                     peer_port: 0,
                     addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
@@ -709,5 +879,14 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+impl Drop for VsockMuxer {
+    fn drop(&mut self) {
+        // Never leave detached workers writing guest RAM after their owner.
+        if let Err(e) = self.stop() {
+            error!("vsock backend stop on drop: {e:?}");
+        }
     }
 }

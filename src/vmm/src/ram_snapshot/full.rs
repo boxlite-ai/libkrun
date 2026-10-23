@@ -2,22 +2,23 @@
 
 //! Full checkpoints for the private minimal owner, independent of KRUNRAM.
 //!
-//! Every full image uses one format, version 4 (`KRUNVM\0\0`), with or
+//! Every full image uses one format, version 5 (`KRUNVM\0\0`), with or
 //! without devices: header, bounded JSON state, RAM payload, then one raw
 //! segment per disk. The JSON holds CPU, KVM and RAM state, the ordered disk
-//! table and the optional NIC, RNG, balloon and legacy-device (UARTs, CMOS,
-//! i8042) sections. Earlier versions are rejected explicitly.
+//! table and the optional NIC, RNG, balloon, vsock and legacy-device (UARTs,
+//! CMOS, i8042) sections. Earlier versions are rejected explicitly.
 
 use super::*;
 use crate::ram_snapshot::event_devices::{self, BalloonMeta, DeviceMeta};
 use crate::ram_snapshot::events;
 use crate::ram_snapshot::legacy::{self, LegacyMeta};
+use crate::ram_snapshot::vsock::{self, VsockMeta};
 use crate::vstate::snapshot::{self, Compatibility, CpuState, Request};
 use crate::vstate::VmState;
 use serde::{Deserialize, Serialize};
 
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const FULL_VERSION: u32 = 4;
+const FULL_VERSION: u32 = 5;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
@@ -51,6 +52,7 @@ struct Metadata {
     nic: Option<NicSection>,
     rng: Option<DeviceMeta>,
     balloon: Option<BalloonMeta>,
+    vsock: Option<VsockMeta>,
     legacy: Option<LegacyMeta>,
 }
 
@@ -59,6 +61,7 @@ struct Metadata {
 struct Requirements {
     disks: bool,
     nic: bool,
+    vsock: bool,
     legacy: bool,
 }
 
@@ -67,6 +70,7 @@ impl Requirements {
         Self {
             disks: !metadata.disks.is_empty(),
             nic: metadata.nic.is_some(),
+            vsock: metadata.vsock.is_some(),
             legacy: metadata.legacy.is_some(),
         }
     }
@@ -80,6 +84,11 @@ impl Requirements {
         if self.nic != resources.nic_socket.is_some() {
             return Err(Error::Invalid(
                 "restore resources: a NIC socket is required exactly when the image has a NIC",
+            ));
+        }
+        if self.vsock != resources.vsock_ports.is_some() {
+            return Err(Error::Invalid(
+                "restore resources: vsock ports are required exactly when the image has a vsock",
             ));
         }
         if self.legacy != resources.serial.is_some() {
@@ -133,7 +142,7 @@ fn read_header(file: &mut File) -> Result<usize> {
     }
     match u32::from_le_bytes(header[8..12].try_into().unwrap()) {
         FULL_VERSION => {}
-        old @ 1..=3 => {
+        old @ 1..=4 => {
             return Err(Error::Full(format!(
                 "full snapshot version {old} predates the unified version {FULL_VERSION} and is not supported"
             )))
@@ -182,6 +191,9 @@ fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<M
         metadata.balloon.as_ref(),
         &metadata.regions,
     )?;
+    if let Some(meta) = &metadata.vsock {
+        vsock::validate_metadata(meta, &metadata.regions)?;
+    }
     if let Some(legacy) = &metadata.legacy {
         legacy::validate_metadata(legacy, &metadata.regions)?;
     }
@@ -218,7 +230,11 @@ fn validate_rings(metadata: &Metadata, memory: &GuestMemoryMmap) -> Result<()> {
     if let Some(nic) = &metadata.nic {
         nic::validate_nic_rings(nic, memory)?;
     }
-    event_devices::validate_rings(metadata.rng.as_ref(), metadata.balloon.as_ref(), memory)
+    event_devices::validate_rings(metadata.rng.as_ref(), metadata.balloon.as_ref(), memory)?;
+    if let Some(meta) = &metadata.vsock {
+        vsock::validate_rings(meta, memory)?;
+    }
+    Ok(())
 }
 
 /// Create the 0600 exclusive image with an invalid magic placeholder, then
@@ -286,19 +302,6 @@ fn validate_target(
     Ok(target)
 }
 
-/// Fold up to three recovery results into one error: the first failure is
-/// the operation error, one further failure becomes its recovery error.
-/// Exhaustive by construction; no result is unwrapped.
-fn combine_recovery(first: Error, second: Result<()>, third: Result<()>) -> Error {
-    match second.err().or(third.err()) {
-        None => first,
-        Some(recovery) => Error::Recovery {
-            operation: Box::new(first),
-            resume: Box::new(recovery),
-        },
-    }
-}
-
 impl RamSnapshotVm {
     pub(super) fn setup_irqchip(&mut self) -> Result<()> {
         if self.irqchip_ready {
@@ -319,154 +322,90 @@ impl RamSnapshotVm {
         Ok(())
     }
 
-    /// Pause and acknowledge ALL vCPUs -> freeze ALL devices (every disk,
-    /// the NIC, then the event thread with RNG, balloon and UART input) ->
-    /// reject a pending guest exit -> ONE RAM alias probe at the quiescent
-    /// boundary -> interrupt drain (synchronous KVM deassign) -> device,
-    /// legacy, CPU, KVM, RAM and disk capture -> sync file -> reassign
-    /// source irqfds, resume ALL devices, resume ALL CPUs (each attempted
-    /// independently) -> publish valid magic. A source keeps running with
-    /// its backends, worker buffers and pending notifications; an exiting
-    /// source keeps its CPUs paused for the event thread to stop.
-    pub(crate) fn save_full(&mut self, path: &Path) -> Result<()> {
-        if self.control.unusable || self.paused || self.handles.is_empty() || !self.irqchip_ready {
-            return Err(Error::Invalid(
-                "full save requires a running usable kernel-irqchip VM",
-            ));
-        }
+    /// Export the paused owner's cut: ONE RAM alias probe (every device is
+    /// frozen, so no transient mapping clone is alive) -> device capture
+    /// from the cursors the pause retained, legacy, CPU, KVM, RAM and disk
+    /// capture -> sync file -> publish valid magic. Nothing is resumed, so
+    /// repeated exports capture the same RAM, device and CPU state; each
+    /// captures the KVM clock and TSC at its own time, which keep running
+    /// while paused. A failed export removes its partial image and leaves
+    /// the owner paused and retryable, except a vCPU that never answers its
+    /// state request: that uncertain control disables the owner and stops
+    /// every thread.
+    pub(crate) fn export(&mut self, path: &Path) -> Result<()> {
+        // Only worker devices retain cursors.
+        #[cfg_attr(not(feature = "blk"), allow(unused_variables))]
+        let paused = match &self.pause {
+            Some(paused) if !self.control.unusable => paused,
+            _ => return Err(Error::Invalid("export requires a paused usable VM")),
+        };
         if self.exit.requested() {
-            return Err(Error::Invalid("the guest requested exit"));
+            return Err(Error::Invalid("the VM is exiting"));
         }
         let regions = self.topology.regions(&self.memory)?;
         payload_len(&regions, self.max_slots)?;
         let kvm = KvmContext::new().map_err(Error::State)?;
         let compatibility = Compatibility::capture(kvm.fd()).map_err(Error::Full)?;
-        let pause = if self
-            .handles
-            .iter()
-            .any(|h| !h.response_receiver().is_empty())
-        {
-            Err(Error::Invalid("unconsumed vCPU response before full save"))
-        } else {
-            Control::transition(&self.handles, true, CONTROL_TIMEOUT)
+        self.probe_ram_aliases(self.expected_device_clones())?;
+        #[cfg(feature = "blk")]
+        let disks = blk::capture_disks(self, &paused.disks, &regions)?;
+        #[cfg(not(feature = "blk"))]
+        let disks = Vec::new();
+        #[cfg(all(feature = "blk", feature = "net"))]
+        let nic = nic::capture(self, paused.nic.as_ref(), &disks, &regions)?;
+        #[cfg(not(all(feature = "blk", feature = "net")))]
+        let nic = None;
+        let (rng, balloon) = event_devices::capture(self, &regions)?;
+        let vsock = vsock::capture(self, &regions)?;
+        let legacy = legacy::capture(self, &regions)?;
+        let cpus = match self.save_cpus(&compatibility) {
+            Err(unanswered @ Error::Control(_)) => {
+                self.disable();
+                return Err(unanswered);
+            }
+            cpus => cpus?,
         };
-        if pause.is_err() {
-            self.control.unusable = true;
-        }
-        let mut drained = 0;
-        let operation = pause.and_then(|_| {
-            // vCPUs are paused: device activation cannot race the expected
-            // clone count. Every device is frozen before the single probe,
-            // so no transient mapping clone is alive when it counts.
+        let vm = self.vm.save_state().map_err(Error::State)?;
+        let metadata = Metadata {
+            compatibility,
+            cpus,
+            vm,
+            regions,
+            disks,
+            nic,
+            rng,
+            balloon,
+            vsock,
+            legacy,
+        };
+        write_pending(
+            path,
+            &self.memory,
+            &metadata,
             #[cfg(feature = "blk")]
-            let frozen_disks = blk::freeze_disks(self)?;
-            #[cfg(all(feature = "blk", feature = "net"))]
-            let frozen_nic = nic::freeze(self)?;
-            if let Some(events) = &self.events {
-                events.freeze()?;
-            }
-            // A frozen thread leaves an exit unread; either form aborts.
-            if self.exit.requested() {
-                return Err(Error::Invalid("the guest requested exit"));
-            }
-            self.probe_ram_aliases(self.expected_device_clones())?;
-            wiring::drain_irqfds(self, &mut drained)?;
-            #[cfg(feature = "blk")]
-            let disks = blk::capture_disks(self, &frozen_disks, &regions)?;
-            #[cfg(not(feature = "blk"))]
-            let disks = Vec::new();
-            #[cfg(all(feature = "blk", feature = "net"))]
-            let nic = nic::capture(self, frozen_nic, &disks, &regions)?;
-            #[cfg(not(all(feature = "blk", feature = "net")))]
-            let nic = None;
-            let (rng, balloon) = event_devices::capture(self, &regions)?;
-            let legacy = legacy::capture(self, &regions)?;
-            let mut cpus = Vec::with_capacity(self.handles.len());
-            for (id, handle) in self.handles.iter().enumerate() {
-                let state = snapshot::request(handle, |reply| Request::Save {
-                    size: compatibility.xsave_size,
-                    reply,
-                })
-                .map_err(|e| Error::Full(format!("save vCPU {id}: {e}")))?;
-                compatibility.validate_cpu(&state).map_err(Error::Full)?;
-                compatibility
-                    .validate_topology(&state, id, self.handles.len())
-                    .map_err(Error::Full)?;
-                cpus.push(state);
-            }
-            let vm = self.vm.save_state().map_err(Error::State)?;
-            let metadata = Metadata {
-                compatibility,
-                cpus,
-                vm,
-                regions,
-                disks,
-                nic,
-                rng,
-                balloon,
-                legacy,
-            };
-            write_pending(
-                path,
-                &self.memory,
-                &metadata,
-                #[cfg(feature = "blk")]
-                &self.disks,
-            )
-        });
-        // Restore source devices and ALL CPUs before deciding publication,
-        // attempting every step independently: an irqfd failure must not
-        // skip the device resumes, and a device failure must not skip the
-        // CPU resumes. Order: reattach the irqfds (so resumed devices cannot
-        // signal an unregistered eventfd), resume every device (also on the
-        // success path: a saved source VM keeps running), then every CPU —
-        // unless the guest requested exit: the resumed event thread stops
-        // the paused CPUs instead.
-        let irqfds = wiring::reassign_irqfds(self, drained);
-        let devices = self.resume_devices();
-        let resume = if self.exit.requested() {
-            Ok(())
-        } else {
-            Control::transition(&self.handles, false, CONTROL_TIMEOUT)
-        };
-        if irqfds.is_err() || devices.is_err() || resume.is_err() {
-            self.control.unusable = true;
-        }
-        let recovery = match (irqfds, devices, resume) {
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (Err(first), second, third) => Err(combine_recovery(first, second, third)),
-            (Ok(()), Err(first), third) => Err(combine_recovery(first, Ok(()), third)),
-            (Ok(()), Ok(()), Err(first)) => Err(first),
-        };
-        match (operation, recovery) {
-            (Ok(mut pending), Ok(())) => {
-                pending.file.seek(SeekFrom::Start(0))?;
-                pending.file.write_all(FULL_MAGIC)?;
-                pending.file.sync_all()?;
-                pending.complete = true;
-                Ok(())
-            }
-            (Err(operation), Err(recovery)) => Err(Error::Recovery {
-                operation: Box::new(operation),
-                resume: Box::new(recovery),
-            }),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+            &self.disks,
+        )?
+        .finish(FULL_MAGIC)
     }
 
-    /// Resume every device (disks, the NIC, then the event thread); each
-    /// actively re-examines its queues where its notifications may be gone,
-    /// and one failure does not skip the rest.
-    fn resume_devices(&self) -> Result<()> {
-        let mut results = Vec::new();
-        #[cfg(feature = "blk")]
-        results.push(blk::resume_devices(self));
-        #[cfg(all(feature = "blk", feature = "net"))]
-        results.push(nic::resume(self));
-        if let Some(events) = &self.events {
-            results.push(events.resume());
+    /// Capture and check every paused vCPU's state; `Error::Control` means
+    /// a vCPU never answered.
+    fn save_cpus(&self, compatibility: &Compatibility) -> Result<Vec<CpuState>> {
+        let mut cpus = Vec::with_capacity(self.handles.len());
+        for (id, handle) in self.handles.iter().enumerate() {
+            let answer = snapshot::answer(handle, |reply| Request::Save {
+                size: compatibility.xsave_size,
+                reply,
+            })
+            .map_err(|e| Error::Control(vec![format!("save vCPU {id}: {e}")]))?;
+            let state = answer.map_err(|e| Error::Full(format!("save vCPU {id}: {e}")))?;
+            compatibility.validate_cpu(&state).map_err(Error::Full)?;
+            compatibility
+                .validate_topology(&state, id, self.handles.len())
+                .map_err(Error::Full)?;
+            cpus.push(state);
         }
-        results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        Ok(cpus)
     }
 
     /// Restore scaffolding: new VM/irqchip. Devices must be attached before
@@ -503,17 +442,22 @@ impl RamSnapshotVm {
         Ok(())
     }
 
-    /// Restore a full checkpoint into a new paused owner. `resources` must
+    /// Import a full checkpoint into a new paused owner. `resources` must
     /// supply exactly the target resources the image's devices need; all
     /// metadata is validated before RAM exists, and every ring against the
     /// loaded RAM before any directory, socket or thread. Disk segments are
     /// imported into a new 0700 directory of exclusive 0600 raw files, which
     /// the owner removes on partial failure and destruction. Cut-time NIC TX
     /// the source had not consumed is already completed as dropped and its
-    /// interrupt raised into the restored irqchip; `resume` starts the VM.
-    /// The legacy UARTs take the fresh `resources.serial` endpoints and
-    /// replay no output; their dropped-output counts start at zero.
-    pub(crate) fn restore_full(path: &Path, mut resources: RestoreResources) -> Result<Self> {
+    /// interrupt raised into the restored irqchip. The owner ends in the
+    /// state a source has after `pause`: devices frozen, their cursors
+    /// retained and every irqfd drained, so it can be exported again before
+    /// it ever runs; `resume` starts it. The legacy UARTs take the fresh
+    /// `resources.serial` endpoints and replay no output; their
+    /// dropped-output counts start at zero. The vsock takes the caller's
+    /// `resources.vsock_ports` paths and keeps its backend stopped with the
+    /// transport reset still owed until `resume`.
+    pub(crate) fn import(path: &Path, mut resources: RestoreResources) -> Result<Self> {
         let kvm = KvmContext::new().map_err(Error::State)?;
         let mut file = File::open(path)?;
         let metadata = read_metadata(&mut file, kvm.max_memslots(), kvm.fd().get_max_vcpus())?;
@@ -521,6 +465,9 @@ impl RamSnapshotVm {
         #[cfg(all(feature = "blk", feature = "net"))]
         if let Some(socket) = &resources.nic_socket {
             nic::check_socket_path(socket)?;
+        }
+        if let (Some(meta), Some(ports)) = (&metadata.vsock, &resources.vsock_ports) {
+            vsock::check_resources(meta, ports)?;
         }
         if let Some(serial) = &resources.serial {
             legacy::check_endpoints(serial)?;
@@ -553,6 +500,9 @@ impl RamSnapshotVm {
             nic::restore_nic(&mut owner, meta, socket)?;
         }
         event_devices::restore(&mut owner, metadata.rng.as_ref(), metadata.balloon.as_ref())?;
+        if let (Some(meta), Some(ports)) = (&metadata.vsock, &resources.vsock_ports) {
+            vsock::restore(&mut owner, meta, ports)?;
+        }
         if let (Some(meta), Some(serial)) = (&metadata.legacy, resources.serial.take()) {
             legacy::restore(&mut owner, meta, serial)?;
         }
@@ -565,31 +515,9 @@ impl RamSnapshotVm {
         if owner.exit.requested() {
             return Err(Error::Invalid("a restored vCPU exited before resume"));
         }
+        // After the owed injection: draining flushes it into the irqchip.
+        owner.pause = Some(owner.quiesce()?);
         Ok(owner)
-    }
-
-    pub(crate) fn resume(&mut self) -> Result<()> {
-        if !self.paused || self.control.unusable || self.handles.is_empty() {
-            return Err(Error::Invalid("resume requires a restored paused full VM"));
-        }
-        if self.exit.requested() {
-            return Err(Error::Invalid("the guest requested exit"));
-        }
-        // Devices first: they actively re-examine their queues, so no lost
-        // notification can hang a request when the CPUs start running. If
-        // any device fails to resume, no vCPU is resumed at all.
-        let result = self
-            .resume_devices()
-            .and_then(|_| Control::transition(&self.handles, false, CONTROL_TIMEOUT));
-        if result.is_err() {
-            // Incomplete resume: no thread keeps running; the imported guard
-            // removal stays with the owner drop.
-            self.control.unusable = true;
-            self.stop_threads();
-            return result;
-        }
-        self.paused = false;
-        result
     }
 }
 

@@ -59,6 +59,7 @@ impl Rig {
             exit: Exit::new().unwrap(),
             rng: Some(self.rng.clone()),
             balloon: None,
+            vsock: None,
             serials: Vec::new(),
         };
         EventThread::spawn(devices, start).unwrap()
@@ -137,7 +138,7 @@ fn snapshot_event_thread_freeze_stop_and_restored_kick() {
 
 /// A vCPU thread that only counts the `Finish` it receives; the kick signal
 /// has the real vCPU handler installed.
-fn fake_vcpu(finished: Arc<AtomicUsize>) -> crate::vstate::VcpuHandle {
+pub(in crate::ram_snapshot) fn fake_vcpu(finished: Arc<AtomicUsize>) -> crate::vstate::VcpuHandle {
     crate::vstate::Vcpu::register_kick_signal_handler();
     let (sender, commands) = crossbeam_channel::unbounded();
     let (_responses, receiver) = crossbeam_channel::unbounded();
@@ -157,12 +158,13 @@ fn exit_only(exit: &Arc<Exit>, start: Start) -> EventThread {
         exit: exit.clone(),
         rng: None,
         balloon: None,
+        vsock: None,
         serials: Vec::new(),
     };
     EventThread::spawn(devices, start).unwrap()
 }
 
-fn wait_finished(finished: &AtomicUsize, count: usize) {
+pub(in crate::ram_snapshot) fn wait_finished(finished: &AtomicUsize, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while finished.load(Ordering::SeqCst) != count {
         assert!(Instant::now() < deadline, "vCPUs were not stopped");

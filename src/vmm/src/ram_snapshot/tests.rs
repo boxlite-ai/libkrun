@@ -3,7 +3,7 @@
 use super::*;
 use crossbeam_channel::{unbounded, Sender};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vm_memory::{GuestRegionMmap, MmapRegion};
 
 thread_local! {
@@ -80,9 +80,7 @@ fn memory() -> GuestMemoryMmap {
 }
 
 fn image(path: &Path, memory: &GuestMemoryMmap) {
-    Control::default()
-        .save(path, memory, &Topology::default(), &[], 32)
-        .unwrap();
+    write_ram_image(path, memory, &Topology::default(), 32).unwrap();
 }
 
 #[test]
@@ -161,18 +159,14 @@ fn shared_file_and_unknown_raw_mappings_are_rejected() {
     let shared_memory =
         GuestMemoryMmap::from_regions(vec![GuestRegionMmap::new(shared, GuestAddress(0)).unwrap()])
             .unwrap();
-    assert!(Control::default()
-        .save(&dir.path(), &shared_memory, &Topology::default(), &[], 32)
-        .is_err());
+    assert!(write_ram_image(&dir.path(), &shared_memory, &Topology::default(), 32).is_err());
     let backing = MmapRegion::<()>::new(4096).unwrap();
     // SAFETY: backing remains mapped until the raw guest view is dropped below.
     let raw = unsafe { MmapRegion::build_raw(backing.as_ptr(), 4096, 0, 0).unwrap() };
     let raw_memory =
         GuestMemoryMmap::from_regions(vec![GuestRegionMmap::new(raw, GuestAddress(0)).unwrap()])
             .unwrap();
-    assert!(Control::default()
-        .save(&dir.path(), &raw_memory, &Topology::default(), &[], 32)
-        .is_err());
+    assert!(write_ram_image(&dir.path(), &raw_memory, &Topology::default(), 32).is_err());
     let mut topology = Topology {
         kernel: Some(KernelMapping {
             gpa: 0,
@@ -219,8 +213,9 @@ fn dax_intent_is_rejected_even_when_mapping_is_anonymous() {
     assert!(topology.regions(&memory).is_err());
 }
 
-// These fakes exercise real VcpuHandle send/receive and save transactions. They
-// model communication faults; separate KVM tests below exercise actual CPUs.
+// These fakes exercise real VcpuHandle send/receive for the pause/resume
+// transition. They model communication faults; separate KVM tests below
+// exercise actual CPUs.
 struct TestCpus {
     handles: Vec<VcpuHandle>,
 }
@@ -257,7 +252,6 @@ fn normal(event: VcpuEvent, responses: &Sender<VcpuResponse>) {
 
 #[test]
 fn pause_is_broadcast_before_waiting_for_individual_acknowledgments() {
-    let dir = TempDir::new();
     let (sent, received) = unbounded();
     let cpus = TestCpus {
         handles: vec![
@@ -275,145 +269,12 @@ fn pause_is_broadcast_before_waiting_for_individual_acknowledgments() {
             }),
         ],
     };
-    Control::default()
-        .save(
-            &dir.path(),
-            &memory(),
-            &Topology::default(),
-            &cpus.handles,
-            32,
-        )
-        .unwrap();
-    assert!(restore_memory(&mut File::open(dir.path()).unwrap(), 32).is_ok());
+    Control::transition(&cpus.handles, true, CONTROL_TIMEOUT).unwrap();
 }
 
 #[test]
-fn write_failure_resumes_every_cpu_and_does_not_poison_control() {
-    let dir = TempDir::new();
-    let resumed = Arc::new(AtomicUsize::new(0));
-    let cpus = TestCpus {
-        handles: (0..2)
-            .map(|_| {
-                let resumed = resumed.clone();
-                cpu(move |event, responses| {
-                    if matches!(event, VcpuEvent::Resume) {
-                        resumed.fetch_add(1, Ordering::SeqCst);
-                    }
-                    normal(event, responses);
-                })
-            })
-            .collect(),
-    };
-    let mut control = Control::default();
-    let absent_parent = dir.0.join("absent/ram");
-    assert!(control
-        .save(
-            &absent_parent,
-            &memory(),
-            &Topology::default(),
-            &cpus.handles,
-            32
-        )
-        .is_err());
-    assert_eq!(resumed.load(Ordering::SeqCst), 2);
-    assert!(!control.unusable);
-    control
-        .save(
-            &dir.path(),
-            &memory(),
-            &Topology::default(),
-            &cpus.handles,
-            32,
-        )
-        .unwrap();
-}
-
-#[test]
-fn mid_copy_file_write_failure_invalidates_file_and_resumes_every_cpu() {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            COPY_WRITE_LIMIT.with(|limit| limit.set(None));
-        }
-    }
-    let _reset = Reset;
-    COPY_WRITE_LIMIT.with(|limit| limit.set(Some(17)));
-    COPY_BYTES.with(|written| written.set(0));
-    let dir = TempDir::new();
-    let resumes = Arc::new(AtomicUsize::new(0));
-    let cpus = TestCpus {
-        handles: (0..2)
-            .map(|_| {
-                let resumes = resumes.clone();
-                cpu(move |event, responses| {
-                    if matches!(event, VcpuEvent::Resume) {
-                        resumes.fetch_add(1, Ordering::SeqCst);
-                    }
-                    normal(event, responses);
-                })
-            })
-            .collect(),
-    };
-    let mut control = Control::default();
-    let error = control
-        .save(
-            &dir.path(),
-            &memory(),
-            &Topology::default(),
-            &cpus.handles,
-            32,
-        )
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("injected mid-copy write failure"));
-    assert_eq!(COPY_BYTES.with(|written| written.get()), 17);
-    assert_eq!(resumes.load(Ordering::SeqCst), 2);
-    assert!(!dir.path().exists());
-    assert!(!control.unusable);
-}
-
-#[test]
-fn magic_is_published_only_after_every_resume_acknowledgment() {
-    let dir = TempDir::new();
-    let path = dir.path();
-    let check_path = path.clone();
-    let cpus = TestCpus {
-        handles: vec![cpu(move |event, responses| {
-            if matches!(event, VcpuEvent::Resume) {
-                let mut file = File::open(&check_path).unwrap();
-                assert!(file.metadata().unwrap().len() > HEADER_LEN + 2 * REGION_LEN);
-                assert!(restore_memory(&mut file, 32).is_err());
-            }
-            normal(event, responses);
-        })],
-    };
-    Control::default()
-        .save(&path, &memory(), &Topology::default(), &cpus.handles, 32)
-        .unwrap();
-    assert!(restore_memory(&mut File::open(path).unwrap(), 32).is_ok());
-}
-
-#[test]
-fn failed_magic_write_removes_the_unpublished_file() {
-    let dir = TempDir::new();
-    let memory = memory();
-    let mut pending = PendingSnapshot::write(
-        &dir.path(),
-        &memory,
-        &Topology::default().regions(&memory).unwrap(),
-    )
-    .unwrap();
-    // A read-only replacement FD fails at the actual final magic write.
-    pending.file = File::open(dir.path()).unwrap();
-    assert!(pending.finish().is_err());
-    assert!(!dir.path().exists());
-}
-
-#[test]
-fn timeout_late_pause_and_exit_latch_controller_and_resume_all() {
+fn transition_timeout_and_exit_fail_and_a_late_pause_precedes_its_resume() {
     for exit in [false, true] {
-        let dir = TempDir::new();
         let resumes = Arc::new(AtomicUsize::new(0));
         let count = resumes.clone();
         let cpus = TestCpus {
@@ -441,62 +302,16 @@ fn timeout_late_pause_and_exit_latch_controller_and_resume_all() {
                 }),
             ],
         };
-        let mut control = Control::default();
-        assert!(control
-            .save_with_timeout(
-                &dir.path(),
-                &memory(),
-                &Topology::default(),
-                &cpus.handles,
-                32,
-                Duration::from_millis(20)
-            )
-            .is_err());
-        assert!(control.unusable);
+        assert!(Control::transition(&cpus.handles, true, Duration::from_millis(20)).is_err());
+        // The late Paused is consumed before the Resumed, not misread.
+        Control::transition(&cpus.handles, false, Duration::from_millis(500)).unwrap();
         assert_eq!(resumes.load(Ordering::SeqCst), 1);
-        assert!(!dir.path().exists());
-        assert!(control
-            .save(
-                &dir.path(),
-                &memory(),
-                &Topology::default(),
-                &cpus.handles,
-                32
-            )
-            .is_err());
-        assert_eq!(resumes.load(Ordering::SeqCst), 1); // no second attempt consumes stale responses
     }
 }
 
 #[test]
-fn resume_failure_never_finalizes_a_successful_ram_copy() {
-    let dir = TempDir::new();
-    let cpus = TestCpus {
-        handles: vec![cpu(|event, responses| {
-            if matches!(event, VcpuEvent::Pause) {
-                responses.send(VcpuResponse::Paused).unwrap();
-            }
-        })],
-    };
-    let mut control = Control::default();
-    assert!(control
-        .save_with_timeout(
-            &dir.path(),
-            &memory(),
-            &Topology::default(),
-            &cpus.handles,
-            32,
-            Duration::from_millis(20)
-        )
-        .is_err());
-    assert!(control.unusable);
-    assert!(!dir.path().exists());
-}
-
-#[test]
-fn disconnected_command_channel_preserves_operation_and_recovery_errors() {
+fn disconnected_command_channel_still_attempts_every_cpu() {
     Vcpu::register_kick_signal_handler();
-    let dir = TempDir::new();
     let (sender, commands) = unbounded();
     drop(commands);
     let (responses, receiver) = unbounded();
@@ -518,20 +333,44 @@ fn disconnected_command_channel_preserves_operation_and_recovery_errors() {
             }),
         ],
     };
-    let error = Control::default()
-        .save_with_timeout(
-            &dir.path(),
-            &memory(),
-            &Topology::default(),
-            &cpus.handles,
-            32,
-            Duration::from_millis(20),
-        )
-        .unwrap_err();
-    assert!(matches!(error, Error::Recovery { .. }));
+    let error = Control::transition(&cpus.handles, false, Duration::from_millis(20)).unwrap_err();
+    assert!(
+        matches!(&error, Error::Control(errors) if errors.len() == 2),
+        "{error}"
+    );
     assert_eq!(resumed.load(Ordering::SeqCst), 1);
-    assert!(!dir.path().exists());
     stop.send(()).unwrap(); // allow the intentionally disconnected test handle to join
+}
+
+#[test]
+fn mid_copy_file_write_failure_removes_the_unpublished_file() {
+    COPY_BYTES.with(|written| written.set(0));
+    let dir = TempDir::new();
+    let error = with_failed_payload_write(17, || {
+        write_ram_image(&dir.path(), &memory(), &Topology::default(), 32)
+    })
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected mid-copy write failure"));
+    assert_eq!(COPY_BYTES.with(|written| written.get()), 17);
+    assert!(!dir.path().exists());
+}
+
+#[test]
+fn failed_magic_write_removes_the_unpublished_file() {
+    let dir = TempDir::new();
+    let memory = memory();
+    let mut pending = PendingSnapshot::write(
+        &dir.path(),
+        &memory,
+        &Topology::default().regions(&memory).unwrap(),
+    )
+    .unwrap();
+    // A read-only replacement FD fails at the actual final magic write.
+    pending.file = File::open(dir.path()).unwrap();
+    assert!(pending.finish(MAGIC).is_err());
+    assert!(!dir.path().exists());
 }
 
 #[test]
@@ -664,13 +503,13 @@ fn new_kvm_vm_runs_against_restored_registered_mappings_and_repeated_pause() {
     drop(memory);
     let mut restored = RamSnapshotVm::restore(&dir.path()).unwrap();
     restored.start_vcpus(2, 0).unwrap();
-    Control::transition(&restored.handles, true, CONTROL_TIMEOUT).unwrap();
-    Control::transition(&restored.handles, true, CONTROL_TIMEOUT).unwrap();
+    restored.pause().unwrap();
+    assert!(restored.pause().is_err(), "a second pause was accepted");
     let before = restored
         .memory
         .read_obj::<u16>(GuestAddress(0x800))
         .unwrap();
-    Control::transition(&restored.handles, false, CONTROL_TIMEOUT).unwrap();
+    restored.resume().unwrap();
     // Bounded polling checks guest writes crossing real KVM registered slots.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
@@ -688,7 +527,47 @@ fn new_kvm_vm_runs_against_restored_registered_mappings_and_repeated_pause() {
         );
         std::thread::yield_now();
     }
-    restored.save(&dir.0.join("running")).unwrap();
+    let running = dir.0.join("running");
+    assert!(restored.save(&running).is_err(), "RAM save while running");
+    assert!(!running.exists());
+}
+
+/// A RAM-only save needs a confirmed pause and never resumes: a failed
+/// write leaves the owner paused and retryable, and only `resume` runs the
+/// guest again.
+#[test]
+fn ram_save_requires_pause_and_never_resumes() {
+    let dir = TempDir::new();
+    let memory = memory();
+    // inc word [0x800]; jmp back.
+    memory
+        .write_slice(&[0xff, 0x06, 0x00, 0x08, 0xeb, 0xfa], GuestAddress(0))
+        .unwrap();
+    let mut owner = RamSnapshotVm::from_memory(memory, Topology::default()).unwrap();
+    owner.start_vcpus(1, 0).unwrap();
+    let counter =
+        |owner: &RamSnapshotVm| owner.memory.read_obj::<u16>(GuestAddress(0x800)).unwrap();
+    owner.pause().unwrap();
+    let paused_at = counter(&owner);
+    let failed = with_failed_payload_write(17, || owner.save(&dir.path()));
+    assert!(failed.is_err());
+    assert!(!dir.path().exists());
+    owner.save(&dir.path()).unwrap();
+    owner.save(&dir.0.join("again")).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(counter(&owner), paused_at, "a RAM save resumed the guest");
+    assert!(owner.is_paused());
+    let saved = restore_memory(&mut File::open(dir.path()).unwrap(), 32).unwrap();
+    assert_eq!(
+        saved.read_obj::<u16>(GuestAddress(0x800)).unwrap(),
+        paused_at
+    );
+    owner.resume().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while counter(&owner) == paused_at {
+        assert!(Instant::now() < deadline, "resume did not run the guest");
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -705,8 +584,10 @@ fn minimal_builder_has_a_reachable_no_device_save_path() {
         .write_slice(&[0xeb, 0xfe], GuestAddress(0))
         .unwrap();
     source.start_vcpus(2, 0).unwrap();
+    source.pause().unwrap();
     source.save(&dir.path()).unwrap();
     assert!(RamSnapshotVm::restore(&dir.path()).is_ok());
+    source.resume().unwrap();
 }
 
 #[test]
@@ -757,70 +638,4 @@ fn partial_registration_failure_does_not_return_an_owner_or_retain_mappings() {
         Err(Error::State(crate::vstate::Error::SetUserMemoryRegion(_)))
     ));
     assert!(weak.upgrade().is_none());
-}
-
-#[test]
-fn vmm_rejects_a_registered_background_ram_writer() {
-    struct Writer {
-        stop: Sender<()>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-    impl devices::virtio::VmmExitObserver for Writer {}
-    impl Drop for Writer {
-        fn drop(&mut self) {
-            let _ = self.stop.send(());
-            self.thread.take().unwrap().join().unwrap();
-        }
-    }
-    let dir = TempDir::new();
-    let memory = memory();
-    let writer_memory = memory.clone();
-    let (stop, request) = unbounded();
-    let (started, ready) = unbounded();
-    let thread = std::thread::spawn(move || {
-        writer_memory.write_obj(42u64, GuestAddress(0)).unwrap();
-        started.send(()).unwrap();
-        while matches!(
-            request.try_recv(),
-            Err(crossbeam_channel::TryRecvError::Empty)
-        ) {
-            writer_memory.write_obj(43u64, GuestAddress(0)).unwrap();
-            std::thread::yield_now();
-        }
-    });
-    ready.recv_timeout(Duration::from_secs(1)).unwrap();
-    let vm = crate::builder::setup_vm(&memory, false).unwrap();
-    let exit_evt = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
-    let pio = crate::device_manager::legacy::PortIODeviceManager::new(
-        Arc::new(Mutex::new(devices::legacy::Cmos::new(4096, 0))),
-        Vec::new(),
-        exit_evt.try_clone().unwrap(),
-    )
-    .unwrap();
-    let mut vmm = crate::Vmm {
-        guest_memory: memory,
-        arch_memory_info: arch::arch_memory_regions(4096, None, 0, 0, None).0,
-        kernel_cmdline: kernel::cmdline::Cmdline::new(4096),
-        vcpus_handles: Vec::new(),
-        exit_evt,
-        vm,
-        exit_observers: vec![Arc::new(Mutex::new(Writer {
-            stop,
-            thread: Some(thread),
-        }))],
-        exit_code: Arc::new(std::sync::atomic::AtomicI32::new(i32::MAX)),
-        mmio_device_manager: crate::device_manager::mmio::MMIODeviceManager::new(
-            &mut 0xd000_0000,
-            (arch::IRQ_BASE, arch::IRQ_MAX),
-        ),
-        pio_device_manager: pio,
-        ram_snapshot_topology: Topology::default(),
-        ram_snapshot_control: Control::default(),
-    };
-    let error = vmm.save_ram_snapshot(&dir.path()).unwrap_err();
-    assert!(matches!(
-        error,
-        Error::Invalid("background device observers have no freeze contract")
-    ));
-    assert!(!dir.path().exists());
 }

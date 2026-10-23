@@ -946,10 +946,6 @@ pub fn build_microvm(
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
     let mut vmm = Vmm {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-        ram_snapshot_topology: ram_snapshot_topology(vm_resources, &payload, &_shm_manager),
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
-        ram_snapshot_control: crate::ram_snapshot::Control::default(),
         guest_memory,
         arch_memory_info,
         kernel_cmdline,

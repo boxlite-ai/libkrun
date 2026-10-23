@@ -255,35 +255,53 @@ LD_LIBRARY_PATH=/usr/local/lib64 ./chroot_vm rootfs_fedora/ /bin/sh
 
 ## Internal minimal VM checkpoints (experimental)
 
-The private Linux x86_64/KVM `RamSnapshotVm` harness supports `save_full`,
-`restore_full(path, RestoreResources)` and explicit `resume` for ordinary RAM
-with a kernel irqchip/PIT. Its base configuration is device-free (no userspace
+The private Linux x86_64/KVM `RamSnapshotVm` harness supports an explicit
+`pause` -> `export(path)` -> `import(path, RestoreResources)` -> `resume`
+lifecycle (described below) for ordinary RAM with a kernel irqchip/PIT. Its base configuration is device-free (no userspace
 devices; uncontrolled background RAM writers are rejected); `attach_rng` and
-`attach_balloon` add internal virtio devices, `attach_legacy` adds the x86
+`attach_balloon` add internal virtio devices, `attach_vsock` adds a Unix
+IPC vsock, `attach_legacy` adds the x86
 UARTs, CMOS and i8042, the optional `blk` feature
 described below adds internal block devices, and `blk` plus `net` add one
 internal network device. The harness supports
 1–128 vCPUs, subject to the host KVM capacity and the existing
 CPUID package-sizing limit. Saved CPU ordering and topology must match this count.
-Restore returns paused; it does not reload a payload, write boot parameters, or
+Import returns paused; it does not reload a payload, write boot parameters, or
 initialize new guest CPUs.
-The existing RAM-only image and APIs retain their memory-only meaning; an owner
-with any attached device refuses a RAM-only save and needs `save_full`.
+The existing RAM-only image and APIs retain their memory-only meaning: `save`
+needs an owner without vCPUs or a confirmed `pause`, never resumes, and is
+refused for an owner with any attached device, which needs `export`.
+
+Lifecycle contract:
+
+| Call | Requires | Effect | On failure |
+| --- | --- | --- | --- |
+| `pause` | running, usable, no guest exit | quiesce the vsock gate, pause/ack every vCPU, then freeze every disk, the NIC and the event thread (RNG, balloon, vsock queues, UART input), stop the vsock backend, then deassign and drain every irqfd; the frozen worker queue cursors and the drained irqfd count stay with the owner | rejected without effect before any control; otherwise the owner is disabled and every thread stopped and joined |
+| `export` | paused, usable | capture the same cut into a new image; resumes nothing, so it can repeat | partial image removed, still paused and retryable; a vCPU that never answers its state request disables the owner and stops every thread |
+| `import` | an image and matching resources | a new owner in the same paused state as a source after `pause` (devices frozen, cursors retained, irqfds drained), exportable before it ever runs | everything it created is removed after its threads joined |
+| `resume` | paused, usable, no guest exit | shared by sources and imports: reattach the drained irqfds, resume every device (the vsock delivers its transport reset before reopening its backend), then every vCPU last | the owner is disabled and every thread stopped and joined; no vCPU runs unless every device resumed |
+
+For example, a source checkpoints and continues with `pause()`,
+`export(a)`, `export(b)`, `resume()`; a target runs with
+`import(a, resources)`, `resume()`. Each export captures the KVM clock and
+TSC when it runs; both keep running while the owner is paused (see the timer
+handling below).
 
 Every full image, with or without devices, uses one format: magic
-`KRUNVM\0\0`, version 4, a bounded 16 MiB JSON state section, RAM copied in
+`KRUNVM\0\0`, version 5, a bounded 16 MiB JSON state section, RAM copied in
 64 KiB chunks into independent anonymous mappings, then one raw segment per
 disk. The JSON holds CPU, KVM and RAM state, the ordered disk table and the
-optional NIC, RNG, balloon and legacy-device (UARTs, CMOS, i8042) sections.
-Versions 1–3
-are rejected explicitly. Images never contain host paths, descriptors or
-threads: `RestoreResources` supplies the disk import directory, the NIC
-backend socket and the four serial endpoints, and each must be present exactly
-when the image has the matching device. A mismatch is rejected before any RAM,
+optional NIC, RNG, balloon, vsock and legacy-device (UARTs, CMOS, i8042)
+sections. Versions 1–4 (version 4 had no vsock section) are rejected
+explicitly; the RAM-only `KRUNRAM` image stays version 1. Images never contain
+host paths, descriptors or threads: `RestoreResources` supplies the disk
+import directory, the NIC backend socket, the vsock port paths and the four
+serial endpoints, and each must be present exactly when the image has the
+matching device. A mismatch is rejected before any RAM,
 directory, socket or thread is created. Files are created exclusively with mode 0600 and become
-valid only after all source vCPUs resume successfully. Errors attempt every
-source resume; uncertain control disables subsequent checkpoints. Partial
-imports stop and join created threads before releasing VM/RAM. External RAM
+valid only after the whole image is synced; an export never resumes the
+source. Uncertain control disables subsequent checkpoints and stops every
+thread. Partial imports stop and join created threads before releasing VM/RAM. External RAM
 aliases, TEE, nested virtualization, split irqchips, PMU/SMM and uncovered
 extended CPU states are unsupported.
 
@@ -301,14 +319,14 @@ pausing a source vCPU does not stop its hardware clocks. TSC frequency differenc
 above 250 ppm require successful scaling. Multi-vCPU restore requires successful
 vCPU0-based TSC offset synchronization before VM clock restore. Every
 attached device below is frozen, drained and saved before CPU/KVM/RAM
-capture; device types not listed here (virtio-fs, vsock, console) remain
+capture; device types not listed here (virtio-fs, console) remain
 future work.
 
 ### Internal block-device checkpoints (stage 3, feature `blk`)
 
 With the `blk` cargo feature, the same private owner additionally supports
 `attach_disk` (before vCPUs start) for ordinary RAW/QCOW2/VMDK files through
-the existing imago backends, saved into the version-4 full image. Caller
+the existing imago backends, saved into the full image. Caller
 precondition: the source disk file and every backing file in its chain must
 have no writers outside this private owner for the lifetime of the
 attachment — the consistent cut assumes sole ownership; no lock or lease is
@@ -319,27 +337,26 @@ steps, kernel-irqchip GSIs 16–23; GSI 0–15 stay reserved for legacy devices.
 The ordered disk table in the JSON section is followed after the RAM payload
 by one raw segment per disk: the frozen guest-visible logical capacity with
 QCOW2/VMDK backing chains and readonly disks normalized into plain bytes.
-`save_full` keeps its single-file contract. `restore_full` with
+`export` keeps its single-file contract. `import` with
 `RestoreResources::disk_dir` imports the segments into a new 0700 destination
 directory of exclusive 0600 `disk-N.raw` files, never taking paths from
 metadata, and the owner deletes the imported directory on partial failure and
 destruction.
 
-The save order is: configuration checks -> pause/ack all vCPUs -> freeze and
+The pause order is: configuration checks -> pause/ack all vCPUs -> freeze and
 flush every device (controls are checked before popping each descriptor, so a
 freeze lands between individual requests after the status write, used-ring
 update and interrupt; the single frozen flag and scoped mapping clones
 guarantee no ring write — including notification re-enables — after the
 confirmation; the disk is flushed and synced regardless of the guest cache
 mode, inactive disks included; the bounded command queue is part of the 30 s
-control timeout, which is never an I/O cancellation) -> the RAM alias probe
-at that quiescent boundary, counting only the clones of the owner's own
-devices -> per-device synchronous KVM irqfd deassign (Linux flushes the
-injection workqueue before the ioctl returns) and eventfd drain -> device
-(active rings validated against guest RAM), CPU, KVM, RAM and disk capture ->
-file sync -> irqfd reassign, device resume and CPU resume, each attempted for
-every resource and aggregated (any failure poisons the owner and never
-publishes) -> valid magic. Restores validate all metadata — including the
+control timeout, which is never an I/O cancellation) -> per-device
+synchronous KVM irqfd deassign (Linux flushes the injection workqueue before
+the ioctl returns) and eventfd drain. Each export then runs at that
+quiescent boundary: the RAM alias probe, counting only the clones of the
+owner's own devices -> device (active rings validated against guest RAM),
+CPU, KVM, RAM and disk capture -> file sync -> valid magic, resuming
+nothing. Imports validate all metadata — including the
 exact offered-feature contract and read-only consistency — before creating
 anything, then the active rings against the loaded RAM, then import through
 an exclusive creation guard: a pre-existing destination directory is an error
@@ -348,11 +365,12 @@ itself created are removed, after every CPU and worker thread joined.
 Restored devices rebuild MMIO/ioeventfd/irqfd from the saved address and IRQ
 with new eventfds; already-injected interrupts come back with the kernel
 irqchip state, and transport interrupt status is restored without
-reinjecting. Restored active workers start frozen; explicit `resume` resumes
-devices first (actively re-examining their queues so drained notification
-counts cannot hang) and then the CPUs; if any device fails to resume, no CPU
-is resumed, and an incomplete resume joins all CPUs and workers before
-returning the error. Reusable virtio queue/device/
+reinjecting. Imported active workers start frozen and the import drains its
+irqfds, so it ends in the paused state of a source. `resume` reattaches the
+irqfds, resumes devices (actively re-examining their queues so drained
+notification counts cannot hang) and then the CPUs; if any device fails to
+resume, no CPU is resumed, and an incomplete resume joins all CPUs and
+workers before returning the error. Reusable virtio queue/device/
 transport state (adapted from Firecracker's virtio persist structures)
 preserves every guest-writable selector verbatim and validates ring
 alignment/ranges and cursor consistency against guest RAM, including u16
@@ -392,21 +410,21 @@ confirmed freeze lands at a complete descriptor boundary with every used
 entry's interrupt raised; afterwards the worker writes no guest RAM, ring or
 interrupt and does no backend I/O until resumed or stopped. A resume
 re-examines the backend and both queues itself, so kicks drained while frozen
-cannot stall it. A source that saves keeps its backend connection and worker
-buffers and continues where it stopped.
+cannot stall it. A paused or exported source keeps its backend connection
+and worker buffers and continues where it stopped once resumed.
 
 The image's NIC section holds the MAC, attach features, device config, MMIO
 transport registers, negotiated features and RX/TX queue cursors in the
 persist structures above. Worker-private RX/TX buffers are excluded.
 
-`save_full` with devices: pause all vCPUs -> freeze every disk, the NIC, then
-the event thread -> one RAM alias probe (every device is frozen, so no
-transient mapping clone exists) -> deassign and drain every irqfd -> capture
-devices, CPUs, KVM, RAM and disks -> sync -> reassign irqfds, resume every
-device and every CPU, each attempted -> publish the magic only if everything
-succeeded.
+`pause` with devices: pause all vCPUs -> freeze every disk, the NIC, then
+the event thread -> deassign and drain every irqfd. Each `export`: one RAM
+alias probe (every device is frozen, so no transient mapping clone exists)
+-> capture devices from the retained cursors, CPUs, KVM, RAM and disks ->
+sync -> publish the magic. `resume`: reassign irqfds -> resume every device
+-> resume every CPU.
 
-`restore_full` with `RestoreResources::nic_socket` validates all
+`import` with `RestoreResources::nic_socket` validates all
 metadata (fixed slot, disk count, offered features against the attach
 features, config bytes against the MAC, transport state machine, queue
 structure) before RAM exists, then
@@ -422,8 +440,9 @@ are never parsed, and the count is fixed when the discard starts;
 chains the source already used are never replayed, and RX buffers stay
 available for new frames. The owed TX interrupt is raised after the KVM
 irqchip state is restored (loading it would overwrite an earlier injection)
-and before any vCPU runs. `resume` resumes the disks, the NIC and the event thread,
-then the CPUs. Teardown stops the event thread, joins CPUs, then workers
+and before the import drains its irqfds, so the injection lands in the
+irqchip state an immediate re-export captures. `resume` reattaches the
+irqfds, resumes the disks, the NIC and the event thread, then the CPUs. Teardown stops the event thread, joins CPUs, then workers
 (closing the backend), then removes owned imports.
 
 ### Internal RNG and balloon checkpoints (stage 5, no feature)
@@ -433,7 +452,7 @@ GSI 5 and a virtio balloon (existing free page reporting only) at 0xd000a000
 with GSI 6, before vCPUs start. Disk and NIC slots are unchanged. All devices
 share one wiring path: fixed-slot checks against guest RAM and against every
 attached device's address and GSI, ioeventfd/irqfd registration with
-rollback, and the irqfd drain/reassign around a capture.
+rollback, and the irqfd drain/reassign around a pause.
 
 Both devices run on one event thread. Its `EventManager` is created inside the
 thread from the concrete devices, so the public `Subscriber` bounds are
@@ -466,7 +485,7 @@ descriptor by descriptor). Only page-aligned private anonymous RAM owned by
 guest memory is discarded; other mappings ignore the hint and complete.
 
 This remains an internal closed loop for the minimal VM: no full BoxLite box
-restore and no virtio-fs/vsock/console support.
+restore and no virtio-fs/console support.
 
 ### Internal legacy UART, CMOS and i8042 checkpoints (stage 6, no feature)
 
@@ -475,7 +494,7 @@ UARTs at ports 0x3f8/0x2f8/0x3e8/0x2e8 (IRQ 4/3/4/3; a port without an
 endpoint is a sink), the CMOS at 0x70 and the i8042 at 0x60 (IRQ 1) on the
 owner's port-I/O bus. The five interrupt eventfds join the shared irqfd
 wiring: one irqfd per eventfd (COM1/COM3 and COM2/COM4 share a GSI), deassigned
-and drained with the MMIO devices around a capture. An interrupt already
+and drained with the MMIO devices while paused. An interrupt already
 injected lives in the saved KVM irqchip state and is never replayed.
 
 Each endpoint is a `UnixStream` that must already be nonblocking; its file
@@ -504,16 +523,101 @@ counts start at zero.
 Every owner with vCPUs (started or full-restored) has one event thread, even
 without devices:
 it also reads UART input and watches the owner's exit eventfd, which the
-i8042 reset and every vCPU exit write. After the vCPU threads are created and
+i8042 reset, every vCPU exit and a fatal vsock backend failure (see below)
+write. After the vCPU threads are created and
 before any first runs, the thread receives a stop handle (command sender and
 thread ID) per vCPU; the owner keeps the join handles. An exit latches
 `exiting` and stops every vCPU. A frozen thread leaves the exit unread, so
-`save_full` checks the latch and the unread eventfd after the freeze;
-`save`, `save_full` and `resume` reject an exiting owner, an exiting source
-keeps its CPUs paused for the event thread to stop, and a latched exit is
-never saved, so a target never replays a reset. Cleanup always runs event
-thread → vCPUs → disk/NIC workers → owned resources, so no stop handle
-outlives its thread's join.
+`pause` checks the latch and the unread eventfd after the freeze;
+`pause`, `save`, `export` and `resume` reject an exiting owner, an exit
+found at the freeze boundary disables the owner and stops every thread, and
+a latched exit is never saved, so a target never replays a reset. Cleanup always runs vsock
+gate quiesce → event thread → vCPUs → disk/NIC/vsock workers → owned
+resources, so no stop handle outlives its thread's join and no thread is
+joined while a vsock send blocks it.
+
+### Internal vsock checkpoints (stage 7, no feature)
+
+`attach_vsock(cid, ports)` adds, before vCPUs start, one virtio vsock at MMIO
+0xd000b000 with GSI 7 (guest kernel: `virtio_mmio.device=4K@0xd000b000:7`).
+Only ordinary Unix IPC is supported, never TSI: `ports` maps each vsock port
+to a host socket path and a role, `true` for a path the backend binds for
+host-initiated connections, `false` for a host listener that guest-initiated
+connections reach. The CID must be 3 to 2^32 - 2; paths must fit
+`sun_path` and hold no NUL byte, and no two listening ports may share a
+path (connecting ports may). `attach_vsock` and import reject a bad path
+before any device, guest RAM or other resource exists.
+
+Connections and RPCs do not survive a pause; guest listeners do. The guest
+learns it from the transport reset event (virtio 1.2 §5.10.6.7, `le32 id`
+0), and Linux guests then reset their established sockets.
+
+| Step | What happens |
+| --- | --- |
+| pause | the owner quiesces the device's gate, kept since attach and used without the device lock: every live Unix socket is shut down through a duplicate the gate owns, cancelling a send blocked under the device lock (which the event thread or a vCPU's MMIO access could otherwise wait on forever), and the gate is held closed (a backend start racing the pause, such as a guest activation, exits at once). Then the vCPUs pause, the event thread freezes, and the backend stops: muxer and reaper joined, proxies, pending RX packets and backend RAM clones released, only the paths it bound removed. An activated device then completes every TX chain still in its ring with length 0 (head indexes only, never parsed), owes their interrupt and owes the guest a reset |
+| export | saves the CID, port roles (never paths), transport, RX/TX/event queues, `reset_pending` and `interrupt_owed`; repeated exports and an export of an import before it runs keep both flags |
+| import | `RestoreResources::vsock_ports` must name exactly the image's ports and roles, checked with the rest of the metadata (slot, CID, ordered ports, offered features, transport, activation, reset flags) before RAM exists; the rings and every TX head are checked against the loaded RAM; the device comes back frozen with its backend stopped, so nothing is bound until `resume` |
+| resume | source or import: release the hold, write the reset into the next event buffer, complete the TX the guest queued before it could see the reset with length 0, then publish the reset's used entry (so a REQUEST the guest queues once it sees the reset is never dropped), raise the owed interrupt, then bind every original (source) or new (import) path and start the workers. No stale REQUEST or RW reaches a fresh connection. A path that cannot bind fails the resume, which disables the owner |
+
+Without an event buffer the resume still raises the owed interrupt, but the
+reset stays pending and the backend closed (TX stays in the ring) until the
+guest kicks the event queue; that kick delivers the reset and opens the
+backend. The whole event buffer chain is checked before anything is
+written: every descriptor device-writable, every NEXT link to a valid
+descriptor within the queue's chain limit (no invalid tail or cycle), every
+declared range inside guest RAM, at least four bytes in total. A valid
+chain may scatter the event (two 2-byte descriptors take it); any other
+buffer completes with length 0, never counts as the delivery and keeps the
+reset pending. A reopen that fails on such a kick (a listening path that
+cannot bind, an interrupt that cannot be raised) has no caller to report
+to: the backend is marked failed for good and the device writes the
+owner's exit notifier, so the event thread latches the exit and stops
+every vCPU at once; `pause`, `save`, `export` and `resume` then reject the
+exiting owner, and teardown still joins every thread and releases the
+backend. An
+inactive device stays inactive and owes no reset; its resume only releases
+the hold, so a later activation starts a backend.
+
+A worker panic makes `stop_backend` return `BackendFailed` after joining
+every other worker and running the whole cleanup; the failure is never
+cleared and the backend never restarts. Dropping any vsock device, TSI
+included, stops and joins its workers and removes the paths it bound.
+Initial activation keeps the old policy: an occupied listening path is
+skipped with a warning and left untouched. Guest driver reset is still
+unsupported (the transport marks the device failed).
+
+The device-level tests (`make snapshot-vsock-host-test`) cover blocked
+sends cancelled by the gate for both directions, stale TX completed at the
+stop and again before a reopen (no host connection, no answer), the event
+queue empty then offered, held-gate kicks, malformed event buffers
+(read-only, short, outside RAM, a declared range crossing the end of RAM
+whose first four bytes fit, an invalid NEXT tail, a cycle, a read-only
+tail) and a valid 2 + 2 byte chain, a REQUEST queued right after the reset
+is published (a test hook at that point) kept while the older one is
+dropped, a copied-RAM restore at fresh paths with the source continuing on
+its own, inactive and TSI devices, the sticky deferred-reopen failure and
+its notifier, and listener ownership. The owner tests without KVM cover
+metadata, port/role (NUL bytes, shared listening paths) and ring
+validation, the event thread freezing after the gate cancelled its blocked
+send, and a deferred reopen failure on the event thread latching the exit
+and stopping fake armed vCPUs. The KVM tests
+(`vsock/kvm_tests.rs`) drive the device through the owner's MMIO bus with
+the counter guest: two exports of one pause, source resume with the reset
+and its interrupt first, import and export before it runs, both images
+resumed at fresh paths in both directions with no stale request, a reset
+waiting for an event buffer, an inactive device across an import, resource
+errors and a failed restart that disables the owner. Real guest-agent
+reconnection is not exercised: the harness boots no Linux guest.
+
+Stage-7 validation status (macOS arm64 host, x86_64 Linux target):
+`make snapshot-fmt`, `make snapshot-check` (also featureless
+`SNAPSHOT_PKGS='-p krun-vmm'`), `make snapshot-build`,
+`make snapshot-vsock-host-test` (16/16, native) and
+`make snapshot-net-host-test` pass. `make snapshot-test` in the amd64
+`rust:1-bookworm` container without `/dev/kvm`: 57/57 `krun-devices`
+snapshot tests and 37 `krun-vmm` tests pass; the 37 tests that open KVM,
+including the four vsock KVM tests, fail at opening `/dev/kvm` and are
+**UNVERIFIED**, as is guest-agent reconnection.
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 
@@ -524,6 +628,7 @@ make snapshot-build
 make snapshot-test SNAPSHOT_CARGO_FLAGS='--offline --no-run'
 make snapshot-test
 make snapshot-net-host-test
+make snapshot-vsock-host-test
 ```
 
 The snapshot targets enable the `blk` and `net` features and run the
@@ -542,7 +647,8 @@ target runner so `make snapshot-test` executes the cross-built tests, for
 example `SNAPSHOT_RUNNER="docker run --rm --platform linux/amd64 -v $PWD:$PWD
 -w $PWD rust:1-bookworm"`; add `--device /dev/kvm` on a Linux KVM host.
 `make snapshot-net-host-test` runs the virtio-net backend and worker tests
-natively (macOS or Linux, no KVM). `snapshot-guest` regenerates the real-mode
+natively (macOS or Linux, no KVM); `make snapshot-vsock-host-test` does the
+same for the vsock backend lifecycle tests. `snapshot-guest` regenerates the real-mode
 timer and legacy fixture using GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; the block guest is
 emitted by an annotated byte emitter inside the stage-3 tests (a 16-bit-code
 unreal-mode segment setup with an exact GDT layout, virtio queue with
@@ -564,11 +670,12 @@ partial RX frame and spare RX buffers, and with a deferred RX frame, a
 partial TX write, event index and wrapped cursors), the head-only discard,
 NIC metadata/ring/version validation, and KVM tests (`nic/kvm_tests.rs`)
 that drive the virtio-net registers through the owner's MMIO bus while the
-stage-2 counter guest proves CPU continuation: save during active traffic
-with a partial frame and unconsumed TX, source continuation on its backend,
-restore with a new backend (dropped TX, owed interrupt status, paused CPU),
-resume traffic, inactive NIC plus disk, backend failure and legacy-entry
-cleanup, save failure recovery, and the shared GSI limit. No test has the
+stage-2 counter guest proves CPU continuation: export during active traffic
+with a partial frame and unconsumed TX, source continuation on its backend
+after resume, import with a new backend (dropped TX, owed interrupt status,
+paused CPU), resume traffic, inactive NIC plus disk, backend failure and
+legacy-entry cleanup, a failed export that keeps CPU and NIC paused until
+resume, and the shared GSI limit. No test has the
 guest itself read the restored NIC or take a pending NIC interrupt after a
 restore; that guest-observed check is acceptance work below.
 
@@ -589,17 +696,17 @@ crossing the end of RAM, the 64 KiB cap, no second completion), whole-report
 balloon validation (malformed NEXT tail, range crossing the end of RAM, then a
 valid discard; Linux only), the event thread without KVM (frozen thread
 dispatches nothing, the source resumes its pending notification, stop from
-frozen, restored thread serves an un-notified request), pre-version-4
+frozen, restored thread serves an un-notified request), old-version
 rejection, resource matching, and one KVM round trip
 (`event_devices/tests.rs`: pending un-notified RNG request and inactive
-balloon across save, source continuation, restored completion and CPU
-continuation). Stage-5 validation status: `make snapshot-fmt` and
+balloon across export, source continuation after resume, restored completion
+and CPU continuation). Stage-5 validation status: `make snapshot-fmt` and
 `make snapshot-check` pass; the non-KVM tests above, plus the existing NIC
 metadata, ring and discard tests, pass when `make snapshot-test` runs inside
 an amd64 `rust:1-bookworm` container (repository mounted at the same path,
 host `~/.cargo/registry` and `config.toml` as `CARGO_HOME`, a separate
 `CARGO_TARGET_DIR`). The KVM round trip and the existing KVM tests on the
-version-4 path are **UNVERIFIED** (no `/dev/kvm`).
+unified full-image path are **UNVERIFIED** (no `/dev/kvm`).
 
 The stage-6 tests cover the UART endpoint (blocking endpoint rejected with
 flags unchanged; full and closed peers drop, count and still raise THR; the
@@ -610,11 +717,11 @@ cursors across the `usize` wrap, CMOS capacity mismatch), legacy metadata
 and endpoint validation, and the exit watch without KVM (device-free thread
 stops armed vCPUs; a frozen thread leaves the exit pending for the owner,
 then stops on resume). One KVM test extends the stage-2 fixture
-(`full/tests.rs`, entry 0x800): COM1 output and scratch, save, restore with a
+(`full/tests.rs`, entry 0x800): COM1 output and scratch, export, import with a
 fresh endpoint and no replayed output, restored continuation, then a guest
 i8042 reset; the guest keeps counting after it, so the test waits for the
-vCPU thread to finish, checks the counter stays still, and that save and
-resume fail. Stage-6
+vCPU thread to finish, checks the counter stays still, and that pause,
+export and resume fail. Stage-6
 validation status: `make snapshot-fmt`, `make snapshot-check` and the
 featureless `krun-vmm` Linux test check pass; the non-KVM tests pass in the
 amd64 container described above, and the ordinary-UART EOF test fails on the
@@ -622,6 +729,31 @@ unmodified tree (`EOF reported as data`). The KVM test is **UNVERIFIED** (no
 `/dev/kvm`). Under `cfg(test)` a vCPU's own exit (HLT, shutdown, error) does
 not write its exit eventfd, so vCPU-exit wiring is covered only by the
 eventfd-level tests; the guest-driven path is the i8042 reset.
+
+The lifecycle tests cover, without KVM, the vCPU pause/resume transition
+(broadcast before waiting, timeout and exit, a late pause acknowledgment
+before its resume, a disconnected channel with every vCPU still attempted)
+and RAM image publication (mid-copy and magic failures remove the file).
+With KVM (`full/tests.rs`, `tests.rs`): export and resume of a running owner
+and a second pause are rejected; two exports of one pause hold identical
+RAM while the guest stays still; an import is exported again before it runs
+and that image continues the guest; a pause timeout, a vCPU exiting on
+resume and an unanswered state request each disable the owner and join
+every vCPU thread, while a state request answered with an error keeps the
+pause retryable; failed exports (existing file, mid-copy write, external
+RAM alias) keep the guest paused and a retry publishes; a paused RAM-only
+save never resumes. The block, NIC and RNG/balloon continuation tests use
+`pause`, `export` and an explicit source `resume`; a failed NIC export also
+checks that CPU and NIC stay frozen until `resume`.
+
+Lifecycle validation status (macOS arm64 host, x86_64 Linux target):
+`make snapshot-fmt`, `make snapshot-check` (also with
+`SNAPSHOT_PKGS='-p krun-vmm'`, featureless), `make snapshot-build` and
+`make snapshot-net-host-test` pass. `make snapshot-test` with the amd64
+`rust:1-bookworm` runner and no `/dev/kvm`: all 41 `krun-devices` snapshot
+tests and 30 `krun-vmm` tests pass, including the non-KVM lifecycle tests;
+the 33 tests that open KVM, including every KVM lifecycle and continuation
+test above, fail at opening `/dev/kvm` and are **UNVERIFIED**.
 
 Guest-observed NIC acceptance is **UNVERIFIED**: on a Linux KVM host, a
 real-mode guest (like the stage-3 block fixture) should read the NIC
@@ -635,8 +767,8 @@ KVM host is: start a UnixStream backend that speaks the same length-prefixed
 framing (for example passt or gvproxy in their QEMU stream-socket mode);
 attach the NIC and boot the guest with
 `virtio_mmio.device=4K@0xd0008000:23`; configure the network, resolve a name
-and keep a TCP connection open; `save_full`; stop the source VM and its
-backend; start a new backend at a new socket; `restore_full` with that
+and keep a TCP connection open; `pause` and `export`; stop the source VM and
+its backend; start a new backend at a new socket; `import` with that
 `nic_socket` and `resume`. Expected: the old TCP connection fails or times out, new name
 lookups and new TCP connections succeed, interface counters keep moving and
 the guest kernel logs no virtio-net ring errors.

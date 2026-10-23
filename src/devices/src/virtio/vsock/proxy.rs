@@ -21,8 +21,12 @@ pub enum RecvPkt {
 pub enum ProxyError {
     CreatingSocket(nix::errno::Errno),
     InvalidFamily,
+    /// The snapshot gate is closed: the backend is stopping.
+    Quiesced,
     SettingReuseAddr(nix::errno::Errno),
     SettingReusePort(nix::errno::Errno),
+    /// Duplicating or inspecting a socket failed.
+    SocketIo(std::io::Error),
 }
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]

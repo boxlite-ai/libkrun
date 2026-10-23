@@ -96,14 +96,17 @@ fn snapshot_rng_balloon_kvm_restore_kicks_pending_request() {
     assert!(source.attach_rng().is_err(), "a second RNG attached");
     source.start_vcpus(1, 0x1000).unwrap();
     activate_rng_with_pending_request(&source);
-    source.save_full(&image).unwrap();
+    source.pause().unwrap();
+    source.export(&image).unwrap();
 
-    // The source continues: its device serves the request once notified.
+    // The resumed source continues: its device serves the request once
+    // notified.
+    source.resume().unwrap();
     write(&source, RNG.mmio_addr, 0x50, 0);
     wait("source request not served", || used_idx(&source) == 1);
     drop(source);
 
-    let mut restored = RamSnapshotVm::restore_full(&image, RestoreResources::default()).unwrap();
+    let mut restored = RamSnapshotVm::import(&image, RestoreResources::default()).unwrap();
     assert_eq!(used_idx(&restored), 0, "the cut completed the request");
     assert_eq!(read(&restored, BALLOON.mmio_addr, 0x08), TYPE_BALLOON);
     assert_eq!(read(&restored, BALLOON.mmio_addr, 0x70), 0);

@@ -8,7 +8,7 @@
 //! displacements reach the 0xd0000000 MMIO window and the IOAPIC.
 
 use super::*;
-use crate::ram_snapshot::{Control, RestoreResources, CONTROL_TIMEOUT};
+use crate::ram_snapshot::RestoreResources;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -617,7 +617,8 @@ fn blk_snapshot_restores_readonly_qcow2_backing_without_sources() {
     let at_barrier = wait_barrier(&vm);
     assert_eq!(at_barrier, BARRIER_REQUEST as u16);
     let snapshot = dir.path("checkpoint");
-    vm.save_full(&snapshot).unwrap();
+    vm.pause().unwrap();
+    vm.export(&snapshot).unwrap();
     // Long offline pause before the source is destroyed.
     std::thread::sleep(Duration::from_millis(200));
     drop(vm);
@@ -627,7 +628,7 @@ fn blk_snapshot_restores_readonly_qcow2_backing_without_sources() {
     fs::remove_file(&backing).unwrap();
 
     let destination = dir.path("imported");
-    let mut restored = RamSnapshotVm::restore_full(&snapshot, disks_at(&destination)).unwrap();
+    let mut restored = RamSnapshotVm::import(&snapshot, disks_at(&destination)).unwrap();
     let dir_mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700);
     let file_mode = fs::metadata(destination.join("disk-0.raw"))
@@ -706,17 +707,21 @@ fn blk_snapshot_pending_interrupt_barrier_survives_cut_and_restores() {
     assert!(at_barrier >= BARRIER_REQUEST as u16);
     let interrupts_before = read_u16(&vm, 0xB804);
     let snapshot = dir.path("checkpoint");
-    vm.save_full(&snapshot).unwrap();
+    vm.pause().unwrap();
+    vm.export(&snapshot).unwrap();
     let cut_requests = read_u16(&vm, 0xB800);
     let cut_interrupts = read_u16(&vm, 0xB804);
     assert_eq!(cut_interrupts, interrupts_before);
     // The source must still be in the barrier (release byte untouched).
     assert_eq!(read_u16(&vm, 0xB815), 0);
+    // A paused source exports the same cut again.
+    vm.export(&dir.path("again")).unwrap();
+    assert_eq!(read_u16(&vm, 0xB800), cut_requests);
     drop(vm);
     fs::remove_file(&raw).unwrap();
 
     let destination = dir.path("imported");
-    let mut restored = RamSnapshotVm::restore_full(&snapshot, disks_at(&destination)).unwrap();
+    let mut restored = RamSnapshotVm::import(&snapshot, disks_at(&destination)).unwrap();
     // Exact RAM fidelity of the barrier state.
     assert_eq!(read_u16(&restored, 0xB800), cut_requests);
     assert_eq!(read_u16(&restored, 0xB804), cut_interrupts);
@@ -756,22 +761,23 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
     let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
     wait_requests(&vm, 6);
     let snapshot = dir.path("checkpoint");
-    vm.save_full(&snapshot).unwrap();
+    vm.pause().unwrap();
+    vm.export(&snapshot).unwrap();
     drop(vm);
     let valid = fs::read(&snapshot).unwrap();
     let destination = || dir.path("import-target");
 
     // A disk-bearing image needs a destination for its segments.
-    let error = match RamSnapshotVm::restore_full(&snapshot, RestoreResources::default()) {
+    let error = match RamSnapshotVm::import(&snapshot, RestoreResources::default()) {
         Err(error) => error,
-        Ok(_) => panic!("restore_full must reject a disk image without a destination"),
+        Ok(_) => panic!("import must reject a disk image without a destination"),
     };
     assert!(error.to_string().contains("disk directory"), "{error}");
 
     // Truncated segment: the exact-length check fails before creation.
     let truncated = dir.path("truncated");
     fs::write(&truncated, &valid[..valid.len() - 512]).unwrap();
-    assert!(RamSnapshotVm::restore_full(&truncated, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&truncated, disks_at(&destination())).is_err());
     assert!(!destination().exists());
 
     // Corrupt magic and unknown versions are rejected.
@@ -779,12 +785,12 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
     bad_magic[3] = b'X';
     let bad_magic_path = dir.path("bad-magic");
     fs::write(&bad_magic_path, &bad_magic).unwrap();
-    assert!(RamSnapshotVm::restore_full(&bad_magic_path, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&bad_magic_path, disks_at(&destination())).is_err());
     let mut bad_version = valid.clone();
     bad_version[8..12].copy_from_slice(&7u32.to_le_bytes());
     let bad_version_path = dir.path("bad-version");
     fs::write(&bad_version_path, &bad_version).unwrap();
-    assert!(RamSnapshotVm::restore_full(&bad_version_path, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&bad_version_path, disks_at(&destination())).is_err());
 
     // Patch the JSON disk table with illegal values; rewrite the file with a
     // consistent length so only the content checks can fail. `extra_segment`
@@ -811,23 +817,23 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
     let illegal_queue = repack("illegal-queue", false, &|value| {
         value["disks"][0]["device"]["queues"][0]["size"] = serde_json::json!(7);
     });
-    assert!(RamSnapshotVm::restore_full(&illegal_queue, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&illegal_queue, disks_at(&destination())).is_err());
     assert!(!destination().exists());
 
     let mmio_overlap = repack("mmio-overlap", false, &|value| {
         value["disks"][0]["mmio_addr"] = serde_json::json!(0x1000);
     });
-    assert!(RamSnapshotVm::restore_full(&mmio_overlap, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&mmio_overlap, disks_at(&destination())).is_err());
 
     let capacity_mismatch = repack("capacity-mismatch", false, &|value| {
         value["disks"][0]["config"].as_array_mut().unwrap()[0] = serde_json::json!(1);
     });
-    assert!(RamSnapshotVm::restore_full(&capacity_mismatch, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&capacity_mismatch, disks_at(&destination())).is_err());
 
     let irq_out_of_window = repack("irq-window", false, &|value| {
         value["disks"][0]["irq"] = serde_json::json!(5);
     });
-    assert!(RamSnapshotVm::restore_full(&irq_out_of_window, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&irq_out_of_window, disks_at(&destination())).is_err());
 
     let foreign_features = repack("foreign-features", false, &|value| {
         value["disks"][0]["device"]["avail_features"] = serde_json::json!(
@@ -837,7 +843,7 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
                 | 1
         );
     });
-    assert!(RamSnapshotVm::restore_full(&foreign_features, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&foreign_features, disks_at(&destination())).is_err());
 
     // Duplicate identity with a consistent payload length: only the
     // identity/MMIO/IRQ conflict checks can reject this one.
@@ -848,7 +854,7 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
         disk["device_id"] = serde_json::json!("blk0");
         value["disks"].as_array_mut().unwrap().push(disk);
     });
-    assert!(RamSnapshotVm::restore_full(&duplicate_identity, disks_at(&destination())).is_err());
+    assert!(RamSnapshotVm::import(&duplicate_identity, disks_at(&destination())).is_err());
 }
 
 #[test]
@@ -858,14 +864,15 @@ fn blk_snapshot_never_touches_preexisting_destination() {
     let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
     wait_requests(&vm, 6);
     let snapshot = dir.path("checkpoint");
-    vm.save_full(&snapshot).unwrap();
+    vm.pause().unwrap();
+    vm.export(&snapshot).unwrap();
     drop(vm);
     // A pre-existing destination with caller data must never be modified.
     let destination = dir.path("imported");
     fs::create_dir(&destination).unwrap();
     let sentinel = destination.join("sentinel");
     fs::write(&sentinel, b"caller data").unwrap();
-    assert!(RamSnapshotVm::restore_full(&snapshot, disks_at(&destination)).is_err());
+    assert!(RamSnapshotVm::import(&snapshot, disks_at(&destination)).is_err());
     assert_eq!(fs::read(&sentinel).unwrap(), b"caller data");
     assert_eq!(
         fs::read_dir(&destination).unwrap().count(),
@@ -875,21 +882,30 @@ fn blk_snapshot_never_touches_preexisting_destination() {
 }
 
 #[test]
-fn blk_snapshot_save_write_failure_recovers_source_and_republishes() {
+fn blk_snapshot_export_write_failure_stays_paused_and_republishes() {
     let dir = TempDir::new();
     let (raw, _qcow2, _backing) = snapshot_disks(&dir);
     let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
-    let before = wait_requests(&vm, 6);
+    wait_requests(&vm, 6);
+    vm.pause().unwrap();
+    let cut = read_u16(&vm, 0xB800);
     let snapshot = dir.path("checkpoint");
-    let failed =
-        super::super::tests::with_failed_payload_write(64 * 1024, || vm.save_full(&snapshot));
+    let failed = super::super::tests::with_failed_payload_write(64 * 1024, || vm.export(&snapshot));
     assert!(failed.is_err());
-    // The source VM recovered: the guest keeps completing requests and
-    // nothing valid was published.
-    wait_requests(&vm, before + 2);
+    // Nothing valid was published and the source stays at its cut: no
+    // request completes while paused.
     assert!(!snapshot.exists());
-    // The control channel is still usable: a second save publishes.
-    vm.save_full(&snapshot).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        read_u16(&vm, 0xB800),
+        cut,
+        "a failed export resumed the source"
+    );
+    // The pause is still usable: a second export publishes, and only
+    // resume continues the guest.
+    vm.export(&snapshot).unwrap();
+    vm.resume().unwrap();
+    wait_requests(&vm, cut + 2);
     drop(vm);
 }
 
@@ -900,35 +916,36 @@ fn blk_snapshot_partial_import_cleanup() {
     let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
     wait_requests(&vm, 6);
     let snapshot = dir.path("checkpoint");
-    vm.save_full(&snapshot).unwrap();
+    vm.pause().unwrap();
+    vm.export(&snapshot).unwrap();
     drop(vm);
     let destination = dir.path("imported");
     let failed = super::super::tests::with_failed_payload_write(32 * 1024, || {
-        RamSnapshotVm::restore_full(&snapshot, disks_at(&destination))
+        RamSnapshotVm::import(&snapshot, disks_at(&destination))
     });
     assert!(failed.is_err());
     assert!(!destination.exists(), "partial import left files behind");
 }
 
 #[test]
-fn blk_snapshot_long_cpu_pause_then_save_keeps_guest_running() {
+fn blk_snapshot_long_pause_then_export_and_source_resume() {
     let dir = TempDir::new();
     let (raw, _qcow2, _backing) = snapshot_disks(&dir);
     let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
     let before = wait_requests(&vm, 6);
-    // Stop the CPUs the way the timer tests do; hardware may mature a
-    // pending interrupt, then the save uses the same pause handshake.
-    Control::transition(&vm.handles, true, CONTROL_TIMEOUT).unwrap();
+    // Keep everything paused the way the timer tests do; hardware may
+    // mature a pending interrupt before the export of that same pause.
+    vm.pause().unwrap();
     std::thread::sleep(Duration::from_millis(150));
-    Control::transition(&vm.handles, false, CONTROL_TIMEOUT).unwrap();
     let snapshot = dir.path("checkpoint");
-    vm.save_full(&snapshot).unwrap();
-    // The source keeps running after its own save.
+    vm.export(&snapshot).unwrap();
+    // The source continues after its explicit resume.
+    vm.resume().unwrap();
     wait_requests(&vm, before + 2);
     drop(vm);
     fs::remove_file(&raw).unwrap();
     let destination = dir.path("imported");
-    let mut restored = RamSnapshotVm::restore_full(&snapshot, disks_at(&destination)).unwrap();
+    let mut restored = RamSnapshotVm::import(&snapshot, disks_at(&destination)).unwrap();
     assert_eq!(read_u16(&restored, 0xB802), 1);
     restored.resume().unwrap();
     let restored_at = read_u16(&restored, 0xB800);

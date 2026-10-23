@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The owner's event thread, present in every running or restored owner.
-//! RNG, balloon and UART-input callbacks and the exit watch run on an
+//! RNG, balloon, vsock and UART-input callbacks and the exit watch run on an
 //! `EventManager` created inside this thread from the concrete devices, so
 //! the public `Subscriber` threading bounds stay unchanged.
 //!
@@ -14,8 +14,9 @@
 //! frozen and, on its first resume, notifies every ready queue itself,
 //! independently of the source's notifications.
 //!
-//! The exit watch latches the owner's exit request (i8042 reset or any vCPU
-//! exit) and stops every vCPU the owner armed it with.
+//! The exit watch latches the owner's exit request (i8042 reset, any vCPU
+//! exit, or a vsock backend that failed to reopen on an event-queue kick)
+//! and stops every vCPU the owner armed it with.
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use devices::legacy::Serial;
 use devices::virtio::control::{self, CONTROL_TIMEOUT};
-use devices::virtio::{Balloon, MmioTransport, Rng};
+use devices::virtio::{Balloon, MmioTransport, Rng, Vsock};
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -65,8 +66,9 @@ enum Command {
     },
 }
 
-/// The owner's exit request. The i8042 reset and every vCPU hold a clone of
-/// the eventfd; only the event thread reads it and latches `exiting`, which
+/// The owner's exit request. The i8042 reset, every vCPU and the vsock (for
+/// a fatal backend failure) hold a clone of the eventfd; only the event
+/// thread reads it and latches `exiting`, which
 /// is never cleared: an exiting owner takes no further snapshot or resume.
 pub(super) struct Exit {
     evt: EventFd,
@@ -115,6 +117,9 @@ pub(super) struct Devices {
     pub(super) exit: Arc<Exit>,
     pub(super) rng: Option<Arc<Mutex<Rng>>>,
     pub(super) balloon: Option<Arc<Mutex<Balloon>>>,
+    /// Its queue callbacks only; the owner restarts its backend, which
+    /// notifies the queues itself.
+    pub(super) vsock: Option<Arc<Mutex<Vsock>>>,
     /// UARTs whose input the thread reads.
     pub(super) serials: Vec<Arc<Mutex<Serial>>>,
 }
@@ -299,6 +304,9 @@ fn event_manager(wake: EventFd, devices: &Devices) -> std::result::Result<EventM
     if let Some(balloon) = &devices.balloon {
         subscribers.push(balloon.clone());
     }
+    if let Some(vsock) = &devices.vsock {
+        subscribers.push(vsock.clone());
+    }
     for subscriber in subscribers {
         events
             .add_subscriber(subscriber)
@@ -308,4 +316,4 @@ fn event_manager(wake: EventFd, devices: &Devices) -> std::result::Result<EventM
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
