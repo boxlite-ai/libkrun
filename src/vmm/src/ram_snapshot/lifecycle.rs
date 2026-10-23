@@ -4,8 +4,9 @@
 //! gate (cancelling a send blocked under the vsock device lock, which a
 //! vCPU's MMIO access could wait for) before it stops every vCPU, then
 //! freezes every device writer (disks, the NIC, then the event thread with
-//! RNG, balloon, vsock queues and UART input), stops the vsock backend and
-//! drains every irqfd; the frozen
+//! RNG, balloon, vsock and console control queues and UART input, then the
+//! console's port workers), stops the vsock backend and drains every
+//! irqfd; the frozen
 //! worker queue cursors and the drained irqfd count stay in `Paused` until
 //! `resume`, so any number of exports capture the same cut. An import ends
 //! in the same paused state, and both take one resume path: reattach the
@@ -18,7 +19,7 @@
 #[cfg(feature = "blk")]
 use devices::virtio::persist::QueueState;
 
-use super::{vsock, wiring};
+use super::{console, vsock, wiring};
 use super::{Control, Error, RamSnapshotVm, Result, CONTROL_TIMEOUT};
 
 #[cfg(feature = "blk")]
@@ -111,7 +112,8 @@ impl RamSnapshotVm {
         self.pause.is_some()
     }
 
-    /// Freeze every device writer behind paused vCPUs, stop the vsock
+    /// Freeze every device writer behind paused vCPUs (the console's port
+    /// workers after the event thread), stop the vsock
     /// backend (its connections close, stale TX completes empty and a
     /// transport reset is owed) and drain every irqfd. Each step is
     /// idempotent, so an import uses it on its frozen-started devices to
@@ -124,6 +126,8 @@ impl RamSnapshotVm {
         if let Some(events) = &self.events {
             events.freeze()?;
         }
+        // After the event thread: no control-queue callback runs anymore.
+        console::freeze(self)?;
         // A frozen event thread leaves an exit unread; either form aborts.
         if self.exit.requested() {
             return Err(Error::Invalid("the VM is exiting"));
@@ -140,8 +144,8 @@ impl RamSnapshotVm {
     }
 
     /// Resume every device (disks, the NIC, the vsock backend, which
-    /// delivers its reset first, then the event thread); one failure does
-    /// not skip the rest.
+    /// delivers its reset first, the console's port workers and control
+    /// queues, then the event thread); one failure does not skip the rest.
     fn resume_devices(&self) -> Result<()> {
         let mut results = Vec::new();
         #[cfg(feature = "blk")]
@@ -149,6 +153,9 @@ impl RamSnapshotVm {
         #[cfg(all(feature = "blk", feature = "net"))]
         results.push(nic::resume(self));
         results.push(vsock::resume(self));
+        // Workers and control queues first: the event thread then sees a
+        // live console.
+        results.push(console::resume(self));
         if let Some(events) = &self.events {
             results.push(events.resume());
         }

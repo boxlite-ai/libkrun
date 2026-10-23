@@ -2,13 +2,15 @@
 
 //! Full checkpoints for the private minimal owner, independent of KRUNRAM.
 //!
-//! Every full image uses one format, version 5 (`KRUNVM\0\0`), with or
+//! Every full image uses one format, version 6 (`KRUNVM\0\0`), with or
 //! without devices: header, bounded JSON state, RAM payload, then one raw
 //! segment per disk. The JSON holds CPU, KVM and RAM state, the ordered disk
-//! table and the optional NIC, RNG, balloon, vsock and legacy-device (UARTs,
-//! CMOS, i8042) sections. Earlier versions are rejected explicitly.
+//! table and the optional NIC, RNG, balloon, vsock, console and
+//! legacy-device (UARTs, CMOS, i8042) sections. Earlier versions are
+//! rejected explicitly.
 
 use super::*;
+use crate::ram_snapshot::console::{self, ConsoleMeta};
 use crate::ram_snapshot::event_devices::{self, BalloonMeta, DeviceMeta};
 use crate::ram_snapshot::events;
 use crate::ram_snapshot::legacy::{self, LegacyMeta};
@@ -18,7 +20,7 @@ use crate::vstate::VmState;
 use serde::{Deserialize, Serialize};
 
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const FULL_VERSION: u32 = 5;
+const FULL_VERSION: u32 = 6;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
@@ -53,6 +55,7 @@ struct Metadata {
     rng: Option<DeviceMeta>,
     balloon: Option<BalloonMeta>,
     vsock: Option<VsockMeta>,
+    console: Option<ConsoleMeta>,
     legacy: Option<LegacyMeta>,
 }
 
@@ -62,6 +65,7 @@ struct Requirements {
     disks: bool,
     nic: bool,
     vsock: bool,
+    console: bool,
     legacy: bool,
 }
 
@@ -71,6 +75,7 @@ impl Requirements {
             disks: !metadata.disks.is_empty(),
             nic: metadata.nic.is_some(),
             vsock: metadata.vsock.is_some(),
+            console: metadata.console.is_some(),
             legacy: metadata.legacy.is_some(),
         }
     }
@@ -89,6 +94,11 @@ impl Requirements {
         if self.vsock != resources.vsock_ports.is_some() {
             return Err(Error::Invalid(
                 "restore resources: vsock ports are required exactly when the image has a vsock",
+            ));
+        }
+        if self.console != resources.console_ports.is_some() {
+            return Err(Error::Invalid(
+                "restore resources: console ports are required exactly when the image has a console",
             ));
         }
         if self.legacy != resources.serial.is_some() {
@@ -142,7 +152,7 @@ fn read_header(file: &mut File) -> Result<usize> {
     }
     match u32::from_le_bytes(header[8..12].try_into().unwrap()) {
         FULL_VERSION => {}
-        old @ 1..=4 => {
+        old @ 1..=5 => {
             return Err(Error::Full(format!(
                 "full snapshot version {old} predates the unified version {FULL_VERSION} and is not supported"
             )))
@@ -194,6 +204,9 @@ fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<M
     if let Some(meta) = &metadata.vsock {
         vsock::validate_metadata(meta, &metadata.regions)?;
     }
+    if let Some(meta) = &metadata.console {
+        console::validate_metadata(meta, &metadata.regions)?;
+    }
     if let Some(legacy) = &metadata.legacy {
         legacy::validate_metadata(legacy, &metadata.regions)?;
     }
@@ -233,6 +246,9 @@ fn validate_rings(metadata: &Metadata, memory: &GuestMemoryMmap) -> Result<()> {
     event_devices::validate_rings(metadata.rng.as_ref(), metadata.balloon.as_ref(), memory)?;
     if let Some(meta) = &metadata.vsock {
         vsock::validate_rings(meta, memory)?;
+    }
+    if let Some(meta) = &metadata.console {
+        console::validate_rings(meta, memory)?;
     }
     Ok(())
 }
@@ -357,6 +373,7 @@ impl RamSnapshotVm {
         let nic = None;
         let (rng, balloon) = event_devices::capture(self, &regions)?;
         let vsock = vsock::capture(self, &regions)?;
+        let console = console::capture(self, &regions)?;
         let legacy = legacy::capture(self, &regions)?;
         let cpus = match self.save_cpus(&compatibility) {
             Err(unanswered @ Error::Control(_)) => {
@@ -376,6 +393,7 @@ impl RamSnapshotVm {
             rng,
             balloon,
             vsock,
+            console,
             legacy,
         };
         write_pending(
@@ -456,7 +474,10 @@ impl RamSnapshotVm {
     /// `resources.serial` endpoints and replay no output; their
     /// dropped-output counts start at zero. The vsock takes the caller's
     /// `resources.vsock_ports` paths and keeps its backend stopped with the
-    /// transport reset still owed until `resume`.
+    /// transport reset still owed until `resume`. The console takes the
+    /// caller's `resources.console_ports` endpoints without any endpoint
+    /// I/O or new guest handshake; its open ports come back with frozen
+    /// workers holding the saved EOF and partial-TX offsets.
     pub(crate) fn import(path: &Path, mut resources: RestoreResources) -> Result<Self> {
         let kvm = KvmContext::new().map_err(Error::State)?;
         let mut file = File::open(path)?;
@@ -468,6 +489,9 @@ impl RamSnapshotVm {
         }
         if let (Some(meta), Some(ports)) = (&metadata.vsock, &resources.vsock_ports) {
             vsock::check_resources(meta, ports)?;
+        }
+        if let (Some(meta), Some(ports)) = (&metadata.console, &resources.console_ports) {
+            console::check_resources(meta, ports)?;
         }
         if let Some(serial) = &resources.serial {
             legacy::check_endpoints(serial)?;
@@ -502,6 +526,9 @@ impl RamSnapshotVm {
         event_devices::restore(&mut owner, metadata.rng.as_ref(), metadata.balloon.as_ref())?;
         if let (Some(meta), Some(ports)) = (&metadata.vsock, &resources.vsock_ports) {
             vsock::restore(&mut owner, meta, ports)?;
+        }
+        if let (Some(meta), Some(ports)) = (&metadata.console, resources.console_ports.take()) {
+            console::restore(&mut owner, meta, ports)?;
         }
         if let (Some(meta), Some(serial)) = (&metadata.legacy, resources.serial.take()) {
             legacy::restore(&mut owner, meta, serial)?;

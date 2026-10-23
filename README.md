@@ -260,7 +260,7 @@ The private Linux x86_64/KVM `RamSnapshotVm` harness supports an explicit
 lifecycle (described below) for ordinary RAM with a kernel irqchip/PIT. Its base configuration is device-free (no userspace
 devices; uncontrolled background RAM writers are rejected); `attach_rng` and
 `attach_balloon` add internal virtio devices, `attach_vsock` adds a Unix
-IPC vsock, `attach_legacy` adds the x86
+IPC vsock, `attach_console` adds a multiport virtio console, `attach_legacy` adds the x86
 UARTs, CMOS and i8042, the optional `blk` feature
 described below adds internal block devices, and `blk` plus `net` add one
 internal network device. The harness supports
@@ -276,10 +276,10 @@ Lifecycle contract:
 
 | Call | Requires | Effect | On failure |
 | --- | --- | --- | --- |
-| `pause` | running, usable, no guest exit | quiesce the vsock gate, pause/ack every vCPU, then freeze every disk, the NIC and the event thread (RNG, balloon, vsock queues, UART input), stop the vsock backend, then deassign and drain every irqfd; the frozen worker queue cursors and the drained irqfd count stay with the owner | rejected without effect before any control; otherwise the owner is disabled and every thread stopped and joined |
+| `pause` | running, usable, no guest exit | quiesce the vsock gate, pause/ack every vCPU, then freeze every disk, the NIC and the event thread (RNG, balloon, vsock queues, console control queues, UART input), then every console port worker, stop the vsock backend, then deassign and drain every irqfd; the frozen worker queue cursors and the drained irqfd count stay with the owner | rejected without effect before any control; otherwise the owner is disabled and every thread stopped and joined |
 | `export` | paused, usable | capture the same cut into a new image; resumes nothing, so it can repeat | partial image removed, still paused and retryable; a vCPU that never answers its state request disables the owner and stops every thread |
 | `import` | an image and matching resources | a new owner in the same paused state as a source after `pause` (devices frozen, cursors retained, irqfds drained), exportable before it ever runs | everything it created is removed after its threads joined |
-| `resume` | paused, usable, no guest exit | shared by sources and imports: reattach the drained irqfds, resume every device (the vsock delivers its transport reset before reopening its backend), then every vCPU last | the owner is disabled and every thread stopped and joined; no vCPU runs unless every device resumed |
+| `resume` | paused, usable, no guest exit | shared by sources and imports: reattach the drained irqfds, resume every device (the vsock delivers its transport reset before reopening its backend; the console resumes its port workers and processes its control queues before the event thread), then every vCPU last | the owner is disabled and every thread stopped and joined; no vCPU runs unless every device resumed |
 
 For example, a source checkpoints and continues with `pause()`,
 `export(a)`, `export(b)`, `resume()`; a target runs with
@@ -288,15 +288,16 @@ TSC when it runs; both keep running while the owner is paused (see the timer
 handling below).
 
 Every full image, with or without devices, uses one format: magic
-`KRUNVM\0\0`, version 5, a bounded 16 MiB JSON state section, RAM copied in
+`KRUNVM\0\0`, version 6, a bounded 16 MiB JSON state section, RAM copied in
 64 KiB chunks into independent anonymous mappings, then one raw segment per
 disk. The JSON holds CPU, KVM and RAM state, the ordered disk table and the
-optional NIC, RNG, balloon, vsock and legacy-device (UARTs, CMOS, i8042)
-sections. Versions 1–4 (version 4 had no vsock section) are rejected
-explicitly; the RAM-only `KRUNRAM` image stays version 1. Images never contain
-host paths, descriptors or threads: `RestoreResources` supplies the disk
-import directory, the NIC backend socket, the vsock port paths and the four
-serial endpoints, and each must be present exactly when the image has the
+optional NIC, RNG, balloon, vsock, console and legacy-device (UARTs, CMOS,
+i8042) sections. Versions 1–5 (version 4 had no vsock section, version 5 no
+console section) are rejected explicitly; the RAM-only `KRUNRAM` image stays
+version 1. Images never contain host paths, descriptors or threads:
+`RestoreResources` supplies the disk import directory, the NIC backend
+socket, the vsock port paths, the fresh console ports and the four serial
+endpoints, and each must be present exactly when the image has the
 matching device. A mismatch is rejected before any RAM,
 directory, socket or thread is created. Files are created exclusively with mode 0600 and become
 valid only after the whole image is synced; an export never resumes the
@@ -319,7 +320,7 @@ pausing a source vCPU does not stop its hardware clocks. TSC frequency differenc
 above 250 ppm require successful scaling. Multi-vCPU restore requires successful
 vCPU0-based TSC offset synchronization before VM clock restore. Every
 attached device below is frozen, drained and saved before CPU/KVM/RAM
-capture; device types not listed here (virtio-fs, console) remain
+capture; device types not listed here (virtio-fs) remain
 future work.
 
 ### Internal block-device checkpoints (stage 3, feature `blk`)
@@ -485,7 +486,7 @@ descriptor by descriptor). Only page-aligned private anonymous RAM owned by
 guest memory is discarded; other mappings ignore the hint and complete.
 
 This remains an internal closed loop for the minimal VM: no full BoxLite box
-restore and no virtio-fs/console support.
+restore and no virtio-fs support.
 
 ### Internal legacy UART, CMOS and i8042 checkpoints (stage 6, no feature)
 
@@ -619,6 +620,93 @@ snapshot tests and 37 `krun-vmm` tests pass; the 37 tests that open KVM,
 including the four vsock KVM tests, fail at opening `/dev/kvm` and are
 **UNVERIFIED**, as is guest-agent reconnection.
 
+### Internal virtio-console checkpoints (stage 8, no feature)
+
+`attach_console(ports)` adds, before vCPUs start, one multiport virtio
+console at MMIO 0xd000c000 with GSI 8 (guest kernel:
+`virtio_mmio.device=4K@0xd000c000:8`), through the same slot, GSI and
+irqfd/ioeventfd wiring as the other devices. `ports` is the ordered
+`Vec<PortDescription>`: at least one port, with no count limit beyond the
+32-bit queue index range (two control queues plus two per port). Only
+built-in endpoints can be checkpointed: FD, empty and SIGINT input, FD and
+log output, FD and fixed-size terminals. That covers the default console
+(input, output and terminal) and named log, stdin, stdout and stderr ports.
+Snapshot support is per endpoint type: only these built-in types report a
+snapshot kind. A custom `PortInput`, `PortOutput` or
+`PortTerminalProperties` keeps the trait's default (none), so
+`attach_console` and import reject it before any probe, transport or wiring
+exists; the ordinary console path, which never snapshots, still accepts it.
+
+| Step | What happens |
+| --- | --- |
+| pause | after the vCPUs and the event thread (activation and control queues), every opened port's RX and TX worker confirms a freeze through the shared worker control; every worker wait (input, writable output, empty queue) answers it. RX commits the bytes it already read (used) and gives an unfilled buffer back; TX keeps a partly delivered chain popped, with the exact byte offset the host output accepted. Then the irqfds drain. Frozen, the console writes no guest RAM, ring or interrupt and reads or writes no endpoint; a resize request is deferred |
+| export | a pure capture of the confirmed cut: transport, features, config space, every queue cursor and, per port, id, name, endpoint kinds, guest handshake (`ready`, `guest_open`), the last terminal size sent, `started`, EOF, the in-flight `{head, delivered}` and a log port's unfinished line, plus the control messages not yet delivered. Repeated exports are equal; a failed export removes its partial image and leaves the source paused, frozen and retryable |
+| import | `RestoreResources::console_ports` gives fresh descriptions in the image's port order; names, directions and input, output and terminal kinds must match, checked with the rest of the metadata before RAM exists. Against the loaded RAM: ring checks for every ready queue (a driver may leave a port's queues unready), a strict walk of every available chain (links inside the table, no cycle, only NEXT/WRITE, the queue's direction, ranges inside RAM), ready queues for every worker of an opened port, exactly one popped but unused chain on a queue with an in-flight TX and none elsewhere, and an in-flight head that is the last chain popped with bytes left. The device then comes back without endpoint I/O and without a new guest handshake; opened ports get frozen workers, and the owner stays paused and exportable |
+| resume | after the irqfds: the workers resume and re-examine their queue and endpoint, then the console processes its control queues and any deferred resize and raises its interrupt, so nothing waits for a new guest kick; then the event thread and the vCPUs |
+
+Host acceptance is the delivery boundary. Bytes a source's output accepted
+are never written again: an in-flight chain's remainder goes to the
+source's own output when it resumes, or to the target's fresh output after
+an import, and completes once. Input still unread in a source's host
+descriptor is not migrated. A port at EOF never reads its fresh input
+again. The control backlog, the guest handshake and a log port's half line
+survive. The owner registers no SIGWINCH handler, so a restored FD
+terminal reports the saved size. Teardown stops and joins every worker,
+frozen or blocked on a full output, without waiting. A freeze or resume
+that a worker cannot confirm (it is gone or timed out) disables the owner
+and stops every thread.
+
+Guest-facing descriptor rules (every console, snapshotted or not, and
+independent of the endpoint types above): a control message goes whole into
+the first descriptor of one device-writable buffer; a chained control
+buffer is not split across descriptors, so a first descriptor too small for
+the message stays with the guest and the message stays pending (Linux
+drivers post single-descriptor buffers large enough for every message). A control transmit buffer that is shorter
+than a message or device-writable completes with length 0 unread. Unready
+control queues are never used, unknown port ids are ignored, and a repeated
+`VIRTIO_CONSOLE_PORT_OPEN` keeps the running port. A guest reset clears the
+pending messages and the handshake.
+
+The device-level tests (`make snapshot-console-host-test`, native) cover:
+- multiport RX/TX;
+- partial TX under backpressure with exact-remainder resume after a restore with a fresh output, wrapping cursors included;
+- freezes while input waits or streams in;
+- EOF, control backlog, deferred resize, log half line, SIGINT and empty input;
+- stability while frozen and no-kick resume;
+- bounded reset and shutdown, frozen or under backpressure;
+- custom-endpoint and mismatch rejection, malformed chains, cursors and in-flight offsets, started ports on unready queues;
+- the control-queue edge cases above, and a worker that died before a freeze.
+
+The owner tests without KVM (`console/tests.rs`) run the production build, restore, capture and validation code with the real event thread through the MMIO transport:
+- export/import with the partial-TX remainder delivered once to a fresh output;
+- the source resuming from the same cut;
+- RAM alias counts, with no clone taken at capture;
+- frozen kicks, inactive and midway-handshake round trips;
+- 24 ports;
+- resource, metadata and ring rejection;
+- aborting a restored device with the production `discard` (the cleanup a failed import runs), with its workers frozen and again after resume with a worker blocked on a full output: every worker stops promptly and releases guest RAM. The test calls `discard` after a successful restore; it does not inject a restore failure.
+
+The KVM tests (`console/kvm_tests.rs`) run the fixture's MMIO entry (0x900): the guest vCPU performs every console register access through a RAM mailbox, and a counter proves CPU continuation. They cover:
+- restored I/O on replaced endpoints with no replay and no new handshake;
+- a pending GSI-8 interrupt delivered exactly once after the restored guest's `sti`, with the guest reading its own RX data;
+- repeated and failed exports, source resume and re-export before resume;
+- multi-round no-kick resume;
+- inactive and midway-handshake states;
+- combinations with the RNG, balloon, vsock and legacy devices, and (with `blk` and `net`) an attached but inactive disk and NIC;
+- failure cleanup and a dead worker disabling the owner.
+
+Stage-8 validation status (macOS arm64 host, x86_64 Linux target):
+`make snapshot-fmt`, `make snapshot-check` (also featureless
+`SNAPSHOT_PKGS='-p krun-vmm'`), `make snapshot-build`, `make snapshot-test
+SNAPSHOT_CARGO_FLAGS='--offline --no-run'`, `make snapshot-console-host-test`
+(26/26, native), `make snapshot-net-host-test` (20/20) and
+`make snapshot-vsock-host-test` (16/16) pass. `make snapshot-test` in the
+amd64 `rust:1-bookworm` container without `/dev/kvm`: 83/83 `krun-devices`
+snapshot tests and 45 `krun-vmm` tests pass, including the 8 console owner
+tests without KVM. The 48 tests that open KVM, the 11 console KVM tests
+among them, fail at opening `/dev/kvm` and are **UNVERIFIED**, as is a
+Linux guest console driver (the harness boots no Linux guest).
+
 Local contributor checks (no public ABI or SDK entry point is provided):
 
 ```sh
@@ -629,6 +717,7 @@ make snapshot-test SNAPSHOT_CARGO_FLAGS='--offline --no-run'
 make snapshot-test
 make snapshot-net-host-test
 make snapshot-vsock-host-test
+make snapshot-console-host-test
 ```
 
 The snapshot targets enable the `blk` and `net` features and run the
@@ -647,9 +736,12 @@ target runner so `make snapshot-test` executes the cross-built tests, for
 example `SNAPSHOT_RUNNER="docker run --rm --platform linux/amd64 -v $PWD:$PWD
 -w $PWD rust:1-bookworm"`; add `--device /dev/kvm` on a Linux KVM host.
 `make snapshot-net-host-test` runs the virtio-net backend and worker tests
-natively (macOS or Linux, no KVM); `make snapshot-vsock-host-test` does the
-same for the vsock backend lifecycle tests. `snapshot-guest` regenerates the real-mode
-timer and legacy fixture using GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; the block guest is
+natively (macOS or Linux, no KVM); `make snapshot-vsock-host-test` and
+`make snapshot-console-host-test` do the same for the vsock backend
+lifecycle and the console port worker tests. `snapshot-guest` regenerates the real-mode
+timer, legacy and console MMIO-mailbox fixture using GNU
+`SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY` (on macOS, for example, inside the
+`rust:1-bookworm` container); the block guest is
 emitted by an annotated byte emitter inside the stage-3 tests (a 16-bit-code
 unreal-mode segment setup with an exact GDT layout, virtio queue with
 header/data/status chains, IOAPIC/x2APIC interrupts, and a barrier that

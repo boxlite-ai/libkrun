@@ -60,6 +60,7 @@ impl Rig {
             rng: Some(self.rng.clone()),
             balloon: None,
             vsock: None,
+            console: None,
             serials: Vec::new(),
         };
         EventThread::spawn(devices, start).unwrap()
@@ -159,6 +160,7 @@ fn exit_only(exit: &Arc<Exit>, start: Start) -> EventThread {
         rng: None,
         balloon: None,
         vsock: None,
+        console: None,
         serials: Vec::new(),
     };
     EventThread::spawn(devices, start).unwrap()

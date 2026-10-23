@@ -27,6 +27,7 @@ const PAGE_SIZE: u64 = 4096;
 const CHUNK_SIZE: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
+mod console;
 mod event_devices;
 mod events;
 mod full;
@@ -383,6 +384,9 @@ pub(crate) struct RestoreResources {
     /// New host socket paths of the vsock's ports; the ports and their
     /// roles must equal the image's.
     pub(crate) vsock_ports: Option<VsockPorts>,
+    /// Fresh console ports in the image's port order: names, directions
+    /// and input, output and terminal kinds must equal the image's.
+    pub(crate) console_ports: Option<Vec<devices::virtio::PortDescription>>,
 }
 
 /// Owns the minimal VM. No mapping, VM fd, or vCPU handle escapes this owner.
@@ -410,6 +414,7 @@ pub(crate) struct RamSnapshotVm {
     rng: Option<events::EventDevice<devices::virtio::Rng>>,
     balloon: Option<events::EventDevice<devices::virtio::Balloon>>,
     vsock: Option<vsock::VsockDevice>,
+    console: Option<console::ConsoleDevice>,
     events: Option<events::EventThread>,
 }
 
@@ -448,6 +453,7 @@ impl RamSnapshotVm {
             rng: None,
             balloon: None,
             vsock: None,
+            console: None,
             events: None,
         })
     }
@@ -522,6 +528,16 @@ impl RamSnapshotVm {
         vsock::attach(self, cid, ports)
     }
 
+    /// Attach the internal virtio console before vCPUs start. Every port
+    /// must use built-in endpoints; a custom one is rejected before the
+    /// attach has any effect.
+    pub(crate) fn attach_console(
+        &mut self,
+        ports: Vec<devices::virtio::PortDescription>,
+    ) -> Result<()> {
+        console::attach(self, ports)
+    }
+
     /// Attach COM1–COM4, CMOS and the i8042 before vCPUs start. Each
     /// endpoint must already be nonblocking; its flags are never changed.
     pub(crate) fn attach_legacy(&mut self, serial: SerialEndpoints) -> Result<()> {
@@ -542,7 +558,7 @@ impl RamSnapshotVm {
     }
 
     /// Every attached MMIO device as (transport, MMIO address, GSI), in the
-    /// fixed order disks, NIC, RNG, balloon, vsock.
+    /// fixed order disks, NIC, RNG, balloon, vsock, console.
     pub(super) fn mmio_devices(&self) -> Vec<(&Arc<Mutex<MmioTransport>>, u64, u32)> {
         let mut devices = Vec::new();
         #[cfg(feature = "blk")]
@@ -564,6 +580,7 @@ impl RamSnapshotVm {
                 .map(|balloon| (&balloon.transport, balloon.mmio_addr, balloon.irq)),
         );
         devices.extend(self.vsock.iter().map(vsock::slot));
+        devices.extend(self.console.iter().map(console::slot));
         devices
     }
 
@@ -591,16 +608,18 @@ impl RamSnapshotVm {
             + nic
             + event_devices::expected_alias_clones(self)
             + vsock::expected_alias_clones(self)
+            + console::expected_alias_clones(self)
     }
 
     /// Start the event thread: the exit watch, plus the attached RNG,
-    /// balloon, vsock and UART input.
+    /// balloon, vsock, console control queues and UART input.
     fn start_event_thread(&mut self, start: events::Start) -> Result<()> {
         let devices = events::Devices {
             exit: self.exit.clone(),
             rng: self.rng.as_ref().map(|rng| rng.device.clone()),
             balloon: self.balloon.as_ref().map(|balloon| balloon.device.clone()),
             vsock: vsock::event_device(self),
+            console: console::event_device(self),
             serials: self
                 .legacy
                 .as_ref()
@@ -646,10 +665,10 @@ impl RamSnapshotVm {
     /// device lock (the event thread or a vCPU could wait on that lock
     /// forever), then the event thread (it holds vCPU stop handles whose
     /// pthread IDs are valid only until the vCPUs are joined), then the
-    /// vCPUs (they could still touch the devices), then the disk, NIC and
-    /// vsock workers, which hold guest RAM, the disk images and the backend
-    /// connections. Every startup, import, pause and resume failure ends
-    /// here.
+    /// vCPUs (they could still touch the devices), then the disk, NIC,
+    /// vsock and console workers, which hold guest RAM, the disk images,
+    /// the backend connections and the console endpoints. Every startup,
+    /// import, pause and resume failure ends here.
     fn stop_threads(&mut self) {
         vsock::quiesce_gate(self);
         if let Some(events) = &mut self.events {
@@ -663,6 +682,7 @@ impl RamSnapshotVm {
         #[cfg(all(feature = "blk", feature = "net"))]
         nic::stop(self);
         vsock::teardown(self);
+        console::teardown(self);
     }
 
     /// The stage-2 RAM alias probe, parameterized by the clones the owner's

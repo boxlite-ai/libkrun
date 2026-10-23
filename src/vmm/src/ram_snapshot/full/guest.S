@@ -5,6 +5,13 @@
  * Legacy entry 0x800: COM1 output and scratch, counter 0x9000, and an i8042
  * reset once the host sets [0x9006]; the counter keeps moving after the
  * reset until the vCPU is stopped.
+ * MMIO entry 0x900: unreal mode (FS with a 4 GiB limit), then the guest
+ * performs one 32-bit access per request in the mailbox at 0x9100: request
+ * sequence, op (1 write, 2 read, 3 sti), address, value/result, done
+ * sequence; counter 0x9120 moves every loop. Interrupts stay off until an
+ * sti request; the PIC is remapped to 0x20/0x28 with only the cascade and
+ * slave IRQ0 (GSI 8, the console) unmasked, and vector 0x28 counts at
+ * 0x9124.
  */
 .intel_syntax noprefix
 .code16
@@ -223,3 +230,73 @@ legacy_loop:
 legacy_reset:
     inc word ptr [0x9000]
     jmp legacy_reset
+
+.org 0x900
+    cli
+    mov sp, 0xa000
+    mov al, 0x11
+    out 0x20, al
+    out 0xa0, al
+    mov al, 0x20
+    out 0x21, al
+    mov al, 0x28
+    out 0xa1, al
+    mov al, 4
+    out 0x21, al
+    mov al, 2
+    out 0xa1, al
+    mov al, 1
+    out 0x21, al
+    out 0xa1, al
+    mov al, 0xfb
+    out 0x21, al
+    mov al, 0xfe
+    out 0xa1, al
+    mov word ptr [0xa0], offset mmio_irq + 0x1000
+    mov word ptr [0xa2], 0
+    lgdt [mmio_gdt_desc + 0x1000]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+    mov bx, 8
+    mov fs, bx
+    and al, 0xfe
+    mov cr0, eax
+mmio_loop:
+    inc word ptr [0x9120]
+    mov eax, dword ptr [0x9100]
+    cmp eax, dword ptr [0x9110]
+    je mmio_loop
+    mov ebx, dword ptr [0x9108]
+    cmp dword ptr [0x9104], 3
+    je mmio_sti
+    cmp dword ptr [0x9104], 1
+    jne mmio_read
+    mov ecx, dword ptr [0x910c]
+    mov dword ptr fs:[ebx], ecx
+    jmp mmio_done
+mmio_read:
+    mov ecx, dword ptr fs:[ebx]
+    mov dword ptr [0x910c], ecx
+    jmp mmio_done
+mmio_sti:
+    sti
+mmio_done:
+    mov dword ptr [0x9110], eax
+    jmp mmio_loop
+mmio_irq:
+    push ax
+    inc word ptr [0x9124]
+    mov al, 0x20
+    out 0xa0, al
+    out 0x20, al
+    pop ax
+    iret
+
+.balign 8
+mmio_gdt:
+    .quad 0
+    .quad 0x00cf92000000ffff
+mmio_gdt_desc:
+    .word 15
+    .long mmio_gdt + 0x1000

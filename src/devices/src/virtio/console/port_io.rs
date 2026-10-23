@@ -6,6 +6,7 @@ use nix::errno::Errno;
 use nix::ioctl_read_bad;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{dup, isatty};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -14,21 +15,83 @@ use utils::eventfd::EFD_NONBLOCK;
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
 
+/// The kind of a built-in input endpoint, as a snapshot records it. Neither
+/// the host descriptor nor bytes still unread in it are part of a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputKind {
+    Fd,
+    Empty,
+    SigInt,
+}
+
+/// The state of a built-in output endpoint, as a snapshot records it: bytes
+/// the host accepted are delivered, only the log's unfinished line remains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputState {
+    Fd,
+    Log { partial_line: Vec<u8> },
+}
+
+/// The kind of a built-in terminal, as a snapshot records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalKind {
+    Fd,
+    Fixed { cols: u16, rows: u16 },
+}
+
 pub trait PortInput {
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error>;
 
+    /// Block until the input is readable or `stopfd` is signaled.
     fn wait_until_readable(&self, stopfd: Option<&EventFd>);
+
+    /// Snapshot kind; custom endpoints keep `None` and cannot be
+    /// checkpointed.
+    fn snapshot_kind(&self) -> Option<InputKind> {
+        None
+    }
 }
 
 pub trait PortOutput {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error>;
 
-    fn wait_until_writable(&self);
+    /// Block until the output is writable or `stopfd` is signaled.
+    fn wait_until_writable(&self, stopfd: Option<&EventFd>);
+
+    /// Snapshot state; custom endpoints keep `None` and cannot be
+    /// checkpointed.
+    fn snapshot_state(&self) -> Option<OutputState> {
+        None
+    }
+
+    /// Adopt a saved state into this fresh endpoint; false when the state
+    /// belongs to another kind.
+    fn restore_state(&mut self, _state: &OutputState) -> bool {
+        false
+    }
 }
 
 /// Terminal properties associated with this port
 pub trait PortTerminalProperties: Send + Sync {
     fn get_win_size(&self) -> (u16, u16);
+
+    /// Snapshot kind; custom terminals keep `None` and cannot be
+    /// checkpointed.
+    fn snapshot_kind(&self) -> Option<TerminalKind> {
+        None
+    }
+}
+
+/// Poll `fd` for `flags` together with `stopfd`, whichever comes first.
+fn poll_or_stop(fd: BorrowedFd, flags: PollFlags, stopfd: Option<&EventFd>) {
+    let mut poll_fds = Vec::with_capacity(2);
+    poll_fds.push(PollFd::new(fd, flags));
+    if let Some(stopfd) = stopfd {
+        // SAFETY: we trust stopfd won't go away to avoid a dup call here.
+        let stop_bfd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
+        poll_fds.push(PollFd::new(stop_bfd, PollFlags::POLLIN));
+    }
+    poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
 }
 
 pub fn stdin() -> Result<Box<dyn PortInput + Send>, nix::Error> {
@@ -123,14 +186,11 @@ impl PortInput for PortInputFd {
     }
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut poll_fds = Vec::new();
-        poll_fds.push(PollFd::new(self.0.as_fd(), PollFlags::POLLIN));
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            poll_fds.push(PollFd::new(borrowed_fd, PollFlags::POLLIN));
-        }
-        poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+        poll_or_stop(self.0.as_fd(), PollFlags::POLLIN, stopfd)
+    }
+
+    fn snapshot_kind(&self) -> Option<InputKind> {
+        Some(InputKind::Fd)
     }
 }
 
@@ -153,9 +213,16 @@ impl PortOutput for PortOutputFd {
         })
     }
 
-    fn wait_until_writable(&self) {
-        let mut poll_fds = [PollFd::new(self.0.as_fd(), PollFlags::POLLOUT)];
-        poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+    fn wait_until_writable(&self, stopfd: Option<&EventFd>) {
+        poll_or_stop(self.0.as_fd(), PollFlags::POLLOUT, stopfd)
+    }
+
+    fn snapshot_state(&self) -> Option<OutputState> {
+        Some(OutputState::Fd)
+    }
+
+    fn restore_state(&mut self, state: &OutputState) -> bool {
+        matches!(state, OutputState::Fd)
     }
 }
 
@@ -189,7 +256,7 @@ pub struct PortOutputLog {
 }
 
 impl PortOutputLog {
-    const FORCE_FLUSH_TRESHOLD: usize = 512;
+    pub(crate) const FORCE_FLUSH_TRESHOLD: usize = 512;
     const LOG_TARGET: &'static str = "init_or_kernel";
 
     fn new() -> Self {
@@ -221,7 +288,23 @@ impl PortOutput for PortOutputLog {
         Ok(buf.len())
     }
 
-    fn wait_until_writable(&self) {}
+    fn wait_until_writable(&self, _stopfd: Option<&EventFd>) {}
+
+    fn snapshot_state(&self) -> Option<OutputState> {
+        Some(OutputState::Log {
+            partial_line: self.buf.clone(),
+        })
+    }
+
+    fn restore_state(&mut self, state: &OutputState) -> bool {
+        match state {
+            OutputState::Log { partial_line } => {
+                self.buf = partial_line.clone();
+                true
+            }
+            OutputState::Fd => false,
+        }
+    }
 }
 
 pub struct PortInputSigInt {
@@ -256,17 +339,13 @@ impl PortInput for PortInputSigInt {
     }
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut poll_fds = Vec::with_capacity(2);
         // SAFETY: we trust sigint_evt won't go away to avoid a dup call here.
         let sigint_bfd = unsafe { BorrowedFd::borrow_raw(self.sigint_evt.as_raw_fd()) };
-        poll_fds.push(PollFd::new(sigint_bfd, PollFlags::POLLIN));
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let stop_bfd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            poll_fds.push(PollFd::new(stop_bfd, PollFlags::POLLIN));
-        }
+        poll_or_stop(sigint_bfd, PollFlags::POLLIN, stopfd)
+    }
 
-        poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+    fn snapshot_kind(&self) -> Option<InputKind> {
+        Some(InputKind::SigInt)
     }
 }
 
@@ -299,6 +378,10 @@ impl PortInput for PortInputEmpty {
             std::thread::sleep(std::time::Duration::MAX);
         }
     }
+
+    fn snapshot_kind(&self) -> Option<InputKind> {
+        Some(InputKind::Empty)
+    }
 }
 
 struct PortTerminalPropertiesFixed((u16, u16));
@@ -306,6 +389,11 @@ struct PortTerminalPropertiesFixed((u16, u16));
 impl PortTerminalProperties for PortTerminalPropertiesFixed {
     fn get_win_size(&self) -> (u16, u16) {
         self.0
+    }
+
+    fn snapshot_kind(&self) -> Option<TerminalKind> {
+        let (cols, rows) = self.0;
+        Some(TerminalKind::Fixed { cols, rows })
     }
 }
 
@@ -320,6 +408,10 @@ impl PortTerminalProperties for PortTerminalPropertiesFd {
             return (0, 0);
         }
         (ws.cols, ws.rows)
+    }
+
+    fn snapshot_kind(&self) -> Option<TerminalKind> {
+        Some(TerminalKind::Fd)
     }
 }
 

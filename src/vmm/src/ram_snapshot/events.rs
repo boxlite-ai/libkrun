@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use devices::legacy::Serial;
 use devices::virtio::control::{self, CONTROL_TIMEOUT};
-use devices::virtio::{Balloon, MmioTransport, Rng, Vsock};
+use devices::virtio::{Balloon, Console, MmioTransport, Rng, Vsock};
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -120,6 +120,9 @@ pub(super) struct Devices {
     /// Its queue callbacks only; the owner restarts its backend, which
     /// notifies the queues itself.
     pub(super) vsock: Option<Arc<Mutex<Vsock>>>,
+    /// Its activation and control queues; the owner resumes its port
+    /// workers and control queues itself.
+    pub(super) console: Option<Arc<Mutex<Console>>>,
     /// UARTs whose input the thread reads.
     pub(super) serials: Vec<Arc<Mutex<Serial>>>,
 }
@@ -306,6 +309,9 @@ fn event_manager(wake: EventFd, devices: &Devices) -> std::result::Result<EventM
     }
     if let Some(vsock) = &devices.vsock {
         subscribers.push(vsock.clone());
+    }
+    if let Some(console) = &devices.console {
+        subscribers.push(console.clone());
     }
     for subscriber in subscribers {
         events

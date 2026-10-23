@@ -610,13 +610,13 @@ fn rejection(result: Result<impl Sized>) -> String {
     }
 }
 
-/// Versions 1–4 (4 had no vsock section) are rejected by version before
-/// their JSON is parsed.
+/// Versions 1–5 (4 had no vsock section, 5 no console section) are
+/// rejected by version before their JSON is parsed.
 #[test]
 fn snapshot_full_rejects_pre_unified_versions() {
     let dir = TempDir::new();
     let path = dir.path();
-    for old in 1..=4 {
+    for old in 1..=5 {
         write_header_only(&path, old, b"{}");
         let error = rejection(read_metadata(&mut File::open(&path).unwrap(), 32, 32));
         assert!(
@@ -633,6 +633,7 @@ fn snapshot_full_restore_resources_must_match_devices() {
         disks: false,
         nic: false,
         vsock: false,
+        console: false,
         legacy: false,
     };
     none.check(&RestoreResources::default()).unwrap();
@@ -670,6 +671,17 @@ fn snapshot_full_restore_resources_must_match_devices() {
     };
     with_vsock.check(&ports).unwrap();
     assert!(none.check(&ports).is_err());
+    let with_console = Requirements {
+        console: true,
+        ..none
+    };
+    assert!(with_console.check(&RestoreResources::default()).is_err());
+    let console_ports = RestoreResources {
+        console_ports: Some(Vec::new()),
+        ..Default::default()
+    };
+    with_console.check(&console_ports).unwrap();
+    assert!(none.check(&console_ports).is_err());
 }
 
 /// A nonblocking owner end and a blocking-with-timeout test end.
