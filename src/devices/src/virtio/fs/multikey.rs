@@ -112,6 +112,11 @@ where
         self.alt.clear();
         self.main.clear()
     }
+
+    /// Iterates over the main keys and their values in main-key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&K1, &V)> {
+        self.main.iter().map(|(k1, (_, v))| (k1, v))
+    }
 }
 
 #[cfg(test)]

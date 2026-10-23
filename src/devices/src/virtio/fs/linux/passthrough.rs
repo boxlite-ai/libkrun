@@ -12,7 +12,7 @@ use std::mem::{self, size_of, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use caps::{has_cap, CapSet, Capability};
@@ -27,6 +27,13 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
 
+mod snapshot;
+use snapshot::InoMap;
+pub use snapshot::{
+    DirListEntry, HandleState, NodeState, PassthroughCheckpoint, PassthroughSnapshotError,
+    PassthroughState, RestoredObject, SnapshotObject, SYNTHETIC_INO_BASE,
+};
+
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
@@ -34,6 +41,8 @@ const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
 
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
+/// The compiled-in init.krun, shared by every share that was not restored.
+static DEFAULT_INIT: LazyLock<Arc<[u8]>> = LazyLock::new(|| Arc::from(INIT_BINARY));
 
 type Inode = u64;
 type Handle = u64;
@@ -50,6 +59,7 @@ struct InodeData {
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file: File,
     dev: u64,
+    ino: u64,
     mnt_id: u64,
     refcount: AtomicU64,
 }
@@ -58,6 +68,24 @@ struct HandleData {
     inode: Inode,
     file: RwLock<File>,
     exported: AtomicBool,
+    /// The flags `file` was opened with, without creation-only bits; a
+    /// restore reopens the object with exactly these.
+    flags: i32,
+    /// Snapshot mode only: the complete directory list taken when the guest
+    /// started (or rewound) this stream; offsets are indexes into it.
+    listing: Mutex<Option<Vec<DirListEntry>>>,
+}
+
+impl HandleData {
+    fn new(inode: Inode, file: File, flags: i32) -> Self {
+        HandleData {
+            inode,
+            file: RwLock::new(file),
+            exported: AtomicBool::new(false),
+            flags: flags & !snapshot::CREATION_FLAGS,
+            listing: Mutex::new(None),
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -328,6 +356,12 @@ pub struct Config {
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
     pub allow_root_dir_delete: bool,
+
+    /// Opt into checkpointable runtime state: stable directory lists with
+    /// index cookies, guest inode projection and the saved-ctime overlay.
+    /// Only snapshot-owned shares set it; ordinary shares keep the
+    /// unmodified passthrough behavior.
+    pub snapshot: bool,
 }
 
 impl Default for Config {
@@ -343,6 +377,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             allow_root_dir_delete: false,
+            snapshot: false,
         }
     }
 }
@@ -380,6 +415,13 @@ pub struct PassthroughFs {
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
+
+    // The init.krun bytes served for `init_inode`: the compiled-in binary,
+    // or the bytes a restored share archived at its cut.
+    init_binary: Arc<[u8]>,
+    // Snapshot mode only: host identity -> guest inode projection. Lock
+    // order: `inos` before `inodes`; never taken while holding `inodes`.
+    inos: Mutex<InoMap>,
 
     cfg: Config,
 }
@@ -452,22 +494,14 @@ impl PassthroughFs {
             my_uid,
             my_gid,
             cap_fowner,
+            init_binary: DEFAULT_INIT.clone(),
+            inos: Mutex::new(InoMap::new(fuse::ROOT_ID + 1)),
             cfg,
         })
     }
 
-    fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let pathname = CString::new(format!("{}", data.file.as_raw_fd()))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+    /// The flags `open_inode` really opens with for the requested `flags`.
+    fn effective_open_flags(&self, mut flags: i32) -> i32 {
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
         // the file for reading as well as writing.
@@ -486,6 +520,49 @@ impl PassthroughFs {
         if writeback && flags & libc::O_APPEND != 0 {
             flags &= !libc::O_APPEND;
         }
+        flags
+    }
+
+    /// Snapshot mode: replace the host inode and ctime with what the guest
+    /// must see. Ordinary shares report the host values unchanged.
+    fn project_stat(&self, st: &mut libc::stat64) {
+        if !self.cfg.snapshot {
+            return;
+        }
+        let mut inos = self.inos.lock().unwrap();
+        let key = (st.st_dev, st.st_ino);
+        st.st_ino = inos.project(key, |ino| self.host_ino_is_live(ino));
+        let (sec, nsec) = inos.ctime(key, (st.st_ctime, st.st_ctime_nsec));
+        st.st_ctime = sec;
+        st.st_ctime_nsec = nsec;
+    }
+
+    /// Whether a live node's host inode number is `ino` (a synthetic guest
+    /// inode must not shadow an identity-projected live object).
+    fn host_ino_is_live(&self, ino: u64) -> bool {
+        self.inodes
+            .read()
+            .unwrap()
+            .iter()
+            .any(|(_, data)| data.ino == ino)
+    }
+
+    fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        self.reopen(&data.file, self.effective_open_flags(flags))
+    }
+
+    /// Open a new file description for the object behind `file` through
+    /// `/proc/self/fd`, with exactly `flags`.
+    fn reopen(&self, file: &File, flags: i32) -> io::Result<File> {
+        let pathname = CString::new(format!("{}", file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
@@ -579,7 +656,7 @@ impl PassthroughFs {
             // There is a possible race here where 2 threads end up adding the same file
             // into the inode list.  However, since each of those will get a unique Inode
             // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+            let inode = allocate_id(&self.next_inode)?;
             self.inodes.write().unwrap().insert(
                 inode,
                 InodeAltKey {
@@ -591,6 +668,7 @@ impl PassthroughFs {
                     inode,
                     file: f,
                     dev: st.st_dev,
+                    ino: st.st_ino,
                     mnt_id,
                     refcount: AtomicU64::new(1),
                 }),
@@ -599,8 +677,10 @@ impl PassthroughFs {
             inode
         };
 
-        debug!("do_lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
+        debug!("do_lookup: {name:?}, inode: {inode:?}");
 
+        let mut st = st;
+        self.project_stat(&mut st);
         Ok(Entry {
             inode,
             generation: 0,
@@ -634,6 +714,10 @@ impl PassthroughFs {
             .filter(|hd| hd.inode == inode)
             .cloned()
             .ok_or_else(ebadf)?;
+
+        if self.cfg.snapshot {
+            return self.read_listing(&data, offset, add_entry);
+        }
 
         let mut buf = vec![0; size as usize];
 
@@ -741,15 +825,11 @@ impl PassthroughFs {
             } else {
                 None
             };
-            RwLock::new(self.open_inode(inode, flags as i32)?)
+            self.open_inode(inode, flags as i32)?
         };
 
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let data = HandleData {
-            inode,
-            file,
-            exported: Default::default(),
-        };
+        let handle = allocate_id(&self.next_handle)?;
+        let data = HandleData::new(inode, file, self.effective_open_flags(flags as i32));
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
 
@@ -807,7 +887,8 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = stat(&data.file)?;
+        let mut st = stat(&data.file)?;
+        self.project_stat(&mut st);
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -859,6 +940,22 @@ impl PassthroughFs {
         };
 
         Ok((scoped_uid, scoped_gid))
+    }
+}
+
+/// Take the next node or handle ID. The counter never wraps: once it
+/// reaches `u64::MAX` every allocation fails with EOVERFLOW, so no ID is
+/// ever issued twice and the reserved low IDs are never reissued.
+fn allocate_id(counter: &AtomicU64) -> io::Result<u64> {
+    let mut id = counter.load(Ordering::Relaxed);
+    loop {
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+        match counter.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(id),
+            Err(current) => id = current,
+        }
     }
 }
 
@@ -945,6 +1042,7 @@ impl FileSystem for PassthroughFs {
                 inode: fuse::ROOT_ID,
                 file: f,
                 dev: st.st_dev,
+                ino: st.st_ino,
                 mnt_id,
                 refcount: AtomicU64::new(2),
             }),
@@ -996,7 +1094,7 @@ impl FileSystem for PassthroughFs {
 
         if self.init_inode != 0 && name == init_name {
             let mut st: libc::stat64 = unsafe { mem::zeroed() };
-            st.st_size = INIT_BINARY.len() as i64;
+            st.st_size = self.init_binary.len() as i64;
             st.st_ino = self.init_inode;
             st.st_mode = 0o100_755;
 
@@ -1108,6 +1206,9 @@ impl FileSystem for PassthroughFs {
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
+        if self.cfg.snapshot {
+            return self.readdirplus_listing(inode, handle, size, offset, add_entry);
+        }
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
             // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
             // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
@@ -1179,6 +1280,9 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
+        // Taken first: an exhausted handle counter must not create the file.
+        let handle = allocate_id(&self.next_handle)?;
+
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems.
@@ -1195,16 +1299,11 @@ impl FileSystem for PassthroughFs {
         }
 
         // Safe because we just opened this fd.
-        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+        let file = unsafe { File::from_raw_fd(fd) };
 
         let entry = self.do_lookup(parent, name)?;
 
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let data = HandleData {
-            inode: entry.inode,
-            file,
-            exported: Default::default(),
-        };
+        let data = HandleData::new(entry.inode, file, flags as i32);
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
 
@@ -1235,13 +1334,13 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
         if inode == self.init_inode {
-            let off: usize = offset.try_into().map_err(|_| einval())?;
-            let len = if off + (size as usize) < INIT_BINARY.len() {
-                size as usize
-            } else {
-                INIT_BINARY.len() - off
-            };
-            return w.write(&INIT_BINARY[off..(off + len)]);
+            let init = &self.init_binary;
+            // An offset at or past the end reads nothing (EOF).
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(init.len());
+            let end = start.saturating_add(size as usize).min(init.len());
+            return w.write(&init[start..end]);
         }
 
         let data = self
@@ -2102,15 +2201,15 @@ impl FileSystem for PassthroughFs {
                 return Err(io::Error::last_os_error());
             }
 
-            let to_copy = if len as usize > INIT_BINARY.len() {
-                INIT_BINARY.len()
+            let to_copy = if len as usize > self.init_binary.len() {
+                self.init_binary.len()
             } else {
                 len as usize
             };
             unsafe {
                 libc::memcpy(
                     addr as *mut libc::c_void,
-                    INIT_BINARY.as_ptr() as *const _,
+                    self.init_binary.as_ptr() as *const _,
                     to_copy,
                 )
             };

@@ -320,8 +320,8 @@ pausing a source vCPU does not stop its hardware clocks. TSC frequency differenc
 above 250 ppm require successful scaling. Multi-vCPU restore requires successful
 vCPU0-based TSC offset synchronization before VM clock restore. Every
 attached device below is frozen, drained and saved before CPU/KVM/RAM
-capture; device types not listed here (virtio-fs) remain
-future work.
+capture. virtio-fs owner checkpoints are in progress: only the device
+backend described in "Internal virtio-fs session checkpoints" below exists.
 
 ### Internal block-device checkpoints (stage 3, feature `blk`)
 
@@ -706,6 +706,107 @@ snapshot tests and 45 `krun-vmm` tests pass, including the 8 console owner
 tests without KVM. The 48 tests that open KVM, the 11 console KVM tests
 among them, fail at opening `/dev/kvm` and are **UNVERIFIED**, as is a
 Linux guest console driver (the harness boots no Linux guest).
+
+### Internal virtio-fs session checkpoints (stage 12, in progress, Linux)
+
+**Paused at the user's request on 2026-10-23.** Step 1 and its review
+fixes are complete; step 2 reached investigation only and has no code changes.
+See the [checkpoint and remaining work](docs/phase12-virtio-fs-snapshot.md)
+before resuming. This checkpoint is not a complete virtio-fs VM snapshot.
+
+Stage 12 adds virtio-fs to the owner in three steps. Only the first, the
+device backend, exists so far: there is no `attach_fs`, no full-image
+format change (the image stays version 6), no share archive, no DAX window
+handling and no `RestoreResources` entry yet, so the owner still cannot
+checkpoint a VM with virtio-fs.
+
+A share opts in with `Fs::enable_snapshot` (`passthrough::Config::snapshot`)
+before activation; ordinary shares and macOS keep the unchanged passthrough
+behavior apart from the two Linux bounds fixes in the last item. The
+backend provides:
+
+- Worker control (`Fs::worker_control`): `freeze` lands between requests,
+  after the last request's FUSE reply, used-ring entry and interrupt,
+  `fdatasync`s every writable open handle and reports both queue cursors
+  (high-priority queue first); a frozen worker serves nothing and writes no
+  guest RAM, ring or interrupt. `resume` re-examines both queues itself, so
+  notifications drained while frozen cannot stall requests; restored
+  workers start frozen (`activate_frozen`). Dropping a device (also one an
+  owner activated but never inserted) resets it: the worker is stopped and
+  joined while its session and guest memory are still alive, and a reset
+  device can be activated again.
+- Session capture (`Fs::snapshot_session`, worker frozen): the negotiated
+  FUSE options and `PassthroughState` — node IDs with lookup counts, handles
+  with their node, open object and exact open flags (creation flags such as
+  `O_TRUNC` are never recorded), directory lists, the node/handle/synthetic
+  inode counters and the writeback/submount flags — plus, outside the
+  serialized state, one descriptor per distinct host object (deduplicated by
+  host device and inode) and the init.krun bytes the share serves. The
+  capture is pure: it builds no directory list and moves no descriptor.
+  It refuses a share that is not in snapshot mode, a handle the guest
+  exported to another subsystem (`VIRTIO_IOC_EXPORT_FD`), and any node or
+  handle on another host mount than the share root.
+- Session restore (`Fs::restore_session` before `activate_frozen`): validates
+  the state against this build (reserved init.krun node, handle and inode
+  number, ID ranges and counters, duplicate IDs, object references, one
+  node per object, handles not on the init.krun node and on the same object
+  as their node while the guest still holds it — a handle whose node was
+  forgotten stays valid —, no creating, truncating or `O_PATH` flags, entry
+  names) and the options against the share before any host side effect, then rebuilds the
+  node table from fresh `O_PATH` objects, reopens every handle with its
+  saved flags and serves the given init.krun bytes. The guest continues with
+  its original node IDs and handles and never sends FUSE_INIT again; the
+  umask that FUSE_INIT cleared is cleared again.
+- Stable directory streams: reading offset 0 (a new stream or a rewind)
+  lists the whole directory through a new open file description, and every
+  offset is the index after an entry, never a host `d_off`. A restored
+  stream continues from its saved list even after the host directory
+  changed; readdirplus skips names that no longer exist and does not look up
+  "." and "..". A listed name that now names another object reports that
+  object's inode number in both the entry and its attributes, and an entry
+  the reply cannot take (full buffer or error) gives its lookup back.
+  Directory entry names are bytes: names that are not UTF-8 list, look up
+  and survive a restore like any other.
+- Inode projection: a share that was never restored reports host inode
+  numbers. A restore maps every rebuilt object to the inode number the guest
+  saw and reserves every number in a saved directory list; a later object
+  whose host number is already taken gets a synthetic number from 2^63 that
+  no reservation or live node uses. init.krun's number (2) is always
+  reserved, so a host object numbered 2 (an ext4 root, say) gets a
+  synthetic number and a restore refuses an object saved with it. Restored
+  objects report their saved ctime until their host ctime moves (a real
+  modification).
+- Bounds on every Linux share: ID counters never wrap. Once the node or
+  handle counter is exhausted (`u64::MAX`, a valid saved state) every
+  allocation fails with `EOVERFLOW` instead of reissuing 0, a reserved or a
+  live ID; an exhausted handle counter fails a create before the file
+  exists. Reads of init.krun at or past its end return EOF for any offset.
+
+The device tests (`snapshot_fs` names, Linux, run by `make snapshot-test`)
+cover the freeze boundary with a request held after its pop, frozen
+re-freezes, resume without a kick, a frozen restored worker holding a
+request posted at the cut, a device-level restore on the same host objects
+(original node IDs and handles without FUSE_INIT, an `O_APPEND` handle whose
+`O_TRUNC` is not replayed, directory continuation across an unlink and a new
+file, rewind, fresh IDs after the saved counters, and source continuation),
+stable lists and readdirplus skipping, readdirplus on a replaced name with
+exact lookup counts after full-buffer and failed replies, non-UTF-8 names,
+inode and ctime projection, init.krun's reserved number, restored lookup
+counts and init.krun bytes, restored init.krun reads at, past and far past
+its end, exhausted counters, a forgotten node's open handle, dropping an
+activated restored device and reactivating a reset one, the export and mode
+refusals, and malformed state and option rejection.
+
+Stage-12 (step 1) validation status (macOS arm64 host, x86_64 Linux
+target): `make snapshot-fmt`, `make snapshot-check` (also featureless
+`SNAPSHOT_PKGS='-p krun-vmm'`) and `make snapshot-build` pass, and
+`make snapshot-console-host-test` (26/26), `make snapshot-net-host-test`
+(20/20) and `make snapshot-vsock-host-test` (16/16) pass natively. `make
+snapshot-test` in the amd64 `rust:1-bookworm` container without `/dev/kvm`:
+98/98 `krun-devices` snapshot tests pass, the 15 `snapshot_fs` tests among
+them; the `krun-vmm` result is unchanged (45 pass, the 48 tests that open
+KVM fail at `/dev/kvm`). The owner, image format, share archive, DAX and
+every KVM or guest-driver check for virtio-fs are not implemented yet.
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 

@@ -17,7 +17,11 @@ use super::super::{
     VirtioShmRegion,
 };
 use super::passthrough;
-use super::worker::FsWorker;
+#[cfg(target_os = "linux")]
+use super::passthrough::{
+    PassthroughCheckpoint, PassthroughSnapshotError, PassthroughState, RestoredObject,
+};
+use super::worker::{FsServer, FsWorker, FsWorkerHandle};
 use super::ExportTable;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -40,6 +44,14 @@ impl Default for VirtioFsConfig {
 
 unsafe impl ByteValued for VirtioFsConfig {}
 
+/// The FUSE session of an activated, frozen share.
+#[cfg(target_os = "linux")]
+pub struct FsSessionCheckpoint {
+    /// The FUSE options FUSE_INIT negotiated (0 before it).
+    pub options: u64,
+    pub passthrough: PassthroughCheckpoint,
+}
+
 pub struct Fs {
     avail_features: u64,
     acked_features: u64,
@@ -50,6 +62,12 @@ pub struct Fs {
     read_only: bool,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    worker_control: Option<FsWorkerHandle>,
+    /// The session the activated worker serves; shared so a frozen share
+    /// can be checkpointed.
+    server: Option<Arc<FsServer>>,
+    /// A restored session waiting for `activate_frozen`.
+    restored_server: Option<FsServer>,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -86,6 +104,9 @@ impl Fs {
             read_only,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
+            worker_control: None,
+            server: None,
+            restored_server: None,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -112,6 +133,127 @@ impl Fs {
     #[cfg(target_os = "macos")]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);
+    }
+
+    /// Opt this share into checkpointable runtime state (see
+    /// `passthrough::Config::snapshot`). Must precede activation.
+    #[cfg(target_os = "linux")]
+    pub fn enable_snapshot(&mut self) {
+        self.passthrough_cfg.snapshot = true;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn allow_root_dir_delete(&self) -> bool {
+        self.passthrough_cfg.allow_root_dir_delete
+    }
+
+    /// The complete guest-visible device configuration, byte-exact.
+    pub fn config_bytes(&self) -> Vec<u8> {
+        self.config.as_slice().to_vec()
+    }
+
+    /// Snapshot control handle for the activated worker, if any.
+    pub fn worker_control(&self) -> Option<&FsWorkerHandle> {
+        self.worker_control.as_ref()
+    }
+
+    /// Capture the FUSE session; None for an inactive device. The caller
+    /// must hold a freeze confirmation: no request runs concurrently.
+    #[cfg(target_os = "linux")]
+    pub fn snapshot_session(
+        &self,
+    ) -> Result<Option<FsSessionCheckpoint>, PassthroughSnapshotError> {
+        let Some(server) = &self.server else {
+            return Ok(None);
+        };
+        Ok(Some(FsSessionCheckpoint {
+            options: server.options(),
+            passthrough: server.passthrough().checkpoint()?,
+        }))
+    }
+
+    /// Prepare the session a restored, activated device continues; the
+    /// next `activate_frozen` serves it instead of a new share, without
+    /// FUSE_INIT.
+    #[cfg(target_os = "linux")]
+    pub fn restore_session(
+        &mut self,
+        options: u64,
+        state: &PassthroughState,
+        objects: Vec<RestoredObject>,
+        init_binary: Arc<[u8]>,
+    ) -> Result<(), PassthroughSnapshotError> {
+        if self.is_activated() || self.restored_server.is_some() {
+            return Err(PassthroughSnapshotError::Invalid(
+                "device already holds a session",
+            ));
+        }
+        self.restored_server = Some(FsServer::restored(
+            self.passthrough_cfg.clone(),
+            self.read_only,
+            options,
+            state,
+            objects,
+            init_binary,
+        )?);
+        Ok(())
+    }
+
+    fn activate_impl(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+        start_frozen: bool,
+    ) -> ActivateResult {
+        if self.worker_thread.is_some() {
+            panic!("virtio_fs: worker thread already exists");
+        }
+
+        // Extract queues and eventfds from DeviceQueues.
+        let mut worker_queues = Vec::with_capacity(queues.len());
+        let mut queue_evts = Vec::with_capacity(queues.len());
+        for dq in queues {
+            worker_queues.push(dq.queue);
+            queue_evts.push(dq.event);
+        }
+
+        let server = match self.restored_server.take() {
+            Some(server) => server,
+            None => FsServer::new(self.passthrough_cfg.clone(), self.read_only).map_err(|e| {
+                error!("virtio_fs: failed to create worker: {}", e);
+                ActivateError::BadActivate
+            })?,
+        };
+        let server = Arc::new(server);
+        let control_fd = EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?;
+        let (commands, command_receiver) = crossbeam_channel::bounded(16);
+        let worker = FsWorker::new(
+            worker_queues,
+            queue_evts,
+            interrupt.clone(),
+            mem.clone(),
+            self.shm_region.clone(),
+            server.clone(),
+            self.worker_stopfd.try_clone().unwrap(),
+            control_fd.try_clone().unwrap(),
+            command_receiver,
+            self.exit_code.clone(),
+            #[cfg(target_os = "macos")]
+            self.map_sender.clone(),
+        );
+        self.worker_thread = Some(worker.run(start_frozen));
+        self.worker_control = Some(FsWorkerHandle {
+            control_fd,
+            commands,
+        });
+        self.server = Some(server);
+
+        self.device_state = DeviceState::Activated(mem, interrupt);
+        Ok(())
     }
 }
 
@@ -168,39 +310,16 @@ impl VirtioDevice for Fs {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        if self.worker_thread.is_some() {
-            panic!("virtio_fs: worker thread already exists");
-        }
+        self.activate_impl(mem, interrupt, queues, false)
+    }
 
-        // Extract queues and eventfds from DeviceQueues.
-        let mut worker_queues = Vec::with_capacity(queues.len());
-        let mut queue_evts = Vec::with_capacity(queues.len());
-        for dq in queues {
-            worker_queues.push(dq.queue);
-            queue_evts.push(dq.event);
-        }
-
-        let worker = FsWorker::new(
-            worker_queues,
-            queue_evts,
-            interrupt.clone(),
-            mem.clone(),
-            self.shm_region.clone(),
-            self.passthrough_cfg.clone(),
-            self.read_only,
-            self.worker_stopfd.try_clone().unwrap(),
-            self.exit_code.clone(),
-            #[cfg(target_os = "macos")]
-            self.map_sender.clone(),
-        )
-        .map_err(|e| {
-            error!("virtio_fs: failed to create worker: {}", e);
-            ActivateError::BadActivate
-        })?;
-        self.worker_thread = Some(worker.run());
-
-        self.device_state = DeviceState::Activated(mem, interrupt);
-        Ok(())
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate_impl(mem, interrupt, queues, true)
     }
 
     fn is_activated(&self) -> bool {
@@ -218,7 +337,18 @@ impl VirtioDevice for Fs {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.worker_control = None;
+        self.server = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+impl Drop for Fs {
+    /// A dropped device stops and joins its worker first, including one an
+    /// owner activated but never inserted (a failed restore); the session
+    /// and guest memory the worker uses stay alive until it exits.
+    fn drop(&mut self) {
+        self.reset();
     }
 }

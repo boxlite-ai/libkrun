@@ -78,6 +78,27 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
+    /// A server that continues a session whose FUSE_INIT negotiated
+    /// `options`; the guest never sends FUSE_INIT again.
+    #[cfg(target_os = "linux")]
+    pub fn restored(fs: F, options: u64) -> Server<F> {
+        Server {
+            fs,
+            options: AtomicU64::new(options),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn fs(&self) -> &F {
+        &self.fs
+    }
+
+    /// The FUSE options FUSE_INIT negotiated (0 before it).
+    #[cfg(target_os = "linux")]
+    pub fn options(&self) -> u64 {
+        self.options.load(Ordering::Relaxed)
+    }
+
     #[allow(clippy::cognitive_complexity)]
     pub fn handle_message(
         &self,
