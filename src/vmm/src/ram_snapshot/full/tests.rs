@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::ram_snapshot::RestoreResources;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,8 +27,9 @@ impl Drop for TempDir {
     }
 }
 
-fn source(count: u8, entry: u16) -> RamSnapshotVm {
-    let mut owner = crate::builder::build_ram_snapshot_vm(
+/// An owner with the guest fixture and IVT loaded, vCPUs not started.
+fn loaded() -> RamSnapshotVm {
+    let owner = crate::builder::build_ram_snapshot_vm(
         2,
         &Default::default(),
         &crate::builder::Payload::Empty,
@@ -45,6 +47,11 @@ fn source(count: u8, entry: u16) -> RamSnapshotVm {
         .memory
         .write_slice(&[0x80, 0x16, 0, 0], GuestAddress(0x30 * 4))
         .unwrap();
+    owner
+}
+
+fn source(count: u8, entry: u16) -> RamSnapshotVm {
+    let mut owner = loaded();
     owner.start_vcpus(count, entry).unwrap();
     owner
 }
@@ -81,7 +88,8 @@ fn destroyed_source_multi_cpu_continues_register_stack_and_simd_without_reboot()
         0o600
     );
     drop(owner);
-    let mut restored = RamSnapshotVm::restore_full(&dir.path()).unwrap();
+    let mut restored =
+        RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
     let counters: Vec<_> = (0..2).map(|id| read(&restored, 0x8000 + id * 64)).collect();
     std::thread::sleep(Duration::from_millis(30));
     for id in 0..2 {
@@ -136,7 +144,8 @@ fn halted_pit_lapic_and_deadline_continue_after_long_offline_pause() {
         drop(owner);
         std::thread::sleep(Duration::from_millis(250));
         let restore_started = Instant::now();
-        let mut restored = RamSnapshotVm::restore_full(&dir.path()).unwrap();
+        let mut restored =
+            RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
         let before = read(&restored, 0x9000);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
@@ -200,7 +209,7 @@ fn halted_mp_state_round_trips_without_guest_entry() {
     let saved = read_metadata(&mut File::open(dir.path()).unwrap(), owner.max_slots, 32).unwrap();
     assert!(saved.cpus[0].test_halted());
     drop(owner);
-    let restored = RamSnapshotVm::restore_full(&dir.path()).unwrap();
+    let restored = RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
     let state = snapshot::request(&restored.handles[0], |reply| Request::Save {
         size: saved.compatibility.xsave_size,
         reply,
@@ -325,7 +334,8 @@ fn one_shot_lapic_and_deadline_complete_once_after_source_destruction() {
         owner.save_full(&dir.path()).unwrap();
         drop(owner);
         std::thread::sleep(Duration::from_millis(250));
-        let mut restored = RamSnapshotVm::restore_full(&dir.path()).unwrap();
+        let mut restored =
+            RamSnapshotVm::restore_full(&dir.path(), RestoreResources::default()).unwrap();
         assert_eq!(
             read(&restored, 0x9000),
             0,
@@ -354,7 +364,9 @@ fn full_files_reject_wrong_capabilities_trailing_bytes_and_incomplete_marker() {
     malformed.extend_from_slice(&encoded);
     malformed.extend_from_slice(&original[16 + len..]);
     fs::write(dir.0.join("mismatch"), &malformed).unwrap();
-    assert!(RamSnapshotVm::restore_full(&dir.0.join("mismatch")).is_err());
+    assert!(
+        RamSnapshotVm::restore_full(&dir.0.join("mismatch"), RestoreResources::default()).is_err()
+    );
     let mut trailing = original.clone();
     trailing.push(0);
     fs::write(dir.0.join("trailing"), &trailing).unwrap();
@@ -421,7 +433,10 @@ fn partial_import_kvm_failure_joins_threads_and_closes_fds() {
     let count = |path| fs::read_dir(path).unwrap().count();
     let threads = count("/proc/self/task");
     let fds = count("/proc/self/fd");
-    let error = match RamSnapshotVm::restore_full(&dir.0.join("partial-import")) {
+    let error = match RamSnapshotVm::restore_full(
+        &dir.0.join("partial-import"),
+        RestoreResources::default(),
+    ) {
         Ok(_) => panic!("invalid CR0 restored"),
         Err(error) => error,
     };
@@ -457,43 +472,129 @@ fn rejection(result: Result<impl Sized>) -> String {
     }
 }
 
+/// Versions 1–3 are rejected by version before their JSON is parsed.
 #[test]
-fn snapshot_versions_are_rejected_by_entries_that_cannot_restore_them() {
+fn snapshot_full_rejects_pre_unified_versions() {
     let dir = TempDir::new();
     let path = dir.path();
-    let open = || File::open(&path).unwrap();
-    // The device-free reader names the right entry for v2 and v3.
-    write_header_only(&path, FULL_VERSION_V3, b"{}");
-    assert!(rejection(read_metadata(&mut open(), 32, 32)).contains("restore_full_with_net"));
-    write_header_only(&path, FULL_VERSION_V2, b"{}");
-    assert!(rejection(read_metadata(&mut open(), 32, 32)).contains("restore_full_with_disks"));
-    // The disk reader rejects v3 the same way, before parsing JSON.
-    #[cfg(feature = "blk")]
-    {
-        write_header_only(&path, FULL_VERSION_V3, b"{}");
-        assert!(rejection(read_metadata_v2(&mut open(), 32, 32)).contains("restore_full_with_net"));
-    }
-    // The NIC reader rejects NIC-free versions.
-    #[cfg(all(feature = "blk", feature = "net"))]
-    for version in [FULL_VERSION, FULL_VERSION_V2] {
-        write_header_only(&path, version, b"{}");
-        assert!(read_metadata_v3(&mut open(), 32, 32).is_err());
+    for old in 1..=3 {
+        write_header_only(&path, old, b"{}");
+        let error = rejection(read_metadata(&mut File::open(&path).unwrap(), 32, 32));
+        assert!(
+            error.contains(&format!("version {old} predates")),
+            "{error}"
+        );
     }
 }
 
-#[cfg(all(feature = "blk", feature = "net"))]
+/// Each target resource is required exactly when its device is present.
 #[test]
-fn snapshot_malformed_v3_metadata_is_rejected_before_any_resource() {
+fn snapshot_full_restore_resources_must_match_devices() {
+    let none = Requirements {
+        disks: false,
+        nic: false,
+        legacy: false,
+    };
+    none.check(&RestoreResources::default()).unwrap();
+    let with_disks = Requirements {
+        disks: true,
+        ..none
+    };
+    let dir = RestoreResources {
+        disk_dir: Some(PathBuf::from("/nonexistent")),
+        ..Default::default()
+    };
+    with_disks.check(&dir).unwrap();
+    assert!(with_disks.check(&RestoreResources::default()).is_err());
+    assert!(none.check(&dir).is_err());
+    let with_nic = Requirements { nic: true, ..none };
+    assert!(with_nic.check(&RestoreResources::default()).is_err());
+    let socket = RestoreResources {
+        nic_socket: Some(PathBuf::from("/nonexistent.sock")),
+        ..Default::default()
+    };
+    assert!(none.check(&socket).is_err());
+    let serial = RestoreResources {
+        serial: Some([None, None, None, None]),
+        ..Default::default()
+    };
+    assert!(none.check(&serial).is_err());
+}
+
+/// A nonblocking owner end and a blocking-with-timeout test end.
+fn serial_pair() -> (
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+) {
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    ours.set_nonblocking(true).unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    (ours, theirs)
+}
+
+/// The legacy fixture writes COM1 output and scratch, then counts. Its
+/// UART/CMOS/i8042 state survives a destroyed source; the target endpoint
+/// gets no replayed output, and the restored guest continues until its
+/// i8042 reset latches the exit and stops the vCPU, after which no save or
+/// resume is accepted.
+#[test]
+fn snapshot_legacy_restored_vm_continues_then_reset_stops_it() {
     let dir = TempDir::new();
-    let path = dir.path();
-    // Truncated JSON, a v2 document without the NIC section, and an unknown
-    // top-level field all fail in the metadata reader.
-    for json in [
-        &b"{\"compatibility\":"[..],
-        br#"{"compatibility":{},"cpus":[],"vm":{},"regions":[],"disks":[]}"#,
-        br#"{"compatibility":{},"cpus":[],"vm":{},"regions":[],"disks":[],"nic":{},"backend":"/tmp/x"}"#,
-    ] {
-        write_header_only(&path, FULL_VERSION_V3, json);
-        assert!(read_metadata_v3(&mut File::open(&path).unwrap(), 32, 32).is_err());
+    let mut owner = loaded();
+    let (ours, mut theirs) = serial_pair();
+    owner.attach_legacy([Some(ours), None, None, None]).unwrap();
+    owner.start_vcpus(1, 0x1800).unwrap();
+    wait_changed(&owner, 0x9000, 0);
+    let mut output = [0u8];
+    theirs.read_exact(&mut output).unwrap();
+    assert_eq!(&output, b"K");
+    owner.save_full(&dir.path()).unwrap();
+    let saved = read_metadata(&mut File::open(dir.path()).unwrap(), owner.max_slots, 32).unwrap();
+    let saved_legacy =
+        serde_json::to_value(saved.legacy.as_ref().expect("legacy section")).unwrap();
+    drop(owner);
+
+    let (ours, mut theirs) = serial_pair();
+    let resources = RestoreResources {
+        serial: Some([Some(ours), None, None, None]),
+        ..Default::default()
+    };
+    let mut restored = RamSnapshotVm::restore_full(&dir.path(), resources).unwrap();
+    let restored_legacy = legacy::capture(&restored, &saved.regions).unwrap();
+    assert_eq!(serde_json::to_value(restored_legacy).unwrap(), saved_legacy);
+    assert_eq!(restored.serial_dropped_output_bytes(), Some([0; 4]));
+    let before = read(&restored, 0x9000);
+    restored.resume().unwrap();
+    wait_changed(&restored, 0x9000, before);
+    theirs.set_nonblocking(true).unwrap();
+    assert_eq!(
+        theirs.read(&mut output).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock,
+        "source output replayed to the target endpoint"
+    );
+
+    restored
+        .memory
+        .write_obj(1u16, GuestAddress(0x9006))
+        .unwrap();
+    // The guest keeps counting after its reset; only the event thread's
+    // stop ends the vCPU thread.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !restored.handles.iter().all(VcpuHandle::is_finished) {
+        assert!(
+            Instant::now() < deadline,
+            "i8042 reset did not stop the vCPU"
+        );
+        std::thread::yield_now();
     }
+    assert!(restored.exit.requested());
+    let stopped = read(&restored, 0x9000);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(read(&restored, 0x9000), stopped, "vCPU ran after reset");
+    let error = restored.save_full(&dir.0.join("after-reset")).unwrap_err();
+    assert!(error.to_string().contains("requested exit"), "{error}");
+    assert!(!dir.0.join("after-reset").exists());
+    assert!(restored.resume().is_err());
 }

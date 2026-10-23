@@ -2,7 +2,10 @@ mod device;
 mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_BALLOON as TYPE_BALLOON;
-pub use self::device::Balloon;
+pub use self::defs::{NUM_QUEUES as BALLOON_NUM_QUEUES, QUEUE_SIZE as BALLOON_QUEUE_SIZE};
+pub use self::device::{
+    Balloon, AVAIL_FEATURES as BALLOON_FEATURES, CONFIG_LEN as BALLOON_CONFIG_LEN,
+};
 
 mod defs {
     use super::super::QueueConfig;
@@ -25,6 +28,8 @@ mod defs {
 pub enum BalloonError {
     /// Failed to create event fd.
     EventFd(std::io::Error),
+    /// A restored configuration space has the wrong length.
+    ConfigLength(usize),
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;

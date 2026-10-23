@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::ram_snapshot::tests::with_failed_payload_write;
+use crate::ram_snapshot::RestoreResources;
 use devices::virtio::block::ImageType;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -93,6 +94,14 @@ impl Backend {
                 Err(e) => panic!("accept: {e}"),
             }
         }
+    }
+}
+
+fn resources(disk_dir: Option<&Path>, socket: &Path) -> RestoreResources {
+    RestoreResources {
+        disk_dir: disk_dir.map(Path::to_owned),
+        nic_socket: Some(socket.to_owned()),
+        ..Default::default()
     }
 }
 
@@ -384,13 +393,8 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
 
     // Restore with a freshly started backend.
     let new = Backend::start(dir.path("b.sock"));
-    let mut restored =
-        RamSnapshotVm::restore_full_with_net(&image, &dir.path("disks"), &new.path).unwrap();
+    let mut restored = RamSnapshotVm::restore_full(&image, resources(None, &new.path)).unwrap();
     let mut stream = new.accept();
-    assert!(
-        !dir.path("disks").exists(),
-        "disk-free image created a destination"
-    );
 
     // Before any vCPU runs: the cut-time TX is completed as dropped exactly
     // once, earlier completions are untouched, and the discard raised a
@@ -462,7 +466,8 @@ fn snapshot_nic_kvm_inactive_nic_with_disk_activates_after_restore() {
     // An inactive NIC connects nothing at restore time.
     let destination = dir.path("disks");
     let mut restored =
-        RamSnapshotVm::restore_full_with_net(&image, &destination, &dir.path("b.sock")).unwrap();
+        RamSnapshotVm::restore_full(&image, resources(Some(&destination), &dir.path("b.sock")))
+            .unwrap();
     assert_eq!(fs::read(destination.join("disk-0.raw")).unwrap(), bytes);
     restored.resume().unwrap();
     wait_counter(&restored, counter(&restored));
@@ -486,7 +491,7 @@ fn snapshot_nic_kvm_inactive_nic_with_disk_activates_after_restore() {
 }
 
 #[test]
-fn snapshot_nic_kvm_backend_failure_and_legacy_entries_clean_up() {
+fn snapshot_nic_kvm_backend_failure_and_resource_mismatch_clean_up() {
     let dir = TempDir::new();
     let disk = dir.path("disk.raw");
     fs::write(&disk, vec![0x5a; 4096]).unwrap();
@@ -498,19 +503,22 @@ fn snapshot_nic_kvm_backend_failure_and_legacy_entries_clean_up() {
     source.save_full(&image).unwrap();
     drop(source);
 
-    // Version 3 is rejected by the NIC-free entries, before any import.
+    // Resources without the NIC socket are rejected before any import.
     let destination = dir.path("disks");
-    assert!(RamSnapshotVm::restore_full(&image).is_err());
-    assert!(RamSnapshotVm::restore_full_with_disks(&image, &destination).is_err());
+    let disks_only = RestoreResources {
+        disk_dir: Some(destination.clone()),
+        ..Default::default()
+    };
+    assert!(RamSnapshotVm::restore_full(&image, disks_only).is_err());
     assert!(!destination.exists());
 
     // No backend listening: the restore fails after importing the disk and
     // removes everything it created.
     let missing = dir.path("missing.sock");
-    assert!(RamSnapshotVm::restore_full_with_net(&image, &destination, &missing).is_err());
+    assert!(RamSnapshotVm::restore_full(&image, resources(Some(&destination), &missing)).is_err());
     assert!(!destination.exists(), "failed restore left imported disks");
 
-    // A NIC-free image is not a NIC restore.
+    // A NIC-free image takes no NIC socket.
     let plain = dir.path("plain");
     {
         let mut vm = crate::builder::build_ram_snapshot_vm(
@@ -526,7 +534,7 @@ fn snapshot_nic_kvm_backend_failure_and_legacy_entries_clean_up() {
         vm.save_full(&plain).unwrap();
     }
     let new = Backend::start(dir.path("b.sock"));
-    assert!(RamSnapshotVm::restore_full_with_net(&plain, &destination, &new.path).is_err());
+    assert!(RamSnapshotVm::restore_full(&plain, resources(None, &new.path)).is_err());
     assert!(!destination.exists());
 }
 

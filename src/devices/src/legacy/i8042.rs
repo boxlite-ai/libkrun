@@ -8,6 +8,8 @@
 use std::fmt;
 use std::num::Wrapping;
 use std::{io, result};
+
+use serde::{Deserialize, Serialize};
 use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
@@ -18,6 +20,7 @@ pub enum Error {
     KbdInterruptDisabled,
     KbdInterruptFailure(io::Error),
     InternalBufferFull,
+    InvalidState,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -32,6 +35,7 @@ impl fmt::Display for Error {
                 write!(f, "Could not trigger keyboard interrupt: {io_err}.")
             }
             Error::InternalBufferFull => write!(f, "i8042 internal buffer full."),
+            Error::InvalidState => write!(f, "i8042 snapshot state is invalid."),
         }
     }
 }
@@ -56,6 +60,7 @@ const CMD_RESET_CPU: u8 = 0xFE; // Reset CPU
 const SB_OUT_DATA_AVAIL: u8 = 0x0001; // Data available at port 0x60
 const SB_I8042_CMD_DATA: u8 = 0x0008; // i8042 expecting command parameter at port 0x60
 const SB_KBD_ENABLED: u8 = 0x0010; // 1 = kbd enabled, 0 = kbd locked
+const SB_KNOWN: u8 = SB_OUT_DATA_AVAIL | SB_I8042_CMD_DATA | SB_KBD_ENABLED;
 
 /// i8042 control register bits
 const CB_KBD_INT: u8 = 0x0001; // kbd interrupt enabled
@@ -190,6 +195,58 @@ impl I8042Device {
     fn buf_len(&self) -> usize {
         (self.btail - self.bhead).0
     }
+
+    pub fn snapshot_state(&self) -> I8042State {
+        I8042State {
+            status: self.status,
+            control: self.control,
+            outp: self.outp,
+            cmd: self.cmd,
+            buffer: (0..self.buf_len())
+                .map(|i| self.buf[(self.bhead + Wrapping(i)).0 % BUF_SIZE])
+                .collect(),
+        }
+    }
+
+    /// Load a validated state; the buffer cursors are rebuilt from the
+    /// pending bytes, and the reset and interrupt eventfds stay this
+    /// device's own.
+    pub fn restore_snapshot_state(&mut self, state: &I8042State) -> Result<()> {
+        state.validate().map_err(|_| Error::InvalidState)?;
+        self.status = state.status;
+        self.control = state.control;
+        self.outp = state.outp;
+        self.cmd = state.cmd;
+        self.buf = [0; BUF_SIZE];
+        self.buf[..state.buffer.len()].copy_from_slice(&state.buffer);
+        self.bhead = Wrapping(0);
+        self.btail = Wrapping(state.buffer.len());
+        Ok(())
+    }
+}
+
+/// Registers, the last port-0x64 command and the pending output bytes in
+/// read order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct I8042State {
+    status: u8,
+    control: u8,
+    outp: u8,
+    cmd: u8,
+    buffer: Vec<u8>,
+}
+
+impl I8042State {
+    pub fn validate(&self) -> result::Result<(), &'static str> {
+        if self.status & !SB_KNOWN != 0 || self.buffer.len() > BUF_SIZE {
+            return Err("i8042 status or buffer is outside the emulation");
+        }
+        if (self.status & SB_OUT_DATA_AVAIL != 0) == self.buffer.is_empty() {
+            return Err("i8042 data-available disagrees with its buffer");
+        }
+        Ok(())
+    }
 }
 
 impl BusDevice for I8042Device {
@@ -307,6 +364,53 @@ mod tests {
         fn eq(&self, other: &Error) -> bool {
             self.to_string() == other.to_string()
         }
+    }
+
+    /// Pending bytes survive in read order across a wrapped ring; the
+    /// cursors are rebuilt.
+    #[test]
+    fn snapshot_i8042_state_round_trips_wrapped_buffer() {
+        let new = || {
+            I8042Device::new(
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            )
+        };
+        let mut source = new();
+        // Start the cursors so the snapshot reads across the usize wrap.
+        source.bhead = Wrapping(usize::MAX - 20);
+        source.btail = source.bhead;
+        let mut data = [0u8];
+        for key in 0..BUF_SIZE as u16 {
+            source.trigger_key(key + 1).unwrap();
+        }
+        for _ in 0..10 {
+            source.read(0, OFS_DATA, &mut data);
+        }
+        for key in 0..10 {
+            source.trigger_key(0x40 + key).unwrap();
+        }
+        source.write(0, OFS_STATUS, &[CMD_WRITE_OUTP]);
+        let state = source.snapshot_state();
+        assert_eq!(state.buffer.len(), BUF_SIZE);
+        assert_eq!(state.cmd, CMD_WRITE_OUTP);
+
+        let mut target = new();
+        target.restore_snapshot_state(&state).unwrap();
+        assert_eq!(target.snapshot_state(), state);
+        let mut status = [0u8];
+        target.read(0, OFS_STATUS, &mut status);
+        assert_ne!(status[0] & SB_I8042_CMD_DATA, 0);
+        for expected in state.buffer.iter() {
+            target.read(0, OFS_DATA, &mut data);
+            assert_eq!(data[0], *expected);
+        }
+        target.read(0, OFS_STATUS, &mut status);
+        assert_eq!(status[0] & SB_OUT_DATA_AVAIL, 0);
+
+        let mut invalid = state;
+        invalid.buffer.clear();
+        assert!(target.restore_snapshot_state(&invalid).is_err());
     }
 
     #[test]

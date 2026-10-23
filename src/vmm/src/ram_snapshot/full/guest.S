@@ -2,6 +2,9 @@
 /* Real-mode fixture loaded at 0x1000. Entry offsets: 0, 0x200, 0x300, 0x400.
  * Each continuation CPU owns [0x8000 + id*64]: counter, failure, boot count.
  * Timer counter is 0x9000; IVT vectors 0x20/0x30 are installed by the test.
+ * Legacy entry 0x800: COM1 output and scratch, counter 0x9000, and an i8042
+ * reset once the host sets [0x9006]; the counter keeps moving after the
+ * reset until the vCPU is stopped.
  */
 .intel_syntax noprefix
 .code16
@@ -202,3 +205,21 @@ enable_x2apic:
 halted_forever:
     hlt
     jmp halted_forever
+
+.org 0x800
+    cli
+    mov dx, 0x3f8
+    mov al, 0x4b
+    out dx, al
+    mov dx, 0x3ff
+    mov al, 0x5a
+    out dx, al
+legacy_loop:
+    inc word ptr [0x9000]
+    cmp word ptr [0x9006], 0
+    je legacy_loop
+    mov al, 0xfe
+    out 0x64, al
+legacy_reset:
+    inc word ptr [0x9000]
+    jmp legacy_reset

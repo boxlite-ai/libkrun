@@ -2,14 +2,15 @@ mod device;
 mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_RNG as TYPE_RNG;
-pub use self::device::Rng;
+pub use self::defs::{NUM_QUEUES as RNG_NUM_QUEUES, QUEUE_SIZE as RNG_QUEUE_SIZE};
+pub use self::device::{Rng, AVAIL_FEATURES as RNG_FEATURES};
 
 mod defs {
     use crate::virtio::QueueConfig;
 
     pub const RNG_DEV_ID: &str = "virtio_rng";
     pub const NUM_QUEUES: usize = 1;
-    const QUEUE_SIZE: u16 = 256;
+    pub const QUEUE_SIZE: u16 = 256;
     pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
 
     pub mod uapi {

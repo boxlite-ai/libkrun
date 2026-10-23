@@ -80,7 +80,7 @@ fn meta() -> NicMeta {
         | (1u64 << VIRTIO_RING_F_EVENT_IDX);
     NicMeta {
         mmio_addr: NIC_MMIO_ADDR,
-        mmio_len: blk::MMIO_LEN,
+        mmio_len: super::wiring::MMIO_LEN,
         irq: NIC_IRQ,
         device_id: "net0".to_string(),
         transport: MmioTransportState {
@@ -112,7 +112,7 @@ fn disk_irqs(irqs: &[u32]) -> Vec<DiskMeta> {
     irqs.iter()
         .map(|irq| {
             let base = serde_json::json!({
-                "mmio_addr": blk::MMIO_BASE, "mmio_len": blk::MMIO_LEN, "irq": irq,
+                "mmio_addr": blk::MMIO_BASE, "mmio_len": super::wiring::MMIO_LEN, "irq": irq,
                 "device_id": "blk", "config": [], "image_id": [], "read_only": false,
                 "cache_writeback": false, "disk_bytes": 512,
                 "transport": serde_json::to_value(&meta().transport).unwrap(),

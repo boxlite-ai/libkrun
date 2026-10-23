@@ -41,7 +41,7 @@ impl std::fmt::Display for WorkerControlError {
 /// through `control_fd` and wait for its answer. The bounded command queue
 /// is part of the deadline: a plain send() could block forever before any
 /// reply wait starts. A timed-out or dropped reply never blocks the worker.
-pub(crate) fn request<C, T>(
+pub fn request<C, T>(
     commands: &Sender<C>,
     control_fd: &EventFd,
     timeout: Duration,

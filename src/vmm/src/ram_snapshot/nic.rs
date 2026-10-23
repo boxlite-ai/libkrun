@@ -17,14 +17,15 @@ use devices::virtio::net::{NetQueueStates, NUM_QUEUES, QUEUE_SIZE};
 use devices::virtio::persist::{MmioTransportState, VirtioDeviceState};
 use devices::virtio::{MmioTransport, Net, Queue, VirtioDevice, TYPE_NET};
 use serde::{Deserialize, Serialize};
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::GuestMemoryMmap;
 
 use super::blk::{self, DiskMeta};
+use super::wiring::{self, MMIO_LEN};
 use super::{Error, RamSnapshotVm, Region, Result};
 
 /// The NIC sits right after the eight-slot disk window and takes its last
 /// GSI, so at most seven disks coexist with it.
-pub(super) const NIC_MMIO_ADDR: u64 = blk::MMIO_BASE + blk::MAX_DISKS as u64 * blk::MMIO_LEN;
+pub(super) const NIC_MMIO_ADDR: u64 = blk::MMIO_BASE + blk::MAX_DISKS as u64 * MMIO_LEN;
 pub(super) const NIC_IRQ: u32 = blk::IRQ_LAST;
 pub(super) const MAX_DISKS_WITH_NIC: usize = blk::MAX_DISKS - 1;
 const TX: usize = 1;
@@ -72,7 +73,12 @@ pub(super) fn expected_alias_clones(vm: &RamSnapshotVm) -> usize {
     })
 }
 
-fn check_socket_path(path: &Path) -> Result<()> {
+/// The NIC's (transport, MMIO address, GSI) for the shared wiring.
+pub(super) fn slot(nic: &NicDevice) -> (&Arc<Mutex<MmioTransport>>, u64, u32) {
+    (&nic.transport, NIC_MMIO_ADDR, NIC_IRQ)
+}
+
+pub(super) fn check_socket_path(path: &Path) -> Result<()> {
     let length = path.as_os_str().len();
     if length == 0 || length > MAX_SOCKET_PATH {
         return Err(Error::Invalid(
@@ -144,16 +150,8 @@ pub(super) fn attach_net(
     check_socket_path(socket_path)?;
     let attach = (|| -> Result<NicDevice> {
         vm.probe_ram_aliases(vm.expected_device_clones())?;
-        for region in vm.memory.iter() {
-            let start = region.start_addr().raw_value();
-            if NIC_MMIO_ADDR < start + region.len() && start < NIC_MMIO_ADDR + blk::MMIO_LEN {
-                return Err(Error::Invalid(
-                    "internal NIC MMIO window overlaps guest RAM",
-                ));
-            }
-        }
         let (net, transport) = new_device(vm, "net0".to_string(), socket_path, mac, features)?;
-        blk::register_device(vm, &transport, NIC_MMIO_ADDR, NIC_IRQ)?;
+        wiring::register_device(vm, &transport, NIC_MMIO_ADDR, NIC_IRQ)?;
         Ok(NicDevice {
             net,
             transport,
@@ -187,7 +185,7 @@ pub(super) fn validate_nic_metadata(
         ));
     }
     if nic.mmio_addr != NIC_MMIO_ADDR
-        || nic.mmio_len != blk::MMIO_LEN
+        || nic.mmio_len != MMIO_LEN
         || nic.irq != NIC_IRQ
         || nic.device_id.is_empty()
         || nic.device_id.len() > 128
@@ -196,11 +194,7 @@ pub(super) fn validate_nic_metadata(
             "NIC MMIO/IRQ is outside its internal slot or the identity is invalid",
         ));
     }
-    for region in regions {
-        if nic.mmio_addr < region.gpa + region.len && region.gpa < nic.mmio_addr + nic.mmio_len {
-            return Err(Error::Invalid("NIC MMIO range overlaps guest RAM"));
-        }
-    }
+    wiring::check_window(nic.mmio_addr, regions.iter().map(|r| (r.gpa, r.len)))?;
     if nic.features & !FEATURE_MASK != 0
         || nic.device.avail_features != offered_features(nic.features)
     {
@@ -261,22 +255,6 @@ pub(super) fn freeze(vm: &RamSnapshotVm) -> Result<Option<NetQueueStates>> {
         .map_err(|e| Error::Full(format!("freeze NIC: {e}")))
 }
 
-/// Deassign and drain the NIC irqfd (see `blk::drain_disk_irqfds`);
-/// `drained` is set as soon as the deassign succeeded.
-pub(super) fn drain_irqfd(vm: &RamSnapshotVm, drained: &mut bool) -> Result<()> {
-    let Some(nic) = &vm.nic else {
-        return Ok(());
-    };
-    let transport = nic.transport.lock().unwrap();
-    vm.vm
-        .fd()
-        .unregister_irqfd(transport.interrupt_evt(), NIC_IRQ)
-        .map_err(|e| Error::Full(format!("deassign NIC irqfd: {e}")))?;
-    *drained = true;
-    blk::drain_eventfd_count(transport.interrupt_evt());
-    Ok(())
-}
-
 /// Capture the frozen, drained NIC. Worker-private buffers (deferred RX
 /// frame, partial backend frames, unfinished TX writes) are deliberately
 /// not captured.
@@ -297,7 +275,7 @@ pub(super) fn capture(
     };
     let meta = NicMeta {
         mmio_addr: NIC_MMIO_ADDR,
-        mmio_len: blk::MMIO_LEN,
+        mmio_len: MMIO_LEN,
         irq: NIC_IRQ,
         device_id: net.id().to_string(),
         transport: transport.save_transport_state(),
@@ -315,18 +293,6 @@ pub(super) fn capture(
     validate_nic_metadata(&meta, disks, regions)?;
     validate_nic_rings(&meta, &vm.memory)?;
     Ok(Some(meta))
-}
-
-/// Reassign the NIC irqfd if a capture deassigned it.
-pub(super) fn reassign_irqfd(vm: &RamSnapshotVm, drained: bool) -> Result<()> {
-    match (&vm.nic, drained) {
-        (Some(nic), true) => vm
-            .vm
-            .fd()
-            .register_irqfd(nic.transport.lock().unwrap().interrupt_evt(), NIC_IRQ)
-            .map_err(|e| Error::Full(format!("reassign NIC irqfd: {e}"))),
-        _ => Ok(()),
-    }
 }
 
 /// Resume the NIC worker; it re-examines its backend and both queues.
@@ -391,7 +357,7 @@ pub(super) fn restore_nic(
             }
         }
     }
-    if let Err(error) = blk::register_device(vm, &transport, meta.mmio_addr, meta.irq) {
+    if let Err(error) = wiring::register_device(vm, &transport, meta.mmio_addr, meta.irq) {
         net.lock().unwrap().stop_worker();
         return Err(error);
     }

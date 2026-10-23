@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as IoRead, Write as IoWrite};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,15 +16,14 @@ use devices::virtio::block::{
 };
 use devices::virtio::persist::{MmioTransportState, QueueState, VirtioDeviceState};
 use devices::virtio::{CacheType, MmioTransport, VirtioDevice, TYPE_BLOCK};
-use kvm_ioctls::IoEventAddress;
 use serde::{Deserialize, Serialize};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::GuestMemoryMmap;
 
+use super::wiring::{self, MMIO_LEN};
 use super::{Error, RamSnapshotVm, Region, Result, CHUNK_SIZE};
 
 /// Fixed internal MMIO window for snapshot disks, above ordinary guest RAM.
 pub(super) const MMIO_BASE: u64 = 0xd000_0000;
-pub(super) const MMIO_LEN: u64 = 0x1000;
 /// Kernel-irqchip GSI space below this is reserved for legacy devices.
 pub(super) const IRQ_BASE: u32 = 16;
 pub(super) const IRQ_LAST: u32 = 23;
@@ -108,12 +106,7 @@ pub(super) fn validate_disk_metadata(disks: &[DiskMeta], regions: &[Region]) -> 
                 "disk MMIO/IRQ conflicts with another device",
             ));
         }
-        for region in regions {
-            let end = region.gpa + region.len;
-            if disk.mmio_addr < end && region.gpa < disk.mmio_addr + disk.mmio_len {
-                return Err(Error::Invalid("disk MMIO range overlaps guest RAM"));
-            }
-        }
+        wiring::check_window(disk.mmio_addr, regions.iter().map(|r| (r.gpa, r.len)))?;
         if disk.config.len() != VIRTIO_BLK_CONFIG_SIZE || disk.image_id.len() != BLK_ID_BYTES {
             return Err(Error::Invalid(
                 "disk config/identity bytes have an unsupported length",
@@ -212,16 +205,6 @@ pub(super) fn attach_disk(
         let index = vm.disks.len();
         let mmio_addr = MMIO_BASE + index as u64 * MMIO_LEN;
         let irq = IRQ_BASE + index as u32;
-        // The fixed window must never reach into guest RAM.
-        for region in vm.memory.iter() {
-            let start = region.start_addr().raw_value();
-            let end = start + region.len();
-            if mmio_addr < end && start < mmio_addr + MMIO_LEN {
-                return Err(Error::Invalid(
-                    "internal disk MMIO window overlaps guest RAM",
-                ));
-            }
-        }
         let ioapic = vm.ensure_kernel_irqchip()?;
         let cache = if writeback {
             CacheType::Writeback
@@ -251,7 +234,7 @@ pub(super) fn attach_disk(
             MmioTransport::new(vm.memory.clone(), intc, block.clone())
                 .map_err(|e| Error::Full(format!("create block transport: {e}")))?,
         ));
-        register_device(vm, &transport, mmio_addr, irq)?;
+        wiring::register_device(vm, &transport, mmio_addr, irq)?;
         Ok(BlkDevice {
             mmio_addr,
             irq,
@@ -270,66 +253,6 @@ pub(super) fn attach_disk(
             Err(error)
         }
     }
-}
-
-/// Register ioeventfd/irqfd at a fixed address and IRQ and put the transport
-/// on the bus. On failure every registration made here is rolled back.
-pub(super) fn register_device(
-    vm: &mut RamSnapshotVm,
-    transport: &Arc<Mutex<MmioTransport>>,
-    mmio_addr: u64,
-    irq: u32,
-) -> Result<()> {
-    let locked = transport.lock().unwrap();
-    let io_addr = IoEventAddress::Mmio(mmio_addr + u64::from(devices::virtio::NOTIFY_REG_OFFSET));
-    let registration = (|| -> Result<()> {
-        for (queue, queue_evt) in locked.queue_evts().iter().enumerate() {
-            vm.vm
-                .fd()
-                .register_ioevent(queue_evt, &io_addr, queue as u32)
-                .map_err(|e| Error::Full(format!("register ioeventfd: {e}")))?;
-        }
-        vm.vm
-            .fd()
-            .register_irqfd(locked.interrupt_evt(), irq)
-            .map_err(|e| Error::Full(format!("register irqfd: {e}")))?;
-        Ok(())
-    })();
-    if let Err(error) = registration {
-        rollback_registrations(vm, &locked, &io_addr, irq);
-        return Err(error);
-    }
-    drop(locked);
-    vm.bus
-        .insert(
-            Arc::clone(transport) as Arc<Mutex<dyn devices::BusDevice>>,
-            mmio_addr,
-            MMIO_LEN,
-        )
-        .map_err(|e| {
-            // Roll the registrations back so the owner holds nothing of
-            // this device.
-            let locked = transport.lock().unwrap();
-            rollback_registrations(vm, &locked, &io_addr, irq);
-            Error::Full(format!("insert disk on MMIO bus: {e:?}"))
-        })
-}
-
-/// Undo every KVM registration of one device; best effort by design. The
-/// transport is borrowed through the caller's existing guard: no relock.
-fn rollback_registrations(
-    vm: &RamSnapshotVm,
-    transport: &MmioTransport,
-    io_addr: &IoEventAddress,
-    irq: u32,
-) {
-    for (queue, queue_evt) in transport.queue_evts().iter().enumerate() {
-        let _ = vm
-            .vm
-            .fd()
-            .unregister_ioevent(queue_evt, io_addr, queue as u32);
-    }
-    let _ = vm.vm.fd().unregister_irqfd(transport.interrupt_evt(), irq);
 }
 
 /// Freeze every disk: each freeze lands after the in-flight request
@@ -367,24 +290,6 @@ pub(super) fn freeze_disks(vm: &RamSnapshotVm) -> Result<Vec<Option<QueueState>>
         frozen_queues.push(frozen_queue);
     }
     Ok(frozen_queues)
-}
-
-/// Deassign every disk irqfd and drain its count. KVM_IRQFD DEASSIGN
-/// flushes the injection workqueue before returning (Linux v6.12
-/// virt/kvm/eventfd.c contract), so the transport interrupt status includes
-/// every completed injection afterwards. `drained` records each deassigned
-/// disk even on failure, so recovery reassigns exactly those.
-pub(super) fn drain_disk_irqfds(vm: &RamSnapshotVm, drained: &mut Vec<usize>) -> Result<()> {
-    for (index, device) in vm.disks.iter().enumerate() {
-        let transport = device.transport.lock().unwrap();
-        vm.vm
-            .fd()
-            .unregister_irqfd(transport.interrupt_evt(), device.irq)
-            .map_err(|e| Error::Full(format!("deassign irqfd {index}: {e}")))?;
-        drained.push(index);
-        drain_eventfd_count(transport.interrupt_evt());
-    }
-    Ok(())
 }
 
 /// Capture every frozen, drained disk and validate the result against the
@@ -429,25 +334,6 @@ pub(super) fn capture_disks(
     validate_disk_metadata(&metas, regions)?;
     validate_disk_rings(&metas, &vm.memory)?;
     Ok(metas)
-}
-
-/// Reassign every drained irqfd; a single failure must not skip the rest.
-pub(super) fn reassign_irqfds(vm: &RamSnapshotVm, drained: &[usize]) -> Result<()> {
-    let mut first = None;
-    for index in drained {
-        let device = &vm.disks[*index];
-        let transport = device.transport.lock().unwrap();
-        if let Err(e) = vm
-            .vm
-            .fd()
-            .register_irqfd(transport.interrupt_evt(), device.irq)
-        {
-            if first.is_none() {
-                first = Some(Error::Full(format!("reassign irqfd {index}: {e}")));
-            }
-        }
-    }
-    first.map_or(Ok(()), Err)
 }
 
 /// Resume every active worker; each resume actively re-examines its queue.
@@ -649,7 +535,7 @@ pub(super) fn restore_devices(
                 }
             }
         }
-        if let Err(error) = register_device(vm, &transport, meta.mmio_addr, meta.irq) {
+        if let Err(error) = wiring::register_device(vm, &transport, meta.mmio_addr, meta.irq) {
             // Join the freshly started worker and drop the device.
             let _ = block.lock().unwrap().reset();
             return Err(error);
@@ -673,17 +559,3 @@ pub(super) fn stop_devices(vm: &RamSnapshotVm) {
 
 #[cfg(test)]
 mod tests;
-
-/// Read the current eventfd count without blocking, if any.
-pub(super) fn drain_eventfd_count(fd: &utils::eventfd::EventFd) {
-    let mut pollfd = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `pollfd` is exclusively borrowed for the duration of the call.
-    let ready = unsafe { libc::poll(&mut pollfd as *mut libc::pollfd, 1, 0) };
-    if ready > 0 && pollfd.revents & libc::POLLIN != 0 {
-        let _ = fd.read();
-    }
-}

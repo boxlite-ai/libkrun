@@ -7,8 +7,13 @@
 
 use std::collections::VecDeque;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 
 use polly::event_manager::{EventManager, Subscriber};
+use serde::{Deserialize, Serialize};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 
@@ -41,6 +46,7 @@ const IIR_RECV_BIT: u8 = 0x4;
 const LCR_DLAB_BIT: u8 = 0x80;
 
 const LSR_DATA_BIT: u8 = 0x1;
+const LSR_OVERRUN_BIT: u8 = 0x2;
 const LSR_EMPTY_BIT: u8 = 0x20;
 const LSR_IDLE_BIT: u8 = 0x40;
 
@@ -52,6 +58,13 @@ const DEFAULT_LINE_CONTROL: u8 = 0x3; // 8-bits per character
 const DEFAULT_MODEM_CONTROL: u8 = 0x8; // Auxiliary output 2
 const DEFAULT_MODEM_STATUS: u8 = 0x20 | 0x10 | 0x80; // data ready, clear to send, carrier detect
 const DEFAULT_BAUD_DIVISOR: u16 = 12; // 9600 bps
+
+/// Unread input a snapshot UART holds; further input is dropped and sets
+/// the overrun bit. Ordinary UARTs keep unbounded input.
+const SNAPSHOT_INPUT_CAP: usize = 4096;
+/// Bytes one readiness event reads from a snapshot endpoint.
+#[cfg(target_os = "linux")]
+const SNAPSHOT_READ_CHUNK: usize = 256;
 
 /// Emulates serial COM ports commonly seen on x86 I/O ports 0x3f8/0x2f8/0x3e8/0x2e8.
 ///
@@ -70,6 +83,89 @@ pub struct Serial {
     in_buffer: VecDeque<u8>,
     out: Option<Box<dyn io::Write + Send>>,
     input: Option<Box<dyn ReadableFd + Send>>,
+    #[cfg(target_os = "linux")]
+    snapshot: Option<SnapshotEndpoint>,
+}
+
+/// The guest-visible registers and unread input of a UART. Host endpoints
+/// and the dropped-output count are not part of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SerialState {
+    interrupt_enable: u8,
+    interrupt_identification: u8,
+    line_control: u8,
+    line_status: u8,
+    modem_control: u8,
+    modem_status: u8,
+    scratch: u8,
+    baud_divisor: u16,
+    unread_input: Vec<u8>,
+}
+
+impl SerialState {
+    /// Reject register values and input the emulation cannot reach.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.interrupt_enable & !IER_FIFO_BITS != 0 {
+            return Err("serial IER has unsupported bits");
+        }
+        // Either "none pending" alone or a nonempty set of THR/RECV.
+        let iir = self.interrupt_identification;
+        if iir != IIR_NONE_BIT && (iir == 0 || iir & !(IIR_THR_BIT | IIR_RECV_BIT) != 0) {
+            return Err("serial IIR is outside the interrupt state machine");
+        }
+        let known = LSR_DATA_BIT | LSR_OVERRUN_BIT | LSR_EMPTY_BIT | LSR_IDLE_BIT;
+        if self.line_status & !known != 0
+            || self.line_status & (LSR_EMPTY_BIT | LSR_IDLE_BIT) != LSR_EMPTY_BIT | LSR_IDLE_BIT
+        {
+            return Err("serial LSR has unsupported bits");
+        }
+        if self.unread_input.len() > SNAPSHOT_INPUT_CAP {
+            return Err("serial unread input exceeds its capacity");
+        }
+        if (self.line_status & LSR_DATA_BIT != 0) == self.unread_input.is_empty() {
+            return Err("serial data-ready disagrees with unread input");
+        }
+        Ok(())
+    }
+}
+
+/// The private snapshot owner's endpoint: one caller-owned nonblocking
+/// UnixStream, or none for a sink port. Output never blocks or queues: a
+/// byte the peer cannot take now is dropped and counted.
+#[cfg(target_os = "linux")]
+struct SnapshotEndpoint {
+    stream: Option<UnixStream>,
+    input_open: bool,
+    dropped_output: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl SnapshotEndpoint {
+    fn send(&mut self, byte: u8) {
+        let Some(stream) = &self.stream else { return };
+        // MSG_NOSIGNAL: a closed peer returns EPIPE instead of raising
+        // SIGPIPE. The socket is nonblocking, so a full peer returns EAGAIN.
+        // SAFETY: the buffer is one live byte and the fd is owned by `stream`.
+        let sent = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                &byte as *const u8 as *const libc::c_void,
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent != 1 {
+            self.dropped_output += 1;
+        }
+    }
+
+    fn input_fd(&self) -> Option<i32> {
+        self.stream
+            .as_ref()
+            .filter(|_| self.input_open)
+            .map(AsRawFd::as_raw_fd)
+    }
 }
 
 impl Serial {
@@ -91,7 +187,83 @@ impl Serial {
             in_buffer: VecDeque::new(),
             out,
             input,
+            #[cfg(target_os = "linux")]
+            snapshot: None,
         }
+    }
+
+    /// Constructs a UART for the private snapshot owner. `stream` carries
+    /// both directions and must already be nonblocking: the caller may share
+    /// its file status flags, so they are checked, never changed.
+    #[cfg(target_os = "linux")]
+    pub fn new_snapshot(interrupt_evt: EventFd, stream: Option<UnixStream>) -> io::Result<Serial> {
+        if let Some(stream) = &stream {
+            Self::check_snapshot_endpoint(stream)?;
+        }
+        let mut serial = Self::new(interrupt_evt, None, None);
+        serial.snapshot = Some(SnapshotEndpoint {
+            input_open: stream.is_some(),
+            stream,
+            dropped_output: 0,
+        });
+        Ok(serial)
+    }
+
+    /// Fails unless `stream` is in nonblocking mode.
+    #[cfg(target_os = "linux")]
+    pub fn check_snapshot_endpoint(stream: &UnixStream) -> io::Result<()> {
+        // SAFETY: F_GETFL only reads the flags of an fd owned by `stream`.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot serial endpoint must already be nonblocking",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Output bytes a snapshot UART dropped because its peer was full or
+    /// gone; zero for other UARTs and for a newly restored one.
+    pub fn dropped_output_bytes(&self) -> u64 {
+        #[cfg(target_os = "linux")]
+        if let Some(endpoint) = &self.snapshot {
+            return endpoint.dropped_output;
+        }
+        0
+    }
+
+    pub fn snapshot_state(&self) -> SerialState {
+        SerialState {
+            interrupt_enable: self.interrupt_enable,
+            interrupt_identification: self.interrupt_identification,
+            line_control: self.line_control,
+            line_status: self.line_status,
+            modem_control: self.modem_control,
+            modem_status: self.modem_status,
+            scratch: self.scratch,
+            baud_divisor: self.baud_divisor,
+            unread_input: self.in_buffer.iter().copied().collect(),
+        }
+    }
+
+    /// Load a validated state; the endpoints and dropped count stay this
+    /// UART's own.
+    pub fn restore_snapshot_state(&mut self, state: &SerialState) -> Result<(), &'static str> {
+        state.validate()?;
+        self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_identification = state.interrupt_identification;
+        self.line_control = state.line_control;
+        self.line_status = state.line_status;
+        self.modem_control = state.modem_control;
+        self.modem_status = state.modem_status;
+        self.scratch = state.scratch;
+        self.baud_divisor = state.baud_divisor;
+        self.in_buffer = state.unread_input.iter().copied().collect();
+        Ok(())
     }
 
     /// Constructs a Serial port ready for input and output.
@@ -187,6 +359,13 @@ impl Serial {
                         self.recv_data()?;
                     }
                 } else {
+                    // A snapshot UART completes the transmit even when the
+                    // byte is dropped, so the guest never waits on the host.
+                    #[cfg(target_os = "linux")]
+                    if let Some(endpoint) = self.snapshot.as_mut() {
+                        endpoint.send(value);
+                        return self.thr_empty();
+                    }
                     if let Some(out) = self.out.as_mut() {
                         out.write_all(&[value])?;
                         out.flush()?;
@@ -223,7 +402,12 @@ impl Serial {
             }
             LCR => self.line_control,
             MCR => self.modem_control,
-            LSR => self.line_status,
+            LSR => {
+                // Reading LSR clears the overrun error, as on a 16550.
+                let status = self.line_status;
+                self.line_status &= !LSR_OVERRUN_BIT;
+                status
+            }
             MSR => self.modem_status,
             SCR => self.scratch,
             _ => 0,
@@ -231,11 +415,94 @@ impl Serial {
     }
 
     fn raw_input(&mut self, data: &[u8]) -> io::Result<()> {
-        if !self.is_loop() {
-            self.in_buffer.extend(data);
-            self.recv_data()?;
+        // An empty read is not data: it must not set data-ready.
+        if self.is_loop() || data.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let accepted = if self.is_snapshot() {
+            data.len()
+                .min(SNAPSHOT_INPUT_CAP.saturating_sub(self.in_buffer.len()))
+        } else {
+            data.len()
+        };
+        if accepted < data.len() {
+            self.line_status |= LSR_OVERRUN_BIT;
+        }
+        if accepted == 0 {
+            return Ok(());
+        }
+        self.in_buffer.extend(&data[..accepted]);
+        self.recv_data()
+    }
+
+    fn is_snapshot(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.snapshot.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// One bounded read per readiness event. On hang-up, EOF or a read
+    /// error, remaining data is drained up to one byte past the input
+    /// capacity (so a dropped tail still sets the overrun bit) and the input
+    /// is unregistered, so a closed peer can neither spin the event loop nor
+    /// fake data-ready.
+    #[cfg(target_os = "linux")]
+    fn process_snapshot_input(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        let Some(fd) = self.snapshot.as_ref().and_then(SnapshotEndpoint::input_fd) else {
+            return;
+        };
+        if event.fd() != fd {
+            return;
+        }
+        let hang_up = event
+            .event_set()
+            .intersects(EventSet::HANG_UP | EventSet::READ_HANG_UP | EventSet::ERROR);
+        let budget = if hang_up {
+            SNAPSHOT_INPUT_CAP + 1
+        } else {
+            SNAPSHOT_READ_CHUNK
+        };
+        let mut closed = false;
+        let mut drained = 0;
+        let mut chunk = [0u8; SNAPSHOT_READ_CHUNK];
+        while drained < budget {
+            // Never read past the budget, so a hang-up drains at most one
+            // byte beyond the capacity.
+            let len = (budget - drained).min(SNAPSHOT_READ_CHUNK);
+            let stream = self.snapshot.as_mut().and_then(|e| e.stream.as_mut());
+            let read = match stream {
+                Some(stream) => io::Read::read(stream, &mut chunk[..len]),
+                None => return,
+            };
+            match read {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(count) => {
+                    drained += count;
+                    self.raw_input(&chunk[..count])
+                        .unwrap_or_else(|e| warn!("Serial error on input: {e}"));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // Level-triggered epoll reports the fd again.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+                Err(e) => {
+                    warn!("snapshot serial input failed: {e}");
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if closed || hang_up {
+            if let Err(e) = event_manager.unregister(fd) {
+                warn!("snapshot serial input unregister failed: {e:?}");
+            }
+            if let Some(endpoint) = self.snapshot.as_mut() {
+                endpoint.input_open = false;
+            }
+        }
     }
 }
 
@@ -260,7 +527,11 @@ impl BusDevice for Serial {
 
 impl Subscriber for Serial {
     /// Handle a read event (EPOLLIN) on the serial input fd.
-    fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
+    fn process(&mut self, event: &EpollEvent, _event_manager: &mut EventManager) {
+        #[cfg(target_os = "linux")]
+        if self.snapshot.is_some() {
+            return self.process_snapshot_input(event, _event_manager);
+        }
         let source = event.fd();
         let event_set = event.event_set();
 
@@ -291,6 +562,14 @@ impl Subscriber for Serial {
     /// Initial registration of pollable objects.
     /// If serial input is present, register the serial input FD as readable.
     fn interest_list(&self) -> Vec<EpollEvent> {
+        #[cfg(target_os = "linux")]
+        if let Some(endpoint) = &self.snapshot {
+            return endpoint
+                .input_fd()
+                .map(|fd| EpollEvent::new(EventSet::IN, fd as u64))
+                .into_iter()
+                .collect();
+        }
         match &self.input {
             Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
             None => vec![],
@@ -550,6 +829,37 @@ mod tests {
         assert_eq!(data[0], b'c');
     }
 
+    /// An empty input read (EOF) is not data: data-ready stays clear and
+    /// no receive interrupt is raised.
+    #[test]
+    fn test_serial_empty_input_is_not_data_ready() {
+        let intr_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let serial_in_out = SharedBuffer::new();
+        let mut serial = Serial::new_in_out(
+            intr_evt.try_clone().unwrap(),
+            Box::new(serial_in_out.clone()),
+            Box::new(serial_in_out.clone()),
+        );
+        serial.write(0, u64::from(IER), &[IER_RECV_BIT]);
+        serial_in_out
+            .internal
+            .lock()
+            .unwrap()
+            .evfd
+            .write(1)
+            .unwrap();
+
+        let mut evmgr = EventManager::new().unwrap();
+        let serial = Arc::new(Mutex::new(serial));
+        evmgr.add_subscriber(serial.clone()).unwrap();
+        assert_eq!(evmgr.run_with_timeout(50).unwrap(), 1);
+
+        let mut data = [0u8];
+        serial.lock().unwrap().read(0, u64::from(LSR), &mut data);
+        assert_eq!(data[0] & LSR_DATA_BIT, 0, "EOF reported as data");
+        assert!(intr_evt.read().is_err(), "EOF raised an interrupt");
+    }
+
     #[test]
     fn test_serial_scratch() {
         let mut serial = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
@@ -559,5 +869,167 @@ mod tests {
         let mut data = [0u8];
         serial.read(0, u64::from(SCR), &mut data[..]);
         assert_eq!(data[0], 0x12_u8);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod snapshot {
+        use super::*;
+        use std::os::unix::net::UnixStream;
+
+        fn pair() -> (UnixStream, UnixStream) {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            ours.set_nonblocking(true).unwrap();
+            (ours, theirs)
+        }
+
+        fn lsr(serial: &mut Serial) -> u8 {
+            let mut data = [0u8];
+            serial.read(0, u64::from(LSR), &mut data);
+            data[0]
+        }
+
+        #[test]
+        fn snapshot_serial_rejects_blocking_endpoint_without_changing_it() {
+            let (blocking, _peer) = UnixStream::pair().unwrap();
+            assert!(Serial::check_snapshot_endpoint(&blocking).is_err());
+            let flags = unsafe { libc::fcntl(blocking.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(flags & libc::O_NONBLOCK, 0, "check changed the flags");
+            let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+            assert!(Serial::new_snapshot(evt, Some(blocking)).is_err());
+        }
+
+        /// A full or closed peer drops the byte and counts it, but the guest
+        /// still sees the transmit complete with its THR interrupt.
+        #[test]
+        fn snapshot_serial_drops_output_on_backpressure_and_still_raises_thre() {
+            let (ours, theirs) = pair();
+            let filler = ours.try_clone().unwrap();
+            let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+            let mut serial = Serial::new_snapshot(evt.try_clone().unwrap(), Some(ours)).unwrap();
+            serial.write(0, u64::from(IER), &[IER_THR_BIT]);
+
+            serial.write(0, u64::from(DATA), b"a");
+            assert_eq!(serial.dropped_output_bytes(), 0);
+            assert_eq!(evt.read().unwrap(), 1);
+
+            let chunk = [0u8; 4096];
+            while (&filler).write(&chunk).is_ok() {}
+            serial.write(0, u64::from(DATA), b"b");
+            assert_eq!(serial.dropped_output_bytes(), 1, "full peer did not drop");
+            assert_eq!(evt.read().unwrap(), 1, "THR interrupt missing on drop");
+            let mut iir = [0u8];
+            serial.read(0, u64::from(IIR), &mut iir);
+            assert_ne!(iir[0] & IIR_THR_BIT, 0);
+
+            drop(theirs);
+            serial.write(0, u64::from(DATA), b"c");
+            assert_eq!(serial.dropped_output_bytes(), 2, "closed peer did not drop");
+            assert_eq!(evt.read().unwrap(), 1);
+        }
+
+        /// Snapshot input stops at 4 KiB and sets the overrun bit, which an
+        /// LSR read clears; an ordinary UART stays uncapped.
+        #[test]
+        fn snapshot_serial_input_cap_sets_overrun() {
+            let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+            let mut serial = Serial::new_snapshot(evt, None).unwrap();
+            serial.raw_input(&[7; SNAPSHOT_INPUT_CAP + 10]).unwrap();
+            assert_eq!(serial.in_buffer.len(), SNAPSHOT_INPUT_CAP);
+            assert_eq!(
+                lsr(&mut serial) & (LSR_DATA_BIT | LSR_OVERRUN_BIT),
+                LSR_DATA_BIT | LSR_OVERRUN_BIT
+            );
+            assert_eq!(lsr(&mut serial) & LSR_OVERRUN_BIT, 0);
+
+            let mut ordinary =
+                Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+            ordinary.raw_input(&[7; SNAPSHOT_INPUT_CAP + 10]).unwrap();
+            assert_eq!(ordinary.in_buffer.len(), SNAPSHOT_INPUT_CAP + 10);
+        }
+
+        /// A peer that writes and closes: its data is drained up to the
+        /// input cap, a dropped tail sets overrun, the input is
+        /// unregistered, and the closed fd neither spins nor fakes data.
+        #[test]
+        fn snapshot_serial_eof_drains_and_unregisters_input() {
+            for sent_len in [2, 0, SNAPSHOT_INPUT_CAP, SNAPSHOT_INPUT_CAP + 10] {
+                let sent: Vec<u8> = (0..sent_len).map(|i| i as u8).collect();
+                let (ours, mut theirs) = pair();
+                let fd = ours.as_raw_fd();
+                let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+                let serial = Arc::new(Mutex::new(
+                    Serial::new_snapshot(evt.try_clone().unwrap(), Some(ours)).unwrap(),
+                ));
+                serial
+                    .lock()
+                    .unwrap()
+                    .write(0, u64::from(IER), &[IER_RECV_BIT]);
+                theirs.write_all(&sent).unwrap();
+                drop(theirs);
+
+                let mut evmgr = EventManager::new().unwrap();
+                evmgr.add_subscriber(serial.clone()).unwrap();
+                assert_eq!(evmgr.run_with_timeout(1000).unwrap(), 1);
+                assert!(evmgr.subscriber(fd).is_err(), "input still registered");
+                assert!(serial.lock().unwrap().interest_list().is_empty());
+                assert_eq!(evmgr.run_with_timeout(0).unwrap(), 0, "closed fd spins");
+
+                let mut serial = serial.lock().unwrap();
+                let status = lsr(&mut serial);
+                assert_eq!(status & LSR_DATA_BIT != 0, sent_len > 0);
+                assert_eq!(
+                    status & LSR_OVERRUN_BIT != 0,
+                    sent_len > SNAPSHOT_INPUT_CAP,
+                    "overrun disagrees with a dropped tail of {sent_len} bytes"
+                );
+                assert_eq!(evt.read().is_ok(), sent_len > 0);
+                assert_eq!(serial.in_buffer.len(), sent_len.min(SNAPSHOT_INPUT_CAP));
+                for &byte in &sent[..sent_len.min(SNAPSHOT_INPUT_CAP)] {
+                    let mut data = [0u8];
+                    serial.read(0, u64::from(DATA), &mut data);
+                    assert_eq!(data[0], byte);
+                }
+                assert_eq!(lsr(&mut serial) & LSR_DATA_BIT, 0);
+            }
+        }
+
+        #[test]
+        fn snapshot_serial_state_round_trips_registers_and_unread_input() {
+            let mut source =
+                Serial::new_snapshot(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(), None)
+                    .unwrap();
+            source.write(0, u64::from(LCR), &[LCR_DLAB_BIT]);
+            source.write(0, u64::from(DLAB_LOW), &[0x34]);
+            source.write(0, u64::from(DLAB_HIGH), &[0x12]);
+            source.write(0, u64::from(LCR), &[0x03]);
+            source.write(0, u64::from(IER), &[IER_RECV_BIT | IER_THR_BIT]);
+            source.write(0, u64::from(SCR), &[0x5a]);
+            source.raw_input(b"xyz").unwrap();
+            let mut data = [0u8];
+            source.read(0, u64::from(DATA), &mut data);
+            let state = source.snapshot_state();
+            state.validate().unwrap();
+
+            let (ours, _theirs) = pair();
+            let mut target = Serial::new_snapshot(
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+                Some(ours),
+            )
+            .unwrap();
+            target.restore_snapshot_state(&state).unwrap();
+            assert_eq!(target.snapshot_state(), state);
+            assert_eq!(target.dropped_output_bytes(), 0);
+            for expected in *b"yz" {
+                target.read(0, u64::from(DATA), &mut data);
+                assert_eq!(data[0], expected);
+            }
+
+            let mut invalid = state.clone();
+            invalid.unread_input.clear();
+            assert!(target.restore_snapshot_state(&invalid).is_err());
+            let mut invalid = state;
+            invalid.interrupt_identification = 0x8;
+            assert!(invalid.validate().is_err());
+        }
     }
 }

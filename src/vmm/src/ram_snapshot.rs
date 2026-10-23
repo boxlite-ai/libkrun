@@ -6,12 +6,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use devices::virtio::MmioTransport;
 
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 use crate::device_manager::shm::ShmRegion;
 use crate::vstate::{KvmContext, Vcpu, VcpuEvent, VcpuHandle, VcpuResponse, Vm};
+
+pub(crate) use legacy::SerialEndpoints;
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
 const VERSION: u32 = 1;
@@ -21,13 +26,17 @@ const PAGE_SIZE: u64 = 4096;
 const CHUNK_SIZE: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
+mod event_devices;
+mod events;
 mod full;
+mod legacy;
+mod wiring;
 
 #[cfg(feature = "blk")]
 pub(crate) mod blk;
 
-/// The internal NIC reuses the block device plumbing (MMIO window, irqfd
-/// drain, import guard), so it needs both features.
+/// The internal NIC reuses the block device window and import guard, so it
+/// needs both features.
 #[cfg(all(feature = "blk", feature = "net"))]
 pub(crate) mod nic;
 
@@ -397,6 +406,22 @@ impl Control {
     }
 }
 
+/// Target resources a full restore needs. Images never name host paths or
+/// descriptors, so each device present in an image takes its new resource
+/// from here; a resource without its device, or a device without its
+/// resource, is rejected before anything is created.
+#[derive(Default)]
+pub(crate) struct RestoreResources {
+    /// New directory for the imported disk segments; created exclusively.
+    pub(crate) disk_dir: Option<PathBuf>,
+    /// Freshly started UnixStream backend for the NIC.
+    pub(crate) nic_socket: Option<PathBuf>,
+    /// Fresh endpoints of the four legacy serial ports (COM1–COM4), in
+    /// port order; each must already be nonblocking, and a port without one
+    /// discards output and reads no input.
+    pub(crate) serial: Option<SerialEndpoints>,
+}
+
 /// Owns the minimal VM. No mapping, VM fd, or vCPU handle escapes this owner.
 pub(crate) struct RamSnapshotVm {
     handles: Vec<VcpuHandle>,
@@ -407,14 +432,20 @@ pub(crate) struct RamSnapshotVm {
     max_slots: usize,
     irqchip_ready: bool,
     paused: bool,
-    #[cfg(feature = "blk")]
     bus: devices::Bus,
+    /// Port-I/O bus: empty unless the legacy devices are attached.
+    io_bus: devices::Bus,
+    legacy: Option<legacy::Legacy>,
+    exit: Arc<events::Exit>,
     #[cfg(feature = "blk")]
     disks: Vec<blk::BlkDevice>,
     #[cfg(feature = "blk")]
     imported: Option<blk::ImportedDir>,
     #[cfg(all(feature = "blk", feature = "net"))]
     nic: Option<nic::NicDevice>,
+    rng: Option<events::EventDevice<devices::virtio::Rng>>,
+    balloon: Option<events::EventDevice<devices::virtio::Balloon>>,
+    events: Option<events::EventThread>,
 }
 
 impl RamSnapshotVm {
@@ -439,14 +470,19 @@ impl RamSnapshotVm {
             max_slots: kvm.max_memslots(),
             irqchip_ready: false,
             paused: true,
-            #[cfg(feature = "blk")]
             bus: devices::Bus::new(),
+            io_bus: devices::Bus::new(),
+            legacy: None,
+            exit: events::Exit::new()?,
             #[cfg(feature = "blk")]
             disks: Vec::new(),
             #[cfg(feature = "blk")]
             imported: None,
             #[cfg(all(feature = "blk", feature = "net"))]
             nic: None,
+            rng: None,
+            balloon: None,
+            events: None,
         })
     }
 
@@ -463,11 +499,13 @@ impl RamSnapshotVm {
                 "RAM save would resume a restored paused full VM",
             ));
         }
-        #[cfg(feature = "blk")]
         if self.has_devices() {
             return Err(Error::Invalid(
                 "RAM-only save is not a consistent cut for attached devices; use save_full",
             ));
+        }
+        if self.exit.requested() {
+            return Err(Error::Invalid("the guest requested exit"));
         }
         self.control.save(
             path,
@@ -501,14 +539,59 @@ impl RamSnapshotVm {
         nic::attach_net(self, socket_path, mac, features)
     }
 
-    /// Whether any userspace device (disk or NIC) is attached.
-    #[cfg(feature = "blk")]
-    pub(super) fn has_devices(&self) -> bool {
-        #[cfg(feature = "net")]
-        if self.nic.is_some() {
-            return true;
-        }
-        !self.disks.is_empty()
+    /// Attach the internal virtio RNG before vCPUs start.
+    pub(crate) fn attach_rng(&mut self) -> Result<()> {
+        event_devices::attach_rng(self)
+    }
+
+    /// Attach the internal virtio balloon (free page reporting) before
+    /// vCPUs start.
+    pub(crate) fn attach_balloon(&mut self) -> Result<()> {
+        event_devices::attach_balloon(self)
+    }
+
+    /// Attach COM1–COM4, CMOS and the i8042 before vCPUs start. Each
+    /// endpoint must already be nonblocking; its flags are never changed.
+    pub(crate) fn attach_legacy(&mut self, serial: SerialEndpoints) -> Result<()> {
+        legacy::attach(self, serial)
+    }
+
+    /// Output bytes each UART dropped because its endpoint was full or
+    /// closed; a restored owner starts at zero.
+    pub(crate) fn serial_dropped_output_bytes(&self) -> Option<[u64; 4]> {
+        self.legacy
+            .as_ref()
+            .map(legacy::Legacy::dropped_output_bytes)
+    }
+
+    /// Whether any userspace device is attached.
+    fn has_devices(&self) -> bool {
+        !self.mmio_devices().is_empty() || self.legacy.is_some()
+    }
+
+    /// Every attached MMIO device as (transport, MMIO address, GSI), in the
+    /// fixed order disks, NIC, RNG, balloon.
+    pub(super) fn mmio_devices(&self) -> Vec<(&Arc<Mutex<MmioTransport>>, u64, u32)> {
+        let mut devices = Vec::new();
+        #[cfg(feature = "blk")]
+        devices.extend(
+            self.disks
+                .iter()
+                .map(|disk| (&disk.transport, disk.mmio_addr, disk.irq)),
+        );
+        #[cfg(all(feature = "blk", feature = "net"))]
+        devices.extend(self.nic.iter().map(nic::slot));
+        devices.extend(
+            self.rng
+                .iter()
+                .map(|rng| (&rng.transport, rng.mmio_addr, rng.irq)),
+        );
+        devices.extend(
+            self.balloon
+                .iter()
+                .map(|balloon| (&balloon.transport, balloon.mmio_addr, balloon.irq)),
+        );
+        devices
     }
 
     /// Disk slots left by the internal NIC, which takes the last GSI.
@@ -522,27 +605,86 @@ impl RamSnapshotVm {
     }
 
     /// Mapping clones every attached device legitimately holds.
-    #[cfg(feature = "blk")]
     pub(super) fn expected_device_clones(&self) -> usize {
-        #[cfg(feature = "net")]
+        #[cfg(feature = "blk")]
+        let disks = blk::expected_alias_clones(self);
+        #[cfg(not(feature = "blk"))]
+        let disks = 0;
+        #[cfg(all(feature = "blk", feature = "net"))]
         let nic = nic::expected_alias_clones(self);
-        #[cfg(not(feature = "net"))]
+        #[cfg(not(all(feature = "blk", feature = "net")))]
         let nic = 0;
-        blk::expected_alias_clones(self) + nic
+        disks + nic + event_devices::expected_alias_clones(self)
     }
 
-    /// Stop and join every device worker (disks and NIC).
-    #[cfg(feature = "blk")]
-    pub(super) fn stop_devices(&self) {
+    /// Start the event thread: the exit watch, plus the attached RNG,
+    /// balloon and UART input.
+    fn start_event_thread(&mut self, start: events::Start) -> Result<()> {
+        let devices = events::Devices {
+            exit: self.exit.clone(),
+            rng: self.rng.as_ref().map(|rng| rng.device.clone()),
+            balloon: self.balloon.as_ref().map(|balloon| balloon.device.clone()),
+            serials: self
+                .legacy
+                .as_ref()
+                .map_or_else(Vec::new, legacy::Legacy::serials),
+        };
+        self.events = Some(events::EventThread::spawn(devices, start)?);
+        Ok(())
+    }
+
+    /// Create `count` paused vCPU threads on the owner's buses and exit
+    /// eventfd, then arm the event thread with their stop handles before
+    /// any of them first runs. The buses must be complete: a `Bus` clone is
+    /// a snapshot, not a live view.
+    fn spawn_vcpus(
+        &mut self,
+        count: u8,
+        mut configure: impl FnMut(&mut Vcpu) -> Result<()>,
+    ) -> Result<()> {
+        Vcpu::register_kick_signal_handler();
+        for id in 0..count {
+            let mut cpu = Vcpu::new_x86_64(
+                id,
+                self.vm.fd(),
+                self.vm.supported_cpuid().clone(),
+                self.vm.supported_msrs().clone(),
+                self.io_bus.clone(),
+                self.exit.notifier()?,
+            )
+            .map_err(Error::State)?;
+            cpu.set_mmio_bus(self.bus.clone());
+            configure(&mut cpu)?;
+            self.handles
+                .push(cpu.start_threaded().map_err(Error::State)?);
+        }
+        let stops = self.handles.iter().map(VcpuHandle::stop_handle).collect();
+        self.events
+            .as_ref()
+            .ok_or(Error::Invalid("the event thread is not running"))?
+            .arm(stops)
+    }
+
+    /// Stop every thread: the event thread first (it holds vCPU stop handles
+    /// whose pthread IDs are valid only until the vCPUs are joined), then
+    /// the vCPUs (they could still touch the devices), then the disk and NIC
+    /// workers, which hold guest RAM, the disk images and the NIC backend
+    /// connection. Every startup, restore and resume failure ends here.
+    fn stop_threads(&mut self) {
+        if let Some(events) = &mut self.events {
+            events.stop();
+        }
+        for handle in &mut self.handles {
+            handle.finish();
+        }
+        #[cfg(feature = "blk")]
         blk::stop_devices(self);
-        #[cfg(feature = "net")]
+        #[cfg(all(feature = "blk", feature = "net"))]
         nic::stop(self);
     }
 
     /// The stage-2 RAM alias probe, parameterized by the clones the owner's
-    /// own devices legitimately hold (transport plus, once activated, the
-    /// device state and the worker). External aliases always fail.
-    #[cfg(feature = "blk")]
+    /// own devices legitimately hold. External aliases always fail.
     pub(super) fn probe_ram_aliases(&self, expected_device_clones: usize) -> Result<()> {
         for region in self.memory.iter() {
             // remove_region returns a cloned collection plus the removed Arc;
@@ -563,7 +705,6 @@ impl RamSnapshotVm {
 
     /// Create the kernel irqchip/PIT once; later callers get the empty
     /// userspace stub that only writes the interrupt eventfd.
-    #[cfg(feature = "blk")]
     pub(super) fn ensure_kernel_irqchip(&mut self) -> Result<devices::legacy::KvmIoapic> {
         if self.irqchip_ready {
             return Ok(devices::legacy::KvmIoapic {});
@@ -583,35 +724,16 @@ impl RamSnapshotVm {
             return Err(Error::Invalid("invalid minimal vCPU count/state"));
         }
         self.control.unusable = true;
-        Vcpu::register_kick_signal_handler();
         let result = (|| {
             self.setup_irqchip()?;
-            for id in 0..count {
-                let exit_evt = utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK)?;
-                let mut cpu = Vcpu::new_x86_64(
-                    id,
-                    self.vm.fd(),
-                    self.vm.supported_cpuid().clone(),
-                    self.vm.supported_msrs().clone(),
-                    devices::Bus::new(),
-                    exit_evt,
-                )
-                .map_err(Error::State)?;
-                // The devices live on the MMIO bus, not the port-I/O bus;
-                // a Bus clone snapshots the device map, so the disks must
-                // already be attached here.
-                #[cfg(feature = "blk")]
-                cpu.set_mmio_bus(self.bus.clone());
-                cpu.configure_minimal(entry, count).map_err(Error::State)?;
-                self.handles
-                    .push(cpu.start_threaded().map_err(Error::State)?);
-            }
+            self.start_event_thread(events::Start::Running)?;
+            self.spawn_vcpus(count, |cpu| {
+                cpu.configure_minimal(entry, count).map_err(Error::State)
+            })?;
             Control::transition(&self.handles, false, CONTROL_TIMEOUT)
         })();
         if result.is_err() {
-            for handle in &mut self.handles {
-                handle.finish();
-            }
+            self.stop_threads();
             self.handles.clear();
         } else {
             self.control.unusable = false;
@@ -623,15 +745,9 @@ impl RamSnapshotVm {
 
 impl Drop for RamSnapshotVm {
     fn drop(&mut self) {
-        // vCPUs join first: a running CPU could otherwise still touch the
-        // devices while they stop. Workers join next; they hold guest RAM,
-        // the disk images and the NIC backend connection. The imported guard
-        // removes only the files it created, after every thread has exited.
-        for handle in &mut self.handles {
-            handle.finish();
-        }
-        #[cfg(feature = "blk")]
-        self.stop_devices();
+        // The imported guard removes only the files it created, after every
+        // thread has exited.
+        self.stop_threads();
         #[cfg(feature = "blk")]
         drop(self.imported.take());
     }

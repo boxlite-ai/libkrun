@@ -1750,6 +1750,46 @@ impl VcpuHandle {
             let _ = thread.join();
         }
     }
+
+    /// Whether the vCPU thread has returned.
+    #[cfg(test)]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.vcpu_thread
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    /// A handle that stops this vCPU from another thread. The join stays
+    /// with this handle.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    pub(crate) fn stop_handle(&self) -> VcpuStop {
+        VcpuStop {
+            event_sender: self.event_sender.clone(),
+            // Safe to unwrap since constructor make this 'Some'.
+            thread: self.vcpu_thread.as_ref().unwrap().pthread_handle(),
+        }
+    }
+}
+
+/// Stops one vCPU thread without owning its `JoinHandle`. Whoever holds it
+/// must drop it before the vCPU thread is joined: afterwards the pthread ID
+/// may name another thread.
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+pub(crate) struct VcpuStop {
+    event_sender: Sender<VcpuEvent>,
+    thread: libc::pthread_t,
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+impl VcpuStop {
+    /// Queue `Finish` and kick the thread out of KVM_RUN; a thread that
+    /// already finished ignores both.
+    pub(crate) fn stop(&self) {
+        let _ = self.event_sender.send(VcpuEvent::Finish);
+        // SAFETY: the thread is not joined yet (type contract), so the ID is
+        // valid, and the vCPU kick signal has a handler installed.
+        unsafe { libc::pthread_kill(self.thread, sigrtmin() + VCPU_RTSIG_OFFSET) };
+    }
 }
 
 enum VcpuEmulation {

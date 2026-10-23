@@ -256,20 +256,31 @@ LD_LIBRARY_PATH=/usr/local/lib64 ./chroot_vm rootfs_fedora/ /bin/sh
 ## Internal minimal VM checkpoints (experimental)
 
 The private Linux x86_64/KVM `RamSnapshotVm` harness supports `save_full`,
-`restore_full` and explicit `resume` for ordinary RAM with a kernel irqchip/PIT.
-Its base configuration is device-free (no userspace devices; uncontrolled
-background RAM writers are rejected); the optional `blk` feature described
-below adds internal block devices, and `blk` plus `net` add one internal
-network device. The harness supports
+`restore_full(path, RestoreResources)` and explicit `resume` for ordinary RAM
+with a kernel irqchip/PIT. Its base configuration is device-free (no userspace
+devices; uncontrolled background RAM writers are rejected); `attach_rng` and
+`attach_balloon` add internal virtio devices, `attach_legacy` adds the x86
+UARTs, CMOS and i8042, the optional `blk` feature
+described below adds internal block devices, and `blk` plus `net` add one
+internal network device. The harness supports
 1–128 vCPUs, subject to the host KVM capacity and the existing
 CPUID package-sizing limit. Saved CPU ordering and topology must match this count.
 Restore returns paused; it does not reload a payload, write boot parameters, or
 initialize new guest CPUs.
-The existing RAM-only image and APIs retain their memory-only meaning.
+The existing RAM-only image and APIs retain their memory-only meaning; an owner
+with any attached device refuses a RAM-only save and needs `save_full`.
 
-Device-free full images use independent version 1 magic `KRUNVM\0\0`, a bounded
-16 MiB JSON state section, and RAM copied in 64 KiB chunks into independent
-anonymous mappings. Files are created exclusively with mode 0600 and become
+Every full image, with or without devices, uses one format: magic
+`KRUNVM\0\0`, version 4, a bounded 16 MiB JSON state section, RAM copied in
+64 KiB chunks into independent anonymous mappings, then one raw segment per
+disk. The JSON holds CPU, KVM and RAM state, the ordered disk table and the
+optional NIC, RNG, balloon and legacy-device (UARTs, CMOS, i8042) sections.
+Versions 1–3
+are rejected explicitly. Images never contain host paths, descriptors or
+threads: `RestoreResources` supplies the disk import directory, the NIC
+backend socket and the four serial endpoints, and each must be present exactly
+when the image has the matching device. A mismatch is rejected before any RAM,
+directory, socket or thread is created. Files are created exclusively with mode 0600 and become
 valid only after all source vCPUs resume successfully. Errors attempt every
 source resume; uncertain control disables subsequent checkpoints. Partial
 imports stop and join created threads before releasing VM/RAM. External RAM
@@ -288,15 +299,16 @@ TSC deadline becomes the saved TSC in the image only, with no per-tick replay.
 Clock restore uses `clock_realtime=false` and adds no snapshot storage wall time;
 pausing a source vCPU does not stop its hardware clocks. TSC frequency differences
 above 250 ppm require successful scaling. Multi-vCPU restore requires successful
-vCPU0-based TSC offset synchronization before VM clock restore. The `blk` and
-`net` paths below freeze/drain and save their device state before CPU/KVM/RAM
-capture; additional device types remain future work.
+vCPU0-based TSC offset synchronization before VM clock restore. Every
+attached device below is frozen, drained and saved before CPU/KVM/RAM
+capture; device types not listed here (virtio-fs, vsock, console) remain
+future work.
 
 ### Internal block-device checkpoints (stage 3, feature `blk`)
 
 With the `blk` cargo feature, the same private owner additionally supports
 `attach_disk` (before vCPUs start) for ordinary RAW/QCOW2/VMDK files through
-the existing imago backends, plus disk-bearing version-2 full images. Caller
+the existing imago backends, saved into the version-4 full image. Caller
 precondition: the source disk file and every backing file in its chain must
 have no writers outside this private owner for the lifetime of the
 attachment — the consistent cut assumes sole ownership; no lock or lease is
@@ -304,15 +316,14 @@ taken. The internal device topology is fixed: at most eight disks (seven
 when the internal NIC below is attached), MMIO slots at 0xd0000000 in 4 KiB
 steps, kernel-irqchip GSIs 16–23; GSI 0–15 stay reserved for legacy devices.
 
-Version-2 images keep the same header layout and add an ordered disk table to
-the bounded JSON section, followed after the RAM payload by one raw segment
-per disk: the frozen guest-visible logical capacity with QCOW2/VMDK backing
-chains and readonly disks normalized into plain bytes. `save_full` keeps its
-single-file contract; version-1 images stay device-free. `restore_full`
-rejects versions 2 and 3 explicitly; `restore_full_with_disks(path, destination)`
-imports the segments into a new 0700 destination directory of exclusive 0600
-`disk-N.raw` files, never taking paths from metadata, and the owner deletes
-the imported directory on partial failure and destruction.
+The ordered disk table in the JSON section is followed after the RAM payload
+by one raw segment per disk: the frozen guest-visible logical capacity with
+QCOW2/VMDK backing chains and readonly disks normalized into plain bytes.
+`save_full` keeps its single-file contract. `restore_full` with
+`RestoreResources::disk_dir` imports the segments into a new 0700 destination
+directory of exclusive 0600 `disk-N.raw` files, never taking paths from
+metadata, and the owner deletes the imported directory on partial failure and
+destruction.
 
 The save order is: configuration checks -> pause/ack all vCPUs -> freeze and
 flush every device (controls are checked before popping each descriptor, so a
@@ -384,20 +395,18 @@ re-examines the backend and both queues itself, so kicks drained while frozen
 cannot stall it. A source that saves keeps its backend connection and worker
 buffers and continues where it stopped.
 
-Images with a NIC are version 3: the version-2 layout (bounded JSON, RAM,
-optional ordered disk segments) plus the NIC's MAC, attach features,
-device config, MMIO transport registers, negotiated features and RX/TX queue
-cursors in the persist structures above. Worker-private RX/TX buffers are
-excluded. NIC-free owners keep writing versions 1 and 2; `restore_full` and
-`restore_full_with_disks` reject version 3 explicitly.
+The image's NIC section holds the MAC, attach features, device config, MMIO
+transport registers, negotiated features and RX/TX queue cursors in the
+persist structures above. Worker-private RX/TX buffers are excluded.
 
-`save_full` with a NIC: pause all vCPUs -> freeze every disk, then the NIC ->
-one RAM alias probe (every worker is frozen, so no transient mapping clone
-exists) -> deassign and drain every irqfd -> capture devices, CPUs, KVM, RAM
-and disks -> sync -> reassign irqfds, resume every device and every CPU, each
-attempted -> publish the magic only if everything succeeded.
+`save_full` with devices: pause all vCPUs -> freeze every disk, the NIC, then
+the event thread -> one RAM alias probe (every device is frozen, so no
+transient mapping clone exists) -> deassign and drain every irqfd -> capture
+devices, CPUs, KVM, RAM and disks -> sync -> reassign irqfds, resume every
+device and every CPU, each attempted -> publish the magic only if everything
+succeeded.
 
-`restore_full_with_net(path, disk_destination, socket_path)` validates all
+`restore_full` with `RestoreResources::nic_socket` validates all
 metadata (fixed slot, disk count, offered features against the attach
 features, config bytes against the MAC, transport state machine, queue
 structure) before RAM exists, then
@@ -413,12 +422,98 @@ are never parsed, and the count is fixed when the discard starts;
 chains the source already used are never replayed, and RX buffers stay
 available for new frames. The owed TX interrupt is raised after the KVM
 irqchip state is restored (loading it would overwrite an earlier injection)
-and before any vCPU runs. `resume` resumes the disks and the NIC, then the
-CPUs. Teardown joins CPUs, then workers (closing the backend), then removes
-owned imports.
+and before any vCPU runs. `resume` resumes the disks, the NIC and the event thread,
+then the CPUs. Teardown stops the event thread, joins CPUs, then workers
+(closing the backend), then removes owned imports.
+
+### Internal RNG and balloon checkpoints (stage 5, no feature)
+
+`attach_rng()` and `attach_balloon()` add a virtio RNG at MMIO 0xd0009000 with
+GSI 5 and a virtio balloon (existing free page reporting only) at 0xd000a000
+with GSI 6, before vCPUs start. Disk and NIC slots are unchanged. All devices
+share one wiring path: fixed-slot checks against guest RAM and against every
+attached device's address and GSI, ioeventfd/irqfd registration with
+rollback, and the irqfd drain/reassign around a capture.
+
+Both devices run on one event thread. Its `EventManager` is created inside the
+thread from the concrete devices, so the public `Subscriber` bounds are
+unchanged; the control eventfd only wakes it, and commands arrive on a
+channel. A freeze is acknowledged after the whole current callback batch has
+returned and released every device lock; a frozen thread dispatches nothing
+(no randomness written, no page reclaimed) and leaves queue notifications
+pending, so a resumed source continues them. Each callback completes at most
+64 descriptor chains and notifies itself for the rest. A restored thread
+starts frozen and, on its first resume, notifies every ready queue itself,
+independent of the source's notifications. Stop drops the command channel,
+wakes and joins the thread, frozen or not. The RAM alias probe counts what the
+devices really hold: one mapping clone per transport plus one per activated
+device; the event thread holds none.
+
+The image keeps the common virtio/MMIO transport state, activation and queues
+of both devices, and the complete 16-byte balloon configuration. Completed
+requests are never replayed, and a restored RNG draws fresh randomness. The
+balloon's optional queues may stay unready after activation, so only ready
+queues are checked against guest RAM.
+
+The RNG writes each request through a 4 KiB buffer, at most 64 KiB per chain,
+and completes it with the bytes that actually reached guest RAM; a failing
+request completes once and is never rewound (previously it was both rewound
+and completed, re-popping the same chain forever). The balloon validates a
+whole report — every NEXT link resolves, every range is direct, page aligned
+and inside one guest RAM region — before discarding anything; a malformed
+report completes without discards (previously a valid prefix was discarded
+descriptor by descriptor). Only page-aligned private anonymous RAM owned by
+guest memory is discarded; other mappings ignore the hint and complete.
 
 This remains an internal closed loop for the minimal VM: no full BoxLite box
 restore and no virtio-fs/vsock/console support.
+
+### Internal legacy UART, CMOS and i8042 checkpoints (stage 6, no feature)
+
+`attach_legacy([COM1, COM2, COM3, COM4])` adds, before vCPUs start, the four
+UARTs at ports 0x3f8/0x2f8/0x3e8/0x2e8 (IRQ 4/3/4/3; a port without an
+endpoint is a sink), the CMOS at 0x70 and the i8042 at 0x60 (IRQ 1) on the
+owner's port-I/O bus. The five interrupt eventfds join the shared irqfd
+wiring: one irqfd per eventfd (COM1/COM3 and COM2/COM4 share a GSI), deassigned
+and drained with the MMIO devices around a capture. An interrupt already
+injected lives in the saved KVM irqchip state and is never replayed.
+
+Each endpoint is a `UnixStream` that must already be nonblocking; its file
+status flags are checked, never changed. Guest output goes out with
+`MSG_NOSIGNAL` (no SIGPIPE) and is never queued: a byte a full or closed peer
+cannot take is dropped and counted (`serial_dropped_output_bytes`), but the
+guest still sees the transmit complete with its THR interrupt. Input reads
+one 256-byte chunk per readiness event into at most 4 KiB of unread input;
+excess input is dropped and sets the LSR overrun bit, which an LSR read
+clears. On hang-up, EOF or a read error the remaining data is drained up to
+one byte past that capacity (a dropped tail still sets overrun) and the input
+is unregistered: a closed peer neither spins the event loop nor reports
+data-ready. Ordinary VMM UARTs keep unbounded input; only their empty-read
+handling changed (an EOF read no longer sets data-ready).
+
+The image keeps every UART register and its unread input, the CMOS index and
+all 128 bytes, and the i8042 registers, last command and pending output in
+read order (the ring cursors are rebuilt). Validation rejects register values
+the emulation cannot reach, more than 4 KiB of input, data-ready flags that
+disagree with the buffers, and CMOS memory-capacity bytes that differ from
+the image's RAM layout. `RestoreResources::serial` supplies four fresh
+endpoints, checked for nonblocking mode before any disk import or target VM
+exists; output the source already sent is not replayed and the dropped
+counts start at zero.
+
+Every owner with vCPUs (started or full-restored) has one event thread, even
+without devices:
+it also reads UART input and watches the owner's exit eventfd, which the
+i8042 reset and every vCPU exit write. After the vCPU threads are created and
+before any first runs, the thread receives a stop handle (command sender and
+thread ID) per vCPU; the owner keeps the join handles. An exit latches
+`exiting` and stops every vCPU. A frozen thread leaves the exit unread, so
+`save_full` checks the latch and the unread eventfd after the freeze;
+`save`, `save_full` and `resume` reject an exiting owner, an exiting source
+keeps its CPUs paused for the event thread to stop, and a latched exit is
+never saved, so a target never replays a reset. Cleanup always runs event
+thread → vCPUs → disk/NIC workers → owned resources, so no stop handle
+outlives its thread's join.
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 
@@ -448,7 +543,7 @@ example `SNAPSHOT_RUNNER="docker run --rm --platform linux/amd64 -v $PWD:$PWD
 -w $PWD rust:1-bookworm"`; add `--device /dev/kvm` on a Linux KVM host.
 `make snapshot-net-host-test` runs the virtio-net backend and worker tests
 natively (macOS or Linux, no KVM). `snapshot-guest` regenerates the real-mode
-timer fixture using GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; the block guest is
+timer and legacy fixture using GNU `SNAPSHOT_AS`/`SNAPSHOT_OBJCOPY`; the block guest is
 emitted by an annotated byte emitter inside the stage-3 tests (a 16-bit-code
 unreal-mode segment setup with an exact GDT layout, virtio queue with
 header/data/status chains, IOAPIC/x2APIC interrupts, and a barrier that
@@ -489,6 +584,45 @@ at opening `/dev/kvm`. All KVM execution — stage-3 block continuation and
 every stage-4 KVM test above — is **UNVERIFIED** until run on a Linux KVM
 host.
 
+The stage-5 tests cover RNG error completion (buffer outside RAM, buffer
+crossing the end of RAM, the 64 KiB cap, no second completion), whole-report
+balloon validation (malformed NEXT tail, range crossing the end of RAM, then a
+valid discard; Linux only), the event thread without KVM (frozen thread
+dispatches nothing, the source resumes its pending notification, stop from
+frozen, restored thread serves an un-notified request), pre-version-4
+rejection, resource matching, and one KVM round trip
+(`event_devices/tests.rs`: pending un-notified RNG request and inactive
+balloon across save, source continuation, restored completion and CPU
+continuation). Stage-5 validation status: `make snapshot-fmt` and
+`make snapshot-check` pass; the non-KVM tests above, plus the existing NIC
+metadata, ring and discard tests, pass when `make snapshot-test` runs inside
+an amd64 `rust:1-bookworm` container (repository mounted at the same path,
+host `~/.cargo/registry` and `config.toml` as `CARGO_HOME`, a separate
+`CARGO_TARGET_DIR`). The KVM round trip and the existing KVM tests on the
+version-4 path are **UNVERIFIED** (no `/dev/kvm`).
+
+The stage-6 tests cover the UART endpoint (blocking endpoint rejected with
+flags unchanged; full and closed peers drop, count and still raise THR; the
+4 KiB cap and overrun; EOF with no data, short data, exactly 4 KiB and an
+over-capacity tail, each drained and unregistered without spinning), the
+ordinary UART's EOF read, UART/CMOS/i8042 state round trips (wrapped i8042
+cursors across the `usize` wrap, CMOS capacity mismatch), legacy metadata
+and endpoint validation, and the exit watch without KVM (device-free thread
+stops armed vCPUs; a frozen thread leaves the exit pending for the owner,
+then stops on resume). One KVM test extends the stage-2 fixture
+(`full/tests.rs`, entry 0x800): COM1 output and scratch, save, restore with a
+fresh endpoint and no replayed output, restored continuation, then a guest
+i8042 reset; the guest keeps counting after it, so the test waits for the
+vCPU thread to finish, checks the counter stays still, and that save and
+resume fail. Stage-6
+validation status: `make snapshot-fmt`, `make snapshot-check` and the
+featureless `krun-vmm` Linux test check pass; the non-KVM tests pass in the
+amd64 container described above, and the ordinary-UART EOF test fails on the
+unmodified tree (`EOF reported as data`). The KVM test is **UNVERIFIED** (no
+`/dev/kvm`). Under `cfg(test)` a vCPU's own exit (HLT, shutdown, error) does
+not write its exit eventfd, so vCPU-exit wiring is covered only by the
+eventfd-level tests; the guest-driven path is the i8042 reset.
+
 Guest-observed NIC acceptance is **UNVERIFIED**: on a Linux KVM host, a
 real-mode guest (like the stage-3 block fixture) should read the NIC
 registers through its own MMIO exits after a restore, and, with IF clear
@@ -502,8 +636,8 @@ framing (for example passt or gvproxy in their QEMU stream-socket mode);
 attach the NIC and boot the guest with
 `virtio_mmio.device=4K@0xd0008000:23`; configure the network, resolve a name
 and keep a TCP connection open; `save_full`; stop the source VM and its
-backend; start a new backend at a new socket; `restore_full_with_net` and
-`resume`. Expected: the old TCP connection fails or times out, new name
+backend; start a new backend at a new socket; `restore_full` with that
+`nic_socket` and `resume`. Expected: the old TCP connection fails or times out, new name
 lookups and new TCP connections succeed, interface counters keep moving and
 the guest kernel logs no virtio-net ring errors.
 

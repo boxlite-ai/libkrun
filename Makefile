@@ -88,7 +88,8 @@ endif
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 
 # Internal minimal-VM snapshot checks; callers supply cross C/linker settings.
-# The blk/net features enable the virtio-blk/net snapshot code and device tests.
+# The blk/net features enable the virtio-blk/net snapshot code and device tests;
+# the RNG/balloon and legacy UART/CMOS/i8042 snapshot code needs no feature.
 SNAPSHOT_TARGET ?= x86_64-unknown-linux-gnu
 SNAPSHOT_FILTER ?= snapshot
 SNAPSHOT_CARGO_FLAGS ?= --offline
@@ -105,7 +106,7 @@ SNAPSHOT_RUNNER_VAR = CARGO_TARGET_$(shell echo '$(SNAPSHOT_TARGET)' | tr 'a-z-'
 SNAPSHOT_NET_FILTER ?= snapshot_net
 .PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-guest snapshot-net-host-test
 snapshot-fmt:
-	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs src/devices/src/virtio/control.rs src/devices/src/virtio/net/backend.rs src/devices/src/virtio/net/device.rs src/devices/src/virtio/net/mod.rs src/devices/src/virtio/net/unixstream.rs src/devices/src/virtio/net/worker.rs
+	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs src/devices/src/virtio/control.rs src/devices/src/virtio/net/backend.rs src/devices/src/virtio/net/device.rs src/devices/src/virtio/net/mod.rs src/devices/src/virtio/net/unixstream.rs src/devices/src/virtio/net/worker.rs src/devices/src/virtio/rng/mod.rs src/devices/src/virtio/rng/device.rs src/devices/src/virtio/balloon/mod.rs src/devices/src/virtio/balloon/device.rs src/devices/src/legacy/x86_64/serial.rs src/devices/src/legacy/x86_64/cmos.rs src/devices/src/legacy/i8042.rs
 
 snapshot-check:
 	cargo check $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --tests --target $(SNAPSHOT_TARGET)

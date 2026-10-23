@@ -38,6 +38,17 @@ impl DeviceQueue {
     pub fn new(queue: Queue, event: Arc<EventFd>) -> Self {
         Self { queue, event }
     }
+
+    /// Notify a ready queue, so a restored device examines its ring without
+    /// the source's notifications.
+    pub(crate) fn kick_if_ready(&self) {
+        if !self.queue.ready {
+            return;
+        }
+        if let Err(e) = self.event.write(1) {
+            error!("failed to kick a restored queue: {e:?}");
+        }
+    }
 }
 
 /// Enum that indicates if a VirtioDevice is inactive or has been activated

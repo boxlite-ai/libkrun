@@ -263,6 +263,28 @@ impl VirtioDeviceState {
         }
         Ok(())
     }
+
+    /// `validate` for devices with optional queues: the transport activates
+    /// without requiring every queue, so a driver may leave unused queues
+    /// unready. Ready queues get the full ring checks; unready queues keep
+    /// the structural checks of an inactive queue.
+    pub fn validate_ready_queues(
+        &self,
+        mem: &GuestMemoryMmap,
+        expected_device_type: u32,
+        expected_num_queues: usize,
+        expected_queue_max_size: u16,
+    ) -> Result<(), PersistError> {
+        self.validate_structure(
+            expected_device_type,
+            expected_num_queues,
+            expected_queue_max_size,
+        )?;
+        for queue in &self.queues {
+            queue.validate(mem, self.activated && queue.ready)?;
+        }
+        Ok(())
+    }
 }
 
 /// Transport information saved in a snapshot.
