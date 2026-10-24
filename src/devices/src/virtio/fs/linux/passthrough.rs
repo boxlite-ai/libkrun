@@ -9,7 +9,9 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::mem::{self, size_of, MaybeUninit};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -40,7 +42,8 @@ pub use archive::{
 #[cfg(test)]
 pub(crate) use dax::faults as dax_faults;
 pub use dax::{
-    reset_dax_window, DaxMapping, DaxMappingKind, DaxPages, DaxState, DaxWindow, DAX_PAGE_SIZE,
+    reset_dax_window, DaxMapping, DaxMappingControl, DaxMappingKind, DaxPages, DaxState, DaxWindow,
+    DAX_PAGE_SIZE,
 };
 use snapshot::InoMap;
 pub use snapshot::{
@@ -346,10 +349,10 @@ pub struct Config {
     /// The default value for this option is `false`.
     pub writeback: bool,
 
-    /// The path of the root directory.
+    /// The path of the root directory; any bytes but NUL.
     ///
     /// The default is `/`.
-    pub root_dir: String,
+    pub root_dir: PathBuf,
 
     /// Whether the file system should support Extended Attributes (xattr). Enabling this feature may
     /// have a significant impact on performance, especially on write parallelism. This is the result
@@ -381,6 +384,11 @@ pub struct Config {
     /// share restored from an archive keeps serving the archived bytes,
     /// also after a device reset.
     pub init_binary: Option<Arc<[u8]>>,
+
+    /// The snapshot owner's guest execution control: every host mapping
+    /// call on the DAX window runs inside it (see `DaxMappingControl`).
+    /// None for ordinary shares.
+    pub dax_control: Option<Arc<dyn DaxMappingControl>>,
 }
 
 impl Config {
@@ -399,7 +407,7 @@ impl Default for Config {
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
             writeback: false,
-            root_dir: String::from("/"),
+            root_dir: PathBuf::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
             export_fsid: 0,
@@ -407,6 +415,7 @@ impl Default for Config {
             allow_root_dir_delete: false,
             snapshot: false,
             init_binary: None,
+            dax_control: None,
         }
     }
 }
@@ -1035,7 +1044,7 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
+        let root = CString::new(self.cfg.root_dir.as_os_str().as_bytes()).map_err(|_| einval())?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         // We use `O_PATH` because we just want this for traversing the directory tree

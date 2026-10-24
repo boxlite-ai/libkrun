@@ -26,9 +26,23 @@
 //! range (`MAP_FIXED` can unmap the old range and then fail, `mprotect` can
 //! stop part way), so the window is lost: every later mapping request,
 //! sync and capture fails without touching window memory, and the owner
-//! discards the share.
+//! discards the share. A failed `MAP_FIXED` range may now be unmapped and
+//! reused by other memory of the process, so the ledger also names those
+//! ranges (`PassthroughFs::dax_unowned`) for the window's owner, which must
+//! never unmap them.
+//!
+//! The guest must never run over such a range: its memslot would expose
+//! whatever memory took it. A share whose owner gives it a
+//! `DaxMappingControl` (`Config::dax_control`) therefore makes every host
+//! mapping call on its window (each `MAP_FIXED` of a setup, removal,
+//! init.krun copy, restore or reset, and each `mprotect`) inside
+//! `DaxMappingControl::exclusive`: no vCPU runs during the call, and after a
+//! failed one none runs again. A call the control skips (guest execution
+//! already ended) loses the window too, but changed nothing, so it names no
+//! range.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -93,6 +107,46 @@ pub struct DaxPages {
     pub offsets: Vec<u64>,
     /// One page per offset, in offset order.
     pub data: Vec<u8>,
+}
+
+/// Guest execution control of a snapshot owner, around the host mapping
+/// calls (`MAP_FIXED`, `mprotect`) on a live DAX window.
+pub trait DaxMappingControl: Send + Sync {
+    /// Run `remap` at most once while no vCPU executes guest code and none
+    /// can start, or skip it once guest execution ended for good (an earlier
+    /// failure or teardown). `remap` returns whether the window is still
+    /// wholly the share's; after `false` (or a panic) no vCPU runs again.
+    fn exclusive(&self, remap: &mut dyn FnMut() -> bool);
+}
+
+impl fmt::Debug for dyn DaxMappingControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DaxMappingControl")
+    }
+}
+
+/// Run host call `op` on a live window under `control`, if the share has
+/// one; None when the control skipped it, which changed nothing.
+fn excluding_vcpus(
+    control: Option<&dyn DaxMappingControl>,
+    op: impl FnOnce() -> io::Result<()>,
+) -> Option<io::Result<()>> {
+    let Some(control) = control else {
+        return Some(op());
+    };
+    let mut op = Some(op);
+    let mut result = None;
+    control.exclusive(&mut || {
+        let done = op.take().map_or_else(|| Err(eio()), |op| op());
+        let kept = done.is_ok();
+        result = Some(done);
+        kept
+    });
+    result
+}
+
+fn eio() -> io::Error {
+    io::Error::from_raw_os_error(libc::EIO)
 }
 
 fn host_page_size() -> u64 {
@@ -391,14 +445,20 @@ unsafe fn map_fixed(
 
 /// Return a window to its initial state, private zero read-write memory,
 /// once no share maps it (a device reset), so the next session's ledger
-/// starts from what the host maps.
-pub fn reset_dax_window(window: DaxWindow) -> io::Result<()> {
+/// starts from what the host maps; under `control` when the share has one.
+/// None when the control skipped the remapping: the window is unchanged.
+pub fn reset_dax_window(
+    window: DaxWindow,
+    control: Option<&dyn DaxMappingControl>,
+) -> Option<io::Result<()>> {
     if !valid_window(window.host_addr, window.size) {
-        return Err(einval());
+        return Some(Err(einval()));
     }
     // Safe because the caller hands over the whole window and no share
     // maps it anymore.
-    unsafe { UNTOUCHED.map(window.host_addr, window.size) }
+    excluding_vcpus(control, || unsafe {
+        UNTOUCHED.map(window.host_addr, window.size)
+    })
 }
 
 /// Host call failures for tests, armed per target address so tests running
@@ -471,24 +531,41 @@ pub(super) struct DaxLedger {
     opened: HashMap<(u64, u64, bool), Weak<MappedObject>>,
     /// A host mapping call failed: `segments` may no longer match the host.
     lost: bool,
+    /// Window ranges (offset, length) a failed `mmap(MAP_FIXED)` targeted.
+    unowned: Vec<(u64, u64)>,
 }
 
 impl DaxLedger {
     /// Refuse a lost window.
     fn usable(&self) -> io::Result<()> {
         if self.lost {
-            Err(io::Error::from_raw_os_error(libc::EIO))
+            Err(eio())
         } else {
             Ok(())
         }
     }
 
-    /// Run host mapping call `op` on the live window; its failure loses
-    /// the window.
-    fn host(&mut self, op: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        let result = op();
-        self.lost |= result.is_err();
-        result
+    /// Run host call `op` on the live window under the owner's `control`
+    /// (see `DaxMappingControl`); its failure, or the control skipping it,
+    /// loses the window. `mapped` is the range (offset, length) an
+    /// `mmap(MAP_FIXED)` replaces, which a failed call may have left
+    /// unmapped; a skipped call and an `mprotect` unmap nothing.
+    fn host(
+        &mut self,
+        control: Option<&dyn DaxMappingControl>,
+        mapped: Option<(u64, u64)>,
+        op: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let result = excluding_vcpus(control, op);
+        match &result {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                self.lost = true;
+                self.unowned.extend(mapped);
+            }
+            None => self.lost = true,
+        }
+        result.unwrap_or_else(|| Err(eio()))
     }
 
     /// Bind to the window a mapping request targets; a share maps one,
@@ -632,10 +709,23 @@ impl DaxLedger {
 }
 
 impl PassthroughFs {
+    /// The owner's guest execution control, for host mapping calls on the
+    /// window.
+    fn dax_control(&self) -> Option<&dyn DaxMappingControl> {
+        self.cfg.dax_control.as_deref()
+    }
+
     /// A host mapping call of this share failed, so the window may no
     /// longer be what it maps, nor wholly its own.
     pub fn dax_window_lost(&self) -> bool {
         self.dax.lock().unwrap().lost
+    }
+
+    /// Window ranges (offset, length) a failed `mmap(MAP_FIXED)` of this
+    /// share targeted: they may be unmapped and taken by other memory of
+    /// the process, so whoever owns the window must never unmap them.
+    pub fn dax_unowned(&self) -> Vec<(u64, u64)> {
+        self.dax.lock().unwrap().unowned.clone()
     }
 
     /// Snapshot-mode FUSE_SETUPMAPPING: the host mapping, then the ledger.
@@ -676,7 +766,9 @@ impl PassthroughFs {
             writable,
         };
         // Safe because the range lies inside this share's window.
-        ledger.host(|| unsafe { segment.map(host_shm_base + moffset, mapped) })?;
+        ledger.host(self.dax_control(), Some((moffset, mapped)), || unsafe {
+            segment.map(host_shm_base + moffset, mapped)
+        })?;
         ledger.replace(moffset, mapped, segment);
         Ok(())
     }
@@ -694,7 +786,9 @@ impl PassthroughFs {
     ) -> io::Result<()> {
         let addr = ledger.host_addr.expect("bind records the window") + moffset;
         // Safe because the range lies inside this share's window.
-        ledger.host(|| unsafe { UNTOUCHED.map(addr, mapped) })?;
+        ledger.host(self.dax_control(), Some((moffset, mapped)), || unsafe {
+            UNTOUCHED.map(addr, mapped)
+        })?;
         let init = &self.init_binary;
         let start = usize::try_from(foffset)
             .unwrap_or(usize::MAX)
@@ -706,7 +800,9 @@ impl PassthroughFs {
         };
         if !writable {
             // Safe because the range is the mapping just made.
-            ledger.host(|| unsafe { make_read_only(addr, mapped) })?;
+            ledger.host(self.dax_control(), None, || unsafe {
+                make_read_only(addr, mapped)
+            })?;
         }
         ledger.replace(moffset, mapped, Segment::Anonymous { writable });
         Ok(())
@@ -726,7 +822,9 @@ impl PassthroughFs {
         for req in requests {
             let len = ledger.range(req.moffset, req.len)?;
             // Safe because the range lies inside this share's window.
-            ledger.host(|| unsafe { Segment::Hole.map(host_shm_base + req.moffset, len) })?;
+            ledger.host(self.dax_control(), Some((req.moffset, len)), || unsafe {
+                Segment::Hole.map(host_shm_base + req.moffset, len)
+            })?;
             ledger.replace(req.moffset, len, Segment::Hole);
         }
         Ok(())
@@ -841,8 +939,10 @@ impl PassthroughFs {
 
     /// Map a restored share's DAX mappings into `window` and write the
     /// captured anonymous pages; call it before the worker or any vCPU
-    /// runs. Everything is checked before the first mapping; a failure part
-    /// way leaves the window partly remapped, so the caller discards it.
+    /// runs. Everything is checked before the first mapping; a host call
+    /// failing part way leaves the window partly remapped and loses it
+    /// (`dax_window_lost`, the failed mapping in `dax_unowned`), so the
+    /// caller discards it.
     pub fn map_dax(
         &self,
         window: DaxWindow,
@@ -856,14 +956,22 @@ impl PassthroughFs {
             return invalid("DAX window differs from the restored one");
         }
         validate_pages(pages, ledger.anonymous())?;
-        for (&start, (len, segment)) in &ledger.segments {
+        let segments: Vec<(u64, u64, Segment)> = ledger
+            .segments
+            .iter()
+            .map(|(&start, (len, segment))| (start, *len, segment.clone()))
+            .collect();
+        for (start, len, segment) in &segments {
             // Anonymous memory is written before it becomes read-only.
             let segment = match segment {
                 Segment::Anonymous { .. } => &UNTOUCHED,
                 other => other,
             };
+            let addr = window.host_addr + start;
             // Safe because the caller hands over the share's whole window.
-            unsafe { segment.map(window.host_addr + start, *len)? };
+            ledger.host(self.dax_control(), Some((*start, *len)), || unsafe {
+                segment.map(addr, *len)
+            })?;
         }
         for (index, &offset) in pages.offsets.iter().enumerate() {
             // Safe because the page lies inside an anonymous mapping just
@@ -876,10 +984,13 @@ impl PassthroughFs {
                 )
             };
         }
-        for (&start, (len, segment)) in &ledger.segments {
+        for (start, len, segment) in &segments {
             if matches!(segment, Segment::Anonymous { writable: false }) {
+                let addr = window.host_addr + start;
                 // Safe because the range is an anonymous mapping just made.
-                unsafe { make_read_only(window.host_addr + start, *len)? };
+                ledger.host(self.dax_control(), None, || unsafe {
+                    make_read_only(addr, *len)
+                })?;
             }
         }
         ledger.host_addr = Some(window.host_addr);

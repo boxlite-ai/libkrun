@@ -1479,6 +1479,55 @@ fn snapshot_fs_archive_guard_stops_held_devices_before_removing_the_tree() {
     assert_eq!(fs::read(dest.join("0/f")).unwrap(), b"file");
 }
 
+/// Teardown never remaps a DAX window, which its owner may release next
+/// (only a guest reset returns a window to zero memory): dropping a device
+/// leaves the window as its session mapped it.
+#[test]
+fn snapshot_fs_archive_dropped_device_leaves_the_dax_window_alone() {
+    let p = host_page();
+    let base = TempDir::new();
+    let src = page_source(&base);
+    let w = Window::new(4);
+    let mut rig = mapped_rig(&src, &w);
+    let dropped = mem::replace(&mut rig.fs, Rig::device(&src));
+    drop(dropped);
+    assert_eq!(w.read(p, 1), [0x33]);
+}
+
+/// Neither does dropping an import guard: it stops the devices it holds
+/// and leaves their windows as mapped.
+#[test]
+fn snapshot_fs_archive_dropped_guard_leaves_held_windows_alone() {
+    let p = host_page();
+    let base = TempDir::new();
+    let src = page_source(&base);
+    let w = Window::new(4);
+    let rig = mapped_rig(&src, &w);
+    let queues = rig.freeze();
+    let archive = ShareArchive::capture(vec![rig.fs.archive_source().unwrap()]).unwrap();
+    let pl = payloads(&archive);
+    let mut imported = import(archive.manifest(), &base.path().join("dest"), &pl).unwrap();
+    let target = Window::new(4);
+    let mut device = device_on(imported.root(0), false);
+    device.set_shm_region(target.shm());
+    device.restore_imported(&imported, 0).unwrap();
+    assert_eq!(target.read(p, 1), [0x33]);
+    let mut restored = Rig::activate(
+        rig.guest.copy(),
+        device,
+        queues.iter().map(QueueState::to_queue).collect(),
+        true,
+    );
+    let device = Arc::new(Mutex::new(mem::replace(
+        &mut restored.fs,
+        Rig::device(&src),
+    )));
+    imported.hold(device.clone());
+    drop(imported);
+    assert!(!device.lock().unwrap().is_activated());
+    assert_eq!(target.read(p, 1), [0x33]);
+}
+
 /// A private bind mount of `from` on `on`, detached on drop.
 struct BindMount(CString);
 

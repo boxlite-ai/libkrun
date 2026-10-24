@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! KVM and bus wiring shared by every internal device of the private
-//! minimal-VM owner: fixed-slot collision checks, ioeventfd/irqfd
-//! registration with rollback, and the irqfd drain/reassign pair around a
-//! pause, covering MMIO devices and the legacy UART/keyboard lines. Each
-//! device keeps its own fixed slot and state handling.
+//! minimal-VM owner: fixed-slot and DAX window collision checks,
+//! ioeventfd/irqfd registration with rollback, and the irqfd
+//! drain/reassign pair around a pause, covering MMIO devices and the legacy
+//! UART/keyboard lines. Each device keeps its own fixed slot and state
+//! handling.
 
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -14,32 +15,65 @@ use kvm_ioctls::IoEventAddress;
 use utils::eventfd::EventFd;
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
-use super::{Error, RamSnapshotVm, Result};
+use super::{virtio_fs, Error, RamSnapshotVm, Result};
 
 /// Every internal device occupies one 4 KiB MMIO slot.
 pub(super) const MMIO_LEN: u64 = 0x1000;
 
-/// Reject an MMIO slot that overlaps any guest RAM range `(gpa, len)`.
-pub(super) fn check_window(
-    mmio_addr: u64,
-    ram: impl IntoIterator<Item = (u64, u64)>,
+/// Reject a guest range `(gpa, len)` that overlaps any range in `taken`;
+/// neither may wrap the address space.
+pub(super) fn check_disjoint(
+    gpa: u64,
+    len: u64,
+    taken: impl IntoIterator<Item = (u64, u64)>,
+    why: &'static str,
 ) -> Result<()> {
-    for (gpa, len) in ram {
-        if mmio_addr < gpa + len && gpa < mmio_addr + MMIO_LEN {
-            return Err(Error::Invalid("device MMIO slot overlaps guest RAM"));
+    for (start, size) in taken {
+        if gpa < start.saturating_add(size) && start < gpa.saturating_add(len) {
+            return Err(Error::Invalid(why));
         }
     }
     Ok(())
 }
 
-/// Reject a slot whose window overlaps guest RAM or whose address or GSI is
-/// already taken by an attached device; GSIs are never shared.
+/// Reject an MMIO slot that overlaps any guest RAM or DAX range `(gpa, len)`.
+pub(super) fn check_window(
+    mmio_addr: u64,
+    ram: impl IntoIterator<Item = (u64, u64)>,
+) -> Result<()> {
+    check_disjoint(
+        mmio_addr,
+        MMIO_LEN,
+        ram,
+        "device MMIO slot overlaps guest RAM or a DAX window",
+    )
+}
+
+/// Every guest range the owner uses: RAM, every attached device's MMIO
+/// slot and every DAX window.
+pub(super) fn claimed(vm: &RamSnapshotVm) -> Vec<(u64, u64)> {
+    vm.memory
+        .iter()
+        .map(|region| (region.start_addr().raw_value(), region.len()))
+        .chain(
+            vm.mmio_devices()
+                .into_iter()
+                .map(|(_, addr, _)| (addr, MMIO_LEN)),
+        )
+        .chain(virtio_fs::windows(vm))
+        .collect()
+}
+
+/// Reject a slot whose window overlaps guest RAM or a DAX window, or whose
+/// address or GSI is already taken by an attached device; GSIs are never
+/// shared. Each check holds whichever was attached first.
 fn check_slot(vm: &RamSnapshotVm, mmio_addr: u64, irq: u32) -> Result<()> {
     check_window(
         mmio_addr,
         vm.memory
             .iter()
-            .map(|region| (region.start_addr().raw_value(), region.len())),
+            .map(|region| (region.start_addr().raw_value(), region.len()))
+            .chain(virtio_fs::windows(vm)),
     )?;
     let taken = vm.mmio_devices().into_iter().any(|(_, addr, used_irq)| {
         used_irq == irq || (mmio_addr < addr + MMIO_LEN && addr < mmio_addr + MMIO_LEN)

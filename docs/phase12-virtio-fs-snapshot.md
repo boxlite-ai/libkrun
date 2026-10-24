@@ -1,10 +1,14 @@
-# 阶段 12：virtio-fs 快照暂停检查点
+# 阶段 12：virtio-fs 内部快照检查点
 
-状态：批次 1 及审查修正已提交（`32dc08f`）；批次 2 已恢复
-（2026-10-24），**DAX ledger 与映射对象生命周期及 fail-closed 审查修正
-已经 Codex 审查通过并在本地提交**；
-独立对象归档及其四项审查修正**已审查通过并在本地提交**；批次 3 尚未开始。完整镜像仍为 **v6**，
-`RamSnapshotVm` 目前仍不能保存含 virtio-fs 的完整 VM。
+状态：阶段 12 **已完成，全部审查通过并在本地提交**。批次 1 及审查修正
+（`32dc08f`）；批次 2 的 DAX ledger 与 fail-closed 审查修正（`c79d6ff`）、
+独立对象归档及其四项审查修正（`bb0617d`）；批次 3（owner、完整镜像
+**v7**）及其 DAX 执行屏障修正在其后的阶段 12 收尾提交中。内部
+`RamSnapshotVm` 可通过 `declare_host_writers_stopped`、`attach_fs`、
+`pause`、`export`、`import`、`resume` 保存和恢复含最多七个 virtio-fs 共享的
+完整 VM；无公共 C ABI、SDK 或 CLI 入口。需要 VM 的路径仅编译，KVM 实际
+运行为 **UNVERIFIED**；没有真实 BoxLite/shim 恢复，接入属于阶段 13（未来
+工作）。验证边界见下文“最终验证与边界”。
 
 ## 已完成并审查
 
@@ -23,11 +27,14 @@
 
 主要代码：`src/devices/src/virtio/fs/{device,worker,server,read_only,multikey}.rs`、
 `linux/passthrough.rs`、`linux/passthrough/snapshot.rs` 和 `fs/tests.rs`。
-当前恢复测试使用同一批宿主对象，**尚未证明独立副本恢复或源目录删除后恢复**。
+（批次 1 时的记录：恢复测试使用同一批宿主对象，尚未证明独立副本恢复。
+批次 2 的归档测试与批次 3 的 `snapshot_fs_vmm` 测试已覆盖源目录删除后在
+独立副本上继续。）
 
 ## 已记录的验证结果
 
-以下为 Claude worker 对最终批次 1 修正版的测试记录，Codex 已审查代码和证据。
+以下为批次 1 修正版的历史测试记录（Claude worker 执行，Codex 已审查）。
+最终结果见“最终验证与边界”。
 按用户要求，后续不重复运行 worker 已完成的测试；新增改动或覆盖缺口再补测。
 
 | 检查 | 结果 |
@@ -42,7 +49,8 @@
 | 七项修正的反向检查 | 撤销修正后对应 7 个测试失败，恢复修正后通过 |
 
 Linux 测试使用本地 amd64 `rust:1-bookworm` 离线容器，未挂载 `/dev/kvm`。
-现有 KVM 运行结果为 **UNVERIFIED**；阶段 12 专用 KVM 用例尚未编写。
+现有 KVM 运行结果为 **UNVERIFIED**；批次 1 时阶段 12 专用 KVM 用例尚未
+编写（批次 3 已编写，仅编译）。
 完整测试命令会因上述 KVM 用例返回失败，不能将其记为全套通过。
 
 后续需要检查新改动时，可沿用以下容器参数执行现有 make 目标：
@@ -83,8 +91,8 @@ macOS 原生回归需将 `KRUN_INIT_BINARY_PATH` 指向已生成的 Linux init�
   `mprotect` 可能中途停止）宿主布局不确定，窗口记为丢失：之后的映射请求
   与 `sync_for_snapshot` 返回 `EIO`（freeze 因此报错而不确认），捕获返回
   `PassthroughSnapshotError::DaxLost`，均不触碰窗口内存；owner 须丢弃
-  共享（停止并 join worker），不做回滚。`map_dax` 中途失败时 ledger 仍为
-  未映射状态，设备须丢弃（保持原约定）。`Fs::restore_session` 在没有
+  共享（停止并 join worker），不做回滚。`map_dax` 中途失败时窗口记为
+  丢失、设备退役（批次 3 起；此前仅约定由调用方丢弃）。`Fs::restore_session` 在没有
   DAX 状态/窗口时拒绝非空 `dax_pages`，且早于构建 session。
 - 接口：`PassthroughState::dax: Option<DaxState>`（映射引用同一对象表，
   便于后续归档做全局对象重映射）；`PassthroughCheckpoint::dax_pages`
@@ -159,7 +167,7 @@ fail-closed 修正验证（2026-10-24）：原依赖 `mseal` 的失败段（无 
   再取得身份：普通文件取自 `O_CREAT|O_EXCL` 返回的描述符（读取前保留在
   日志中供清理使用），硬链接经对象自身描述符的 `/proc/self/fd` 链接创建、
   身份在创建前已知，目录/符号链接/whiteout 创建后立即按名字 statx。
-  失败或未 `persist` 即 drop 时，先 reset 并 join `hold` 的设备 worker，
+  失败或未 `persist` 即 drop 时，先 retire（批次 3 前为 reset）并 join `hold` 的设备 worker，
   再按日志仅删除本次创建且仍指向原对象的名字（先恢复本进程所有权与
   0700）。他人写入的目录和名字、已存在的目标目录保留；目录/符号链接/
   whiteout 创建后若未能读取身份，该名字可能已被替换，故保守保留（记
@@ -201,39 +209,207 @@ reopen 前、目标目录在 statx 前），未含任何修正逻辑。按协调
 名字（应保留 7 个）。修正后全部通过。
 
 已知限制：捕获需初始 user namespace 中的 CAP_SYS_ADMIN（否则拒绝）；
-`map_dax` 中途失败后设备仍未标记退役（沿用“须丢弃”约定）；chattr 标志、
-稀疏文件空洞布局（导入时全零块保留为空洞）、宿主链接计数中不在共享内的
-链接不归档；捕获与导入均为每个对象持有一个描述符；非 UTF-8 的嵌套根路径
-需要 owner 自行处理（`Fs::new` 取 `String`）；DAX 页在读取载荷后才做
-数据相关校验（全零页），失败时清理已创建资源。
+chattr 标志、稀疏文件空洞布局（导入时全零块保留为空洞）、宿主链接计数中
+不在共享内的链接不归档；捕获与导入均为每个对象持有一个描述符；DAX 页在
+读取载荷后才做数据相关校验（全零页），失败时清理已创建资源。归档批次
+记录的 `map_dax` 中途失败未退役设备、非 UTF-8 嵌套根路径（`Fs::new` 取
+`String`）两项已在批次 3 处理（见下）。
 
-### 批次 3：owner、v7 格式和最终回归（尚未实现）
+### 批次 3：owner、v7 格式和最终回归（已审查通过，本地提交）
 
-- 私有 `RamSnapshotVm::attach_fs(FsShareConfig)`：tag、源目录、只读、
-  根目录删除选项、可选 DAX `{gpa,len}`；仅 vCPU 启动前允许调用。
-  最多七共享，MMIO 从 `0xd000d000` 每次增加 4 KiB，GSI 9–15。
-- 统一检查 RAM、全部设备窗口和 DAX 冲突；DAX 独立分配、额外 KVM
-  memslot 并计入容量，不加入普通 RAM，保留 RAM 别名及队列校验。
-- `declare_host_writers_stopped()` 仅运行且未暂停时允许声明；调用方停止
-  共享及宿主别名的所有外部写入并维持至 resume。pause 保留，resume/disable
-  清除；缺声明拒绝导出，导入的独占副本自动满足此前提。
-- `RestoreResources::fs_dir` 当且仅当镜像含共享时提供，独占创建 0700。
-- 使用批次 2 归档接口：导出时各共享 `Fs::archive_source` 后一次
-  `ShareArchive::capture`，清单嵌入 v7 JSON，载荷按 `write_files`、
-  `write_init`、`write_pages` 写出；导入时 `ImportedArchive::import`（目标即
-  `fs_dir`），以 `root(i)` 建设备并 `restore_imported`，`hold` 设备直至恢复
-  成功后 `persist`。读写只读标志由 owner 设备表保证一致。
-- 全镜像升级 **v7**，拒绝 v1–v6；保持 16 MiB 有界 JSON，加入设备表、
-  全局文件对象、共享根、FUSE 状态和映射。数据顺序为 RAM、磁盘、文件及
-  init 内容、匿名映射非零页；全面检查长度、引用、范围、容量和溢出。
-- 先验证结构及 RAM 队列，再创建文件；映射在 vCPU 线程前恢复。
-  导出成败都保持暂停；控制不确定则禁用 owner，先停止/join 线程再释放资源。
-- 补 owner 非 KVM 失败路径、全部测试编译和现有回归；提供并编译 guest
-  MMIO/DAX、pending 中断、原 handle I/O、CPU 续跑用例，实际 KVM 运行
-  按既定安排保留 **UNVERIFIED**。
+`src/vmm/src/ram_snapshot/virtio_fs.rs`（owner）及测试
+`virtio_fs/{tests,kvm_tests}.rs`；设备侧改动见本节末。
 
-BoxLite/shim 生命周期接入仍留在阶段 13。恢复工作应继续由 Claude worker
-实施，Codex 审查。未授权推送、PR 或部署。
+- `RamSnapshotVm::attach_fs(FsShareConfig { tag, source, read_only,
+  allow_root_dir_delete, dax: Option<DaxRange { gpa, len }> })`，仅 vCPU
+  启动前。共享 i 固定在 MMIO `0xd000d000 + i * 0x1000`、GSI `9 + i`，最多
+  七个。tag 1–36 字节、无 NUL、owner 内唯一；源目录为绝对路径、不是指向
+  目录的符号链接、除 NUL 外任意字节（含非 UTF-8）。所有检查先于任何
+  副作用，之后的失败使 owner 不可再快照（与其他设备一致）。
+- DAX 窗口：4 KiB 对齐、非零、不回绕；owner 自行映射私有匿名内存，并在
+  RAM 之后注册为额外 KVM memslot，计入目标容量；不是 guest RAM（RAM
+  镜像、RAM 别名探测和队列校验只看 `GuestMemoryMmap`，环位于 DAX 窗口时
+  拒绝）。统一冲突检查：RAM、全部已挂载设备 MMIO 槽、其他 DAX 窗口，以及
+  KVM 自身服务的地址（`KVM_TSS_ADDRESS - 0x1000` 起 16 KiB 的 EPT 恒等映射
+  页与 TSS、IOAPIC `0xfec00000`、LAPIC `0xfee00000`），任意挂载顺序均生效
+  （后挂载的设备落在窗口上同样拒绝），导入时按元数据做同样检查。owner
+  持有其映射的每个窗口（含挂载或导入失败时的窗口）直到自身析构，晚于
+  VM fd（及 memslot）关闭。
+- RAM 别名探测计入每个共享的映射克隆：transport 1 个，激活后另有设备
+  状态与 worker 各 1 个。
+- 生命周期：pause 与磁盘、NIC 一起冻结已激活共享的 worker；共享丢失 DAX
+  窗口时 pause 失败并禁用 owner。resume 恢复 worker。owner 停止（禁用、
+  导入失败、析构）时在 vCPU 停止后对每个共享执行 `Fs::retire`，然后才
+  释放窗口。
+- `declare_host_writers_stopped()`：仅在运行、可用、未暂停且未退出时接受；
+  调用方保证直至下次 resume，宿主上没有写入共享目录及其文件任何别名
+  （硬链接、bind mount、打开的描述符）的写者。pause 保留，resume 与禁用
+  清除；含共享且未声明的导出在创建镜像前拒绝。导入的副本只属于 owner，
+  因此导入后即为已声明。
+- 导出：各共享 `Fs::archive_source` 后一次 `ShareArchive::capture`。捕获
+  需要初始 user namespace 中的 CAP_SYS_ADMIN（否则 `trusted.*` 不可见），
+  缺少时导出以归档的 `Unsupported` 错误失败，owner 保持暂停且可重试。
+  JSON 的 `fs` 段含每个设备（槽位、tag、只读与根删除标志、DAX 范围、
+  transport 与 virtio 状态及冻结游标）和归档清单（对象、共享根、各
+  session 及其 DAX 映射），不含共享的宿主路径或描述符。文件、init.krun、
+  DAX 页载荷依次写在磁盘段之后；捕获后有变化的文件使导出失败。
+- 完整镜像 **v7**：版本 1–6 显式拒绝（RAM-only `KRUNRAM` 仍为 v1），JSON
+  上限 16 MiB 不变。读取时先校验 RAM 区域（其后的设备检查依赖它们），再
+  校验各设备段，最后用 RAM、磁盘段、共享载荷长度（均为 checked 加法）
+  核对文件总长。
+- 导入：`RestoreResources::fs_dir` 当且仅当镜像含共享时提供，须为不含
+  NUL 的绝对路径（相对路径会让设备服务、reset 和根删除依赖进程工作目录，
+  故拒绝）。RAM 存在前校验清单、各设备固定槽、tag、特性与激活一致性、
+  未激活设备不含 FUSE session（无 options、node、handle）、DAX 窗口与
+  session 一致、只读共享无可写 handle、可写文件映射或 writeback、窗口
+  布局及 memslot 容量；载入 RAM 后、创建任何目录/socket/线程前校验所有
+  环。共享在磁盘段之后导入 `fs_dir`（0700 独占创建，已存在则拒绝且不
+  触碰，失败只删除本次创建的名字）。每个设备以 `Fs::new_at` 在导入根
+  （原生路径）上、按保存的槽位重建，获得新的 DAX 窗口与恢复的 session
+  和窗口内容；已激活的共享以冻结 worker 恢复激活，全部早于 vCPU 线程。
+  成功后保留导入的树（`persist`）：它是 guest 的文件系统，owner 析构时
+  不删除，与磁盘段不同。`allow_root_dir_delete` 删除的是该导入根本身。
+
+设备侧改动（Linux）：`passthrough::Config::root_dir` 改为 `PathBuf`，
+`Fs::new_at` 可服务非 UTF-8 根路径；根路径含 NUL 时 FUSE_INIT 返回
+`EINVAL`，不再 panic。`Fs::retire` 用于拆除：停止并 join worker、丢弃
+session，但从不重映射 DAX 窗口（其所有者随后可能释放该内存；只有 guest
+reset 把窗口恢复为零内存）；`Fs` 析构和导入守卫析构改为 retire 而非
+reset。退役设备不再激活、恢复或捕获（`Fs::must_discard`）。`map_dax`
+中途失败现使窗口丢失并退役设备。每次失败的 `mmap(MAP_FIXED)`（映射请求、
+`map_dax` 恢复、reset 重映射即整个窗口）记录其目标窗口范围
+（`Fs::dax_unowned`、`PassthroughFs::dax_unowned`）；`mprotect` 失败不会
+解除映射，不记录。这类范围可能已被进程内其他内存占用，owner 永不解除
+映射，带 warning 保留至进程结束（无法回收）。guest 不会在这类范围上运行：
+owner 为每个带窗口的共享设置 `passthrough::DaxMappingControl`
+（`Fs::set_dax_control`、`Config::dax_control`），窗口上的每次宿主映射调用
+（映射请求、init.krun 复制、移除、`map_dax`、reset 重映射的 `MAP_FIXED`，
+以及每次 `mprotect`）都在 `exclusive` 内执行；因执行已结束而被跳过的调用
+返回 `EIO` 并使窗口丢失（跳过的 reset 使设备必须丢弃），但它未改变任何
+映射，因此不记录 unowned 范围，拆除时仍释放整个窗口。普通共享没有该控制，行为不变（见下文“DAX 执行
+屏障修正”）。另导出 `FS_FEATURES`、`FS_NUM_QUEUES`、`FS_QUEUE_SIZE`。
+
+测试：设备侧新增 5 个（其中 4 个只用归档提交已有接口检查既有缺陷：
+设备析构与导入守卫析构保持窗口、`map_dax` 失败退役设备、根路径含 NUL；
+另 1 个检查 retire 语义与各类失败记录的范围）。owner 的 `snapshot_fs_vmm`
+（无 KVM，transport + guest RAM + 与 owner 相同方式映射的 DAX 窗口）7 个：
+源目录删除后在副本上继续（中断状态、切点处已发布未处理的请求、原 handle、
+可写 DAX 文件映射、1 + 2 个映射克隆）；非 UTF-8 嵌套根在其导入根上恢复，
+根删除移除该路径；元数据逐项拒绝且核对拒绝原因；DAX 窗口中的环；tag、
+源路径、窗口形状、槽位与 `fs_dir`；窗口后备内存不解除不属于它的范围；
+声明要求。`full/tests.rs` 新增经 `read_metadata` 检查 v7 共享段与长度、
+RAM 区域先于设备段校验（回归：曾在 legacy CMOS 计算中溢出 panic），并
+更新 v1–v6 拒绝和 `fs_dir` 资源要求。`snapshot_fs_kvm` 4 个（仅编译）：
+guest 通过 mailbox 以绝对地址访问共享寄存器与 DAX、GSI 9 pending 中断在
+恢复后只投递一次、源目录删除后原 handle 与 DAX 映射在副本上继续、CPU
+续跑、声明规则、任意顺序的挂载布局、导入 `fs_dir` 契约。`full/guest.S`
+另解除 IRQ9 屏蔽并在 0x9126 计数 vector 0x29，`make snapshot-guest`
+重建 `guest.bin`（重建旧 `guest.S` 与旧 `guest.bin` 逐字节一致）。
+
+历史验证（屏障修正前的 owner 树，2026-10-24，amd64 `rust:1-bookworm` 离线容器，
+`--cap-add SYS_ADMIN --tmpfs /tmp:rw,exec`，无 `/dev/kvm`，容器内先 `touch`
+fs 与 ram_snapshot 源文件）：`make snapshot-fmt`、`snapshot-check`（另含
+无 feature 的 `krun-vmm`、`krun-devices`）、`snapshot-build`、
+`snapshot-guest` 以及 macOS `snapshot-check`（`krun-devices --features net`）
+通过。`make snapshot-test`：`krun-devices` snapshot **130/130**（其中
+`snapshot_fs` 47）；`krun-vmm` **54 通过、52 失败**，全部失败为打开
+`/dev/kvm` 失败（原有 48 个 KVM 测试 + 新增 4 个 `snapshot_fs_kvm`，
+**UNVERIFIED**）。无 feature 的 `krun-vmm`：50 通过、39 失败，原因相同。
+macOS 原生 console/net/vsock 回归 26/26、20/20、16/16。既有缺陷对照：在
+`git archive bb0617d` 树（全部非测试文件逐字节一致；测试侧适配只把根路径
+写成 `String` 并去掉新接口断言）中 4 个缺陷测试在各自检查点失败（两处
+拆除后窗口读到 0 而非 0x33、`map_dax` 失败后第二次恢复被接受、根路径含
+NUL 时 FUSE_INIT panic），其余 42 个通过；当前树全部通过。
+
+BoxLite/shim 生命周期接入留在阶段 13（未来工作）。未授权推送、PR 或部署。
+
+## DAX 执行屏障修正（批次 3，已审查通过）
+
+问题：`MAP_FIXED` 可能先解除旧映射再失败，该范围随后可被进程内其他内存
+占用；修正前运行中的 guest 会通过窗口 memslot 继续访问它，直到下一次
+pause 才发现。现在该窗口在 guest 运行时不存在。
+
+- 设备侧（`passthrough/dax.rs`）：对象安全的 `DaxMappingControl::exclusive`
+  （`Config::dax_control`，`Fs::set_dax_control`）。快照共享窗口上的每次
+  宿主映射调用（setup、init.krun 复制及其 `mprotect`、remove、`map_dax`、
+  reset）都在其中执行；执行失败记录 lost 与 unowned（`mprotect` 不记录
+  范围）；被跳过的调用返回 `EIO`、窗口 lost，但不记录 unowned。
+- vmm 侧（`ram_snapshot/execution.rs`）：每个带 DAX 窗口的 owner 一个
+  `ExecutionBarrier`。vCPU 只在 `fd.run()` 期间持有 permit，在模拟 IO/MMIO
+  之前、EINTR 清 `immediate_exit` 之前释放（guest reset 可在当前 vCPU 线程
+  获取屏障）。重映射：阻止新 permit，用 vCPU kick 信号踢出所有持有者（每
+  10 ms 重踢），等待全部离开后才执行系统调用；多个重映射串行。失败或
+  panic 在重新开放之前把屏障永久标为 failed，写 owner 的 exit eventfd
+  （exit watch 停止所有 vCPU）；之后的 pause/resume/export/declare 禁用 owner
+  并 join 全部线程。pause 在 worker 冻结后、resume 在设备恢复后（vCPU
+  恢复前及返回成功前）再次检查。`stop_threads` 在 join vCPU 前 retire 屏障，
+  释放等待中的 vCPU 与重映射。只踢 permit 持有者，持有者在同一锁下注销后
+  才离开 ioctl 路径，因此被踢的 pthread ID 不会是已 join 的线程。
+- 锁顺序：transport → device → DAX ledger → 屏障锁（叶子锁，持有时不取
+  其他锁，也不在重映射期间持有）。无 DAX 窗口的 owner 与普通 VMM 不受
+  影响。
+- 测试：`snapshot_execution` 4 个（无 KVM，测试线程持 permit 模拟 KVM_RUN）；
+  设备侧 2 个（含 fault hook 失败与被跳过调用不记录范围）；
+  `snapshot_fs_vmm_live_remapping_needs_the_execution_barrier`；KVM 2 个
+  （双 vCPU 重映射期间计数停止且失败后两个 vCPU 结束；设备恢复期间失败
+  时 resume 失败且无 vCPU 运行），**仅编译，UNVERIFIED**。
+- 验证（2026-10-24，同一离线容器）：fmt 无差异；check（含无 feature）、
+  build、macOS `krun-devices` check 通过；`krun-devices` snapshot 132/132
+  （`snapshot_fs` 49）；`krun-vmm` 59 通过、54 失败，全部为打开
+  `/dev/kvm` 失败（48 个原有 + 6 个 `snapshot_fs_kvm`）；无 feature 55/41
+  同因；macOS console/net/vsock 26/26、20/20、16/16。修正前树（非测试文件
+  逐字节一致，测试侧适配仅本地声明 trait、无操作安装控制）上 3 个缺陷
+  测试在检查点失败，其余 14 个通过。证据与命令：
+  `/tmp/phase12-dax-barrier-report.md`。
+- 规模：本修正约 440 行生产代码（非注释约 295 行），加上批次 3 原有约
+  1360 行；本阶段只做本地提交，将来若建 PR 须拆分或申请例外。
+
+## v7 镜像布局与 owner 限制（最终）
+
+- 布局：16 字节头（`KRUNVM\0\0`、版本 7、JSON 长度），JSON 状态（非空，
+  至多 16 MiB），RAM，各磁盘段，然后按归档顺序的三个共享载荷：文件字节、
+  去重后的 init.krun 字节、非零 4 KiB DAX 页。`read_metadata` 依次校验
+  CPU 与 VM、RAM 区域、各设备段（fs 段返回载荷长度），最后以 checked 加法
+  核对头、JSON、RAM、磁盘与共享载荷长度之和恰等于文件长度。版本 1–6 显式
+  拒绝，`KRUNRAM` 仍为 v1。
+- 能力前置：含共享的导出需要初始 user namespace 中的 CAP_SYS_ADMIN（仅此
+  时内核列出 `trusted.*`），否则在读取源之前返回 `Unsupported`，owner 保持
+  暂停、可重试；导入 `trusted.*` 同样需要 CAP_SYS_ADMIN。
+- 重复导出：同一次 pause 的多次导出得到相同的暂停 guest、RAM 与设备切点，
+  但每次重新读取宿主目录树，因此不保证镜像逐字节相同：读取符号链接会改变
+  其 atime（无 `O_NOATIME` 权限时读取文件、目录也会），后续导出按读到的值
+  记录；首次导出会在活动共享中为 guest 未 lookup 的对象分配 inode 投影。
+  不承诺源 atime 不变。
+- DAX 所有权失败为致命：窗口上的宿主映射调用失败后不再有 vCPU 运行，下次
+  `pause`、`resume`、`export` 或 `declare_host_writers_stopped` 禁用 owner
+  并失败；该调用可能已解除映射的范围不解除、不回收，带 warning 保留至进程
+  结束。
+- 未知身份清理：导入失败只删除能证明由本次创建的名字；创建后未能读取身份
+  的目录、符号链接或 whiteout 保留（记 warning，上级目录随之保留）。
+- 导入的共享树在成功后保留，owner 不删除（guest 数据）。
+
+## 最终验证与边界
+
+已接受的证据（屏障修正后的最终树，2026-10-24；命令与日志见
+`/tmp/phase12-dax-barrier-report.md`，完整 API 见
+`/tmp/phase12-owner-report.md`）：
+
+| 检查 | 结果 |
+| --- | --- |
+| `make snapshot-fmt`（macOS 主机） | 通过，无差异 |
+| 容器 `snapshot-check`（另含无 feature 的 `krun-vmm`、`krun-devices`）、`snapshot-build` | 通过 |
+| macOS `snapshot-check`（`krun-devices --features net`） | 通过 |
+| 容器 `snapshot-test`：`krun-devices` snapshot | **132/132**（`snapshot_fs` 49） |
+| 容器 `snapshot-test`：`krun-vmm`（blk,net） | **59 通过、54 失败**，全部在打开 `/dev/kvm` 时失败（原有 48 + 6 个 `snapshot_fs_kvm`） |
+| 容器无 feature `krun-vmm` | **55 通过、41 失败**，原因相同 |
+| macOS 原生 console / net / vsock | 26/26、20/20、16/16 |
+
+容器为 amd64 `rust:1-bookworm` 离线容器，`--cap-add SYS_ADMIN --tmpfs
+/tmp:rw,exec`，未挂载 `/dev/kvm`。打开 KVM 的测试均为失败，既未跳过也
+未通过，完整测试命令因此返回失败。**未验证**：KVM 实际运行（6 个
+`snapshot_fs_kvm`、所有需要 VM 的 owner 路径、原有 48 个 KVM 测试）、
+Linux guest 的 virtiofs/DAX 驱动（fixture 为实模式 mailbox guest）、首次
+DAX ledger 之后的 arm64 Linux、clippy，以及任何 BoxLite/shim 恢复（阶段 13）。
 
 ## 已知边界与协调记录
 
@@ -241,12 +417,18 @@ BoxLite/shim 生命周期接入仍留在阶段 13。恢复工作应继续由 Cla
   耗尽时可能留下已创建对象，但不会发出重复/保留 ID。
 - 既有 `descriptor_utils` 的 descriptor 内 split 和 `write_from_at` count
   问题尚未修改；当前 FUSE 测试使用 Linux 驱动的回复布局，后续避免扩大范围。
+  批次 3 的 owner 测试中观察到：小于回复缓冲区的 READ（5 字节）返回了多于
+  请求长度的数据，测试改为整页读取，未修改该代码。
 - Orca run：`run_9438a313f694`。批次 1 与修正已完成；批次 2
   `task_d288b3b9b609` / `ctx_af1c26cdb38e` 因用户要求暂停结算为 failed，
   **并非实现或测试失败**。恢复时使用新 Dispatch，不复用已结算的生命周期 ID。
   DAX ledger 已审查并本地提交（`c79d6ff`）；独立归档由
   `task_170725846c10` / `ctx_6f4ca8a68320` 实现，审查修正由
-  `task_bbbbe33e568a` / `ctx_bdbf73fe254d` 完成，均已审查并本地提交。
+  `task_bbbbe33e568a` / `ctx_bdbf73fe254d` 完成，均已审查并本地提交
+  （`bb0617d`）。批次 3（owner、v7）由 `task_9f334338d6c4` /
+  `ctx_9453eddecccd` 实现，其 DAX 执行屏障修正由 `task_d2be56a20512` /
+  `ctx_4c954b6bca9c` 实现，均已经 Codex 审查通过，并在阶段 12 收尾提交中
+  本地提交。
 - 原终端仍可供后续使用；`worker-start --terminal` 返回 agent_unconfigured，
   当前已验证可通过 task-create、dispatch --return-preamble 和 terminal send
   投递新任务。遵循 Orca 技能要求重新确认运行态，不盲目重复启动。

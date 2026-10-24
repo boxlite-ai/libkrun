@@ -19,7 +19,7 @@ use super::super::{
 use super::passthrough;
 #[cfg(target_os = "linux")]
 use super::passthrough::{
-    ArchiveError, DaxPages, DaxWindow, ImportedArchive, PassthroughCheckpoint,
+    ArchiveError, DaxMappingControl, DaxPages, DaxWindow, ImportedArchive, PassthroughCheckpoint,
     PassthroughSnapshotError, PassthroughState, RestoredObject, ShareSource,
 };
 use super::worker::{FsServer, FsWorker, FsWorkerHandle};
@@ -44,6 +44,9 @@ impl Default for VirtioFsConfig {
 }
 
 unsafe impl ByteValued for VirtioFsConfig {}
+
+/// The features every virtio-fs device offers.
+pub const FS_FEATURES: u64 = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
 /// The FUSE session of an activated, frozen share.
 #[cfg(target_os = "linux")]
@@ -74,6 +77,12 @@ pub struct Fs {
     /// restores and captures nothing anymore and must be discarded.
     #[cfg(target_os = "linux")]
     dax_lost: bool,
+    /// Window ranges (offset, length) a failed `mmap(MAP_FIXED)` may have
+    /// unmapped, so other memory may now live there; see `dax_unowned`.
+    #[cfg(target_os = "linux")]
+    dax_unowned: Vec<(u64, u64)>,
+    /// `retire` ended the device for good.
+    retired: bool,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -87,21 +96,44 @@ impl Fs {
         allow_root_dir_delete: bool,
         read_only: bool,
     ) -> super::Result<Fs> {
-        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+        let fs_cfg = passthrough::Config {
+            root_dir: shared_dir.into(),
+            allow_root_dir_delete,
+            ..Default::default()
+        };
+        Self::create(fs_id, fs_cfg, exit_code, read_only)
+    }
 
+    /// `new` for a root directory whose path need not be UTF-8.
+    #[cfg(target_os = "linux")]
+    pub fn new_at(
+        fs_id: String,
+        root_dir: std::path::PathBuf,
+        exit_code: Arc<AtomicI32>,
+        allow_root_dir_delete: bool,
+        read_only: bool,
+    ) -> super::Result<Fs> {
+        let fs_cfg = passthrough::Config {
+            root_dir,
+            allow_root_dir_delete,
+            ..Default::default()
+        };
+        Self::create(fs_id, fs_cfg, exit_code, read_only)
+    }
+
+    fn create(
+        fs_id: String,
+        fs_cfg: passthrough::Config,
+        exit_code: Arc<AtomicI32>,
+        read_only: bool,
+    ) -> super::Result<Fs> {
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        let fs_cfg = passthrough::Config {
-            root_dir: shared_dir,
-            allow_root_dir_delete,
-            ..Default::default()
-        };
-
         Ok(Fs {
-            avail_features,
+            avail_features: FS_FEATURES,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
@@ -115,6 +147,9 @@ impl Fs {
             restored_server: None,
             #[cfg(target_os = "linux")]
             dax_lost: false,
+            #[cfg(target_os = "linux")]
+            dax_unowned: Vec::new(),
+            retired: false,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -150,6 +185,14 @@ impl Fs {
         self.passthrough_cfg.snapshot = true;
     }
 
+    /// Make every host mapping call on the DAX window run inside `control`
+    /// (see `passthrough::DaxMappingControl`). Must precede activation and
+    /// restore.
+    #[cfg(target_os = "linux")]
+    pub fn set_dax_control(&mut self, control: Arc<dyn DaxMappingControl>) {
+        self.passthrough_cfg.dax_control = Some(control);
+    }
+
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
@@ -166,6 +209,25 @@ impl Fs {
     /// Snapshot control handle for the activated worker, if any.
     pub fn worker_control(&self) -> Option<&FsWorkerHandle> {
         self.worker_control.as_ref()
+    }
+
+    /// The device must be discarded: a lost DAX window, a failed reset
+    /// remapping or `retire` ended it.
+    pub fn must_discard(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.dax_lost {
+            return true;
+        }
+        self.retired
+    }
+
+    /// Window ranges (offset, length) this device no longer vouches for: a
+    /// failed `mmap(MAP_FIXED)` may have unmapped them, so other memory of
+    /// the process may live there now. Whoever owns the window must leave
+    /// them mapped as they are.
+    #[cfg(target_os = "linux")]
+    pub fn dax_unowned(&self) -> &[(u64, u64)] {
+        &self.dax_unowned
     }
 
     /// The DAX window as this process maps it, if the device has one.
@@ -215,6 +277,9 @@ impl Fs {
         if self.dax_lost {
             return Err(PassthroughSnapshotError::DaxLost);
         }
+        if self.retired {
+            return Err(PassthroughSnapshotError::Invalid("device retired"));
+        }
         if self.is_activated() || self.restored_server.is_some() {
             return Err(PassthroughSnapshotError::Invalid(
                 "device already holds a session",
@@ -241,7 +306,11 @@ impl Fs {
             init_binary,
         )?;
         if let Some(window) = window {
-            server.passthrough().map_dax(window, dax_pages)?;
+            if let Err(e) = server.passthrough().map_dax(window, dax_pages) {
+                // A host call that failed part way retires the device.
+                self.keep_lost_window(&server);
+                return Err(e);
+            }
         }
         self.restored_server = Some(server);
         // A reset device serves the same init.krun again.
@@ -260,6 +329,9 @@ impl Fs {
         }
         if self.dax_lost {
             return Err(PassthroughSnapshotError::DaxLost);
+        }
+        if self.retired {
+            return Err(PassthroughSnapshotError::Invalid("device retired"));
         }
         let server = self.server.as_deref().or(self.restored_server.as_ref());
         let Some(server) = server else {
@@ -290,7 +362,7 @@ impl Fs {
         if share >= archive.shares() {
             return Err(ArchiveError::Invalid("no such imported share"));
         }
-        if std::path::Path::new(&self.passthrough_cfg.root_dir) != archive.root(share) {
+        if self.passthrough_cfg.root_dir != archive.root(share) {
             return Err(ArchiveError::Invalid(
                 "device root is not the imported share root",
             ));
@@ -316,9 +388,10 @@ impl Fs {
         if self.worker_thread.is_some() {
             panic!("virtio_fs: worker thread already exists");
         }
-        #[cfg(target_os = "linux")]
-        if self.dax_lost {
-            error!("virtio_fs: the DAX window was lost; the device must be discarded");
+        if self.must_discard() {
+            error!(
+                "virtio_fs: the device was retired or lost its DAX window; it must be discarded"
+            );
             return Err(ActivateError::BadActivate);
         }
 
@@ -363,6 +436,46 @@ impl Fs {
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
+    }
+
+    /// Stop and join the worker and take the sessions it served or holds
+    /// for its activation.
+    fn stop(&mut self) -> (Option<Arc<FsServer>>, Option<FsServer>) {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("error waiting for worker thread: {e:?}");
+            }
+        }
+        self.worker_control = None;
+        self.device_state = DeviceState::Inactive;
+        (self.server.take(), self.restored_server.take())
+    }
+
+    /// Record a session's window lost by a failed host call, with the
+    /// ranges it may no longer own.
+    #[cfg(target_os = "linux")]
+    fn keep_lost_window(&mut self, session: &FsServer) {
+        if session.passthrough().dax_window_lost() {
+            self.dax_lost = true;
+            self.dax_unowned.extend(session.passthrough().dax_unowned());
+        }
+    }
+
+    /// End the device for good on teardown: stop and join its worker and
+    /// drop its sessions, but leave the DAX window as it is. Unlike a guest
+    /// reset this never remaps memory, which the window's owner may be
+    /// about to release; `dax_unowned` still names the ranges a failed host
+    /// call may have unmapped. A retired device never activates, restores
+    /// or captures again.
+    pub fn retire(&mut self) {
+        let (served, restored) = self.stop();
+        #[cfg(target_os = "linux")]
+        for session in served.as_deref().into_iter().chain(restored.as_ref()) {
+            self.keep_lost_window(session);
+        }
+        drop((served, restored));
+        self.retired = true;
     }
 }
 
@@ -440,18 +553,10 @@ impl VirtioDevice for Fs {
     }
 
     fn reset(&mut self) -> bool {
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
-            if let Err(e) = worker.join() {
-                error!("error waiting for worker thread: {e:?}");
-            }
-        }
-        self.worker_control = None;
         // A reset ends the session the device serves or holds for its
         // activation (a restore); the next one starts with FUSE_INIT on a
         // fresh share, which serves the same init.krun (`passthrough_cfg`).
-        let served = self.server.take();
-        let restored = self.restored_server.take();
+        let (served, restored) = self.stop();
         // The session's DAX mappings outlive it; a snapshot-mode share's
         // next ledger starts from private zero memory. A window a failed
         // host call lost may no longer be wholly the device's, so it is
@@ -464,23 +569,36 @@ impl VirtioDevice for Fs {
             self.dax_lost,
         ) {
             if session.passthrough().dax_window_lost() {
-                self.dax_lost = true;
-            } else if let Err(e) = passthrough::reset_dax_window(window) {
-                error!("virtio_fs: cannot reset the DAX window: {e}");
-                self.dax_lost = true;
+                self.keep_lost_window(session);
+            } else {
+                let control = self.passthrough_cfg.dax_control.as_deref();
+                match passthrough::reset_dax_window(window, control) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        // `MAP_FIXED` over the whole window may have
+                        // unmapped it.
+                        error!("virtio_fs: cannot reset the DAX window: {e}");
+                        self.dax_lost = true;
+                        self.dax_unowned = vec![(0, window.size)];
+                    }
+                    // The owner's guest execution ended: the window is
+                    // unchanged, but not the zero memory a new session
+                    // needs.
+                    None => self.dax_lost = true,
+                }
             }
         }
         drop((served, restored));
-        self.device_state = DeviceState::Inactive;
         true
     }
 }
 
 impl Drop for Fs {
-    /// A dropped device stops and joins its worker first, including one an
-    /// owner activated but never inserted (a failed restore); the session
-    /// and guest memory the worker uses stay alive until it exits.
+    /// A dropped device is retired: its worker is stopped and joined first,
+    /// including one an owner activated but never inserted (a failed
+    /// restore), while the session and guest memory it uses are alive. The
+    /// DAX window is not remapped.
     fn drop(&mut self) {
-        self.reset();
+        self.retire();
     }
 }

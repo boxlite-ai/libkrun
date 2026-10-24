@@ -8,10 +8,12 @@
  * MMIO entry 0x900: unreal mode (FS with a 4 GiB limit), then the guest
  * performs one 32-bit access per request in the mailbox at 0x9100: request
  * sequence, op (1 write, 2 read, 3 sti), address, value/result, done
- * sequence; counter 0x9120 moves every loop. Interrupts stay off until an
- * sti request; the PIC is remapped to 0x20/0x28 with only the cascade and
- * slave IRQ0 (GSI 8, the console) unmasked, and vector 0x28 counts at
- * 0x9124.
+ * sequence; counter 0x9120 moves every loop. The address is absolute, so
+ * guest RAM, an MMIO slot or a DAX window can be accessed. Interrupts stay
+ * off until an sti request; the PIC is remapped to 0x20/0x28 with only the
+ * cascade and slave IRQ0/IRQ1 (GSI 8, the console; GSI 9, the first
+ * virtio-fs share) unmasked, vector 0x28 counts at 0x9124 and vector 0x29
+ * at 0x9126.
  */
 .intel_syntax noprefix
 .code16
@@ -250,10 +252,12 @@ legacy_reset:
     out 0xa1, al
     mov al, 0xfb
     out 0x21, al
-    mov al, 0xfe
+    mov al, 0xfc
     out 0xa1, al
     mov word ptr [0xa0], offset mmio_irq + 0x1000
     mov word ptr [0xa2], 0
+    mov word ptr [0xa4], offset fs_irq + 0x1000
+    mov word ptr [0xa6], 0
     lgdt [mmio_gdt_desc + 0x1000]
     mov eax, cr0
     or al, 1
@@ -287,6 +291,14 @@ mmio_done:
 mmio_irq:
     push ax
     inc word ptr [0x9124]
+    mov al, 0x20
+    out 0xa0, al
+    out 0x20, al
+    pop ax
+    iret
+fs_irq:
+    push ax
+    inc word ptr [0x9126]
     mov al, 0x20
     out 0xa0, al
     out 0x20, al

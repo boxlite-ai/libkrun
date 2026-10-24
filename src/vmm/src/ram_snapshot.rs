@@ -17,6 +17,10 @@ use crate::device_manager::shm::ShmRegion;
 use crate::vstate::{KvmContext, Vcpu, VcpuEvent, VcpuHandle, VcpuResponse, Vm};
 
 pub(crate) use legacy::SerialEndpoints;
+// Callers of the private API name `DaxRange` for `FsShareConfig::dax`; so
+// far only its tests do.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use virtio_fs::{DaxRange, FsShareConfig};
 pub(crate) use vsock::VsockPorts;
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
@@ -30,9 +34,11 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 mod console;
 mod event_devices;
 mod events;
+pub(crate) mod execution;
 mod full;
 mod legacy;
 mod lifecycle;
+mod virtio_fs;
 mod vsock;
 mod wiring;
 
@@ -387,6 +393,10 @@ pub(crate) struct RestoreResources {
     /// Fresh console ports in the image's port order: names, directions
     /// and input, output and terminal kinds must equal the image's.
     pub(crate) console_ports: Option<Vec<devices::virtio::PortDescription>>,
+    /// New directory for the imported virtio-fs shares: an absolute path
+    /// without NUL bytes, created exclusively with mode 0700 and kept once
+    /// the import succeeds.
+    pub(crate) fs_dir: Option<PathBuf>,
 }
 
 /// Owns the minimal VM. No mapping, VM fd, or vCPU handle escapes this owner.
@@ -416,6 +426,20 @@ pub(crate) struct RamSnapshotVm {
     vsock: Option<vsock::VsockDevice>,
     console: Option<console::ConsoleDevice>,
     events: Option<events::EventThread>,
+    /// virtio-fs shares in index order.
+    fs: Vec<virtio_fs::FsDevice>,
+    /// The imported shares' tree until the import that created it succeeds.
+    fs_import: Option<devices::virtio::fs::passthrough::ImportedArchive>,
+    /// The caller declared every host writer of the shares stopped; held
+    /// through a pause, cleared by resume and disable.
+    host_writers_stopped: bool,
+    /// Every DAX window the owner mapped, in memslot order. Declared after
+    /// `vm`: a window is unmapped only after the VM fd (and its memslot)
+    /// closed.
+    dax: Vec<virtio_fs::DaxBacking>,
+    /// Gates every KVM_RUN of an owner with a DAX window against the
+    /// `MAP_FIXED` calls on its windows; see `execution`.
+    execution: Arc<execution::ExecutionBarrier>,
 }
 
 impl RamSnapshotVm {
@@ -431,6 +455,8 @@ impl RamSnapshotVm {
         let mut vm = Vm::new(kvm.fd()).map_err(Error::State)?;
         vm.memory_init(&memory, kvm.max_memslots())
             .map_err(Error::State)?;
+        let exit = events::Exit::new()?;
+        let execution = execution::ExecutionBarrier::new(exit.notifier()?, execution::kick_vcpu);
         Ok(Self {
             handles: Vec::new(),
             vm,
@@ -443,7 +469,7 @@ impl RamSnapshotVm {
             bus: devices::Bus::new(),
             io_bus: devices::Bus::new(),
             legacy: None,
-            exit: events::Exit::new()?,
+            exit,
             #[cfg(feature = "blk")]
             disks: Vec::new(),
             #[cfg(feature = "blk")]
@@ -455,6 +481,11 @@ impl RamSnapshotVm {
             vsock: None,
             console: None,
             events: None,
+            fs: Vec::new(),
+            fs_import: None,
+            host_writers_stopped: false,
+            dax: Vec::new(),
+            execution,
         })
     }
 
@@ -538,6 +569,31 @@ impl RamSnapshotVm {
         console::attach(self, ports)
     }
 
+    /// Attach a virtio-fs share (at most seven) before vCPUs start; see
+    /// `FsShareConfig`. Every check precedes any effect.
+    pub(crate) fn attach_fs(&mut self, config: FsShareConfig) -> Result<()> {
+        virtio_fs::attach(self, config)
+    }
+
+    /// Declare that the caller stopped every host writer of the virtio-fs
+    /// share directories and of any alias of their files, until the next
+    /// resume; exports of an owner with shares require it. Accepted only
+    /// while the owner runs usable, unpaused and not exiting; a pause keeps
+    /// it, resume and disable clear it.
+    pub(crate) fn declare_host_writers_stopped(&mut self) -> Result<()> {
+        self.check_execution()?;
+        if self.control.unusable || self.handles.is_empty() || self.pause.is_some() {
+            return Err(Error::Invalid(
+                "declaring host writers stopped requires a running usable VM",
+            ));
+        }
+        if self.exit.requested() {
+            return Err(Error::Invalid("the VM is exiting"));
+        }
+        self.host_writers_stopped = true;
+        Ok(())
+    }
+
     /// Attach COM1–COM4, CMOS and the i8042 before vCPUs start. Each
     /// endpoint must already be nonblocking; its flags are never changed.
     pub(crate) fn attach_legacy(&mut self, serial: SerialEndpoints) -> Result<()> {
@@ -558,7 +614,7 @@ impl RamSnapshotVm {
     }
 
     /// Every attached MMIO device as (transport, MMIO address, GSI), in the
-    /// fixed order disks, NIC, RNG, balloon, vsock, console.
+    /// fixed order disks, NIC, RNG, balloon, vsock, console, virtio-fs.
     pub(super) fn mmio_devices(&self) -> Vec<(&Arc<Mutex<MmioTransport>>, u64, u32)> {
         let mut devices = Vec::new();
         #[cfg(feature = "blk")]
@@ -581,6 +637,7 @@ impl RamSnapshotVm {
         );
         devices.extend(self.vsock.iter().map(vsock::slot));
         devices.extend(self.console.iter().map(console::slot));
+        devices.extend(self.fs.iter().map(virtio_fs::slot));
         devices
     }
 
@@ -609,6 +666,7 @@ impl RamSnapshotVm {
             + event_devices::expected_alias_clones(self)
             + vsock::expected_alias_clones(self)
             + console::expected_alias_clones(self)
+            + virtio_fs::expected_alias_clones(self)
     }
 
     /// Start the event thread: the exit watch, plus the attached RNG,
@@ -650,6 +708,10 @@ impl RamSnapshotVm {
             )
             .map_err(Error::State)?;
             cpu.set_mmio_bus(self.bus.clone());
+            // Windows exist only before the vCPUs: attached or imported.
+            if !self.dax.is_empty() {
+                cpu.set_execution_barrier(self.execution.clone());
+            }
             configure(&mut cpu)?;
             self.handles
                 .push(cpu.start_threaded().map_err(Error::State)?);
@@ -664,16 +726,20 @@ impl RamSnapshotVm {
     /// Stop every thread: first cancel any vsock send blocked under the
     /// device lock (the event thread or a vCPU could wait on that lock
     /// forever), then the event thread (it holds vCPU stop handles whose
-    /// pthread IDs are valid only until the vCPUs are joined), then the
-    /// vCPUs (they could still touch the devices), then the disk, NIC,
-    /// vsock and console workers, which hold guest RAM, the disk images,
-    /// the backend connections and the console endpoints. Every startup,
+    /// pthread IDs are valid only until the vCPUs are joined), then retire
+    /// the execution barrier (a vCPU or remapping waiting on it gives up;
+    /// nothing runs or remaps a window again), then the vCPUs (they could
+    /// still touch the devices), then the disk, NIC,
+    /// vsock, console and virtio-fs workers, which hold guest RAM, the disk
+    /// images, the backend connections, the console endpoints and the
+    /// shares (a retired share leaves its DAX window alone). Every startup,
     /// import, pause and resume failure ends here.
     fn stop_threads(&mut self) {
         vsock::quiesce_gate(self);
         if let Some(events) = &mut self.events {
             events.stop();
         }
+        self.execution.retire();
         for handle in &mut self.handles {
             handle.finish();
         }
@@ -683,6 +749,7 @@ impl RamSnapshotVm {
         nic::stop(self);
         vsock::teardown(self);
         console::teardown(self);
+        virtio_fs::teardown(self);
     }
 
     /// The stage-2 RAM alias probe, parameterized by the clones the owner's
@@ -746,8 +813,9 @@ impl RamSnapshotVm {
 
 impl Drop for RamSnapshotVm {
     fn drop(&mut self) {
-        // The imported guard removes only the files it created, after every
-        // thread has exited.
+        // The imported guards remove only the files they created, after
+        // every thread has exited; the DAX windows unmap after the VM fd
+        // closed (field order).
         self.stop_threads();
         #[cfg(feature = "blk")]
         drop(self.imported.take());

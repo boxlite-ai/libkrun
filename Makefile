@@ -109,9 +109,10 @@ SNAPSHOT_VSOCK_FILTER ?= snapshot_vsock
 # Host-native virtio-console port worker and state tests (macOS or Linux, no KVM).
 SNAPSHOT_CONSOLE_FILTER ?= snapshot_console
 # The virtio-fs worker and passthrough session tests (snapshot_fs) are
-# Linux-only and run with the krun-devices tests of `snapshot-test`; the
-# share archive tests need root with CAP_SYS_ADMIN and CAP_MKNOD on a tmpfs
-# /tmp (e.g. docker run --cap-add SYS_ADMIN --tmpfs /tmp:rw,exec).
+# Linux-only and run with the krun-devices and krun-vmm tests of
+# `snapshot-test`; the share archive and owner tests need root with
+# CAP_SYS_ADMIN and CAP_MKNOD on a tmpfs /tmp (e.g. docker run --cap-add
+# SYS_ADMIN --tmpfs /tmp:rw,exec).
 .PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-guest snapshot-net-host-test snapshot-vsock-host-test snapshot-console-host-test
 snapshot-fmt:
 	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs src/devices/src/virtio/control.rs src/devices/src/virtio/net/backend.rs src/devices/src/virtio/net/device.rs src/devices/src/virtio/net/mod.rs src/devices/src/virtio/net/unixstream.rs src/devices/src/virtio/net/worker.rs src/devices/src/virtio/rng/mod.rs src/devices/src/virtio/rng/device.rs src/devices/src/virtio/balloon/mod.rs src/devices/src/virtio/balloon/device.rs src/devices/src/legacy/x86_64/serial.rs src/devices/src/legacy/x86_64/cmos.rs src/devices/src/legacy/i8042.rs src/devices/src/virtio/vsock/mod.rs src/vmm/src/ram_snapshot/vsock.rs src/devices/src/virtio/console/mod.rs src/vmm/src/ram_snapshot/console.rs src/devices/src/virtio/fs/mod.rs

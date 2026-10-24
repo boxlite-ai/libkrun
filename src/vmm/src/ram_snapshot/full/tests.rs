@@ -610,13 +610,13 @@ fn rejection(result: Result<impl Sized>) -> String {
     }
 }
 
-/// Versions 1–5 (4 had no vsock section, 5 no console section) are
-/// rejected by version before their JSON is parsed.
+/// Versions 1–6 (4 had no vsock section, 5 no console section, 6 no
+/// virtio-fs section) are rejected by version before their JSON is parsed.
 #[test]
 fn snapshot_full_rejects_pre_unified_versions() {
     let dir = TempDir::new();
     let path = dir.path();
-    for old in 1..=5 {
+    for old in 1..=6 {
         write_header_only(&path, old, b"{}");
         let error = rejection(read_metadata(&mut File::open(&path).unwrap(), 32, 32));
         assert!(
@@ -624,6 +624,114 @@ fn snapshot_full_rejects_pre_unified_versions() {
             "{error}"
         );
     }
+}
+
+/// A metadata JSON holding one zeroed CPU, complete zeroed irqchip state,
+/// fresh legacy devices and the given RAM `regions`.
+fn minimal_metadata(regions: serde_json::Value) -> serde_json::Value {
+    use kvm_bindings::{
+        kvm_clock_data, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state, kvm_pit_state2,
+        kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
+    };
+    use std::mem::size_of;
+    let zeros = |len: usize| vec![0u8; len];
+    // chip_id leads kvm_irqchip: PIC master 0, PIC slave 1, IOAPIC 2.
+    let chip = |id: u8| {
+        let mut bytes = zeros(size_of::<kvm_irqchip>());
+        bytes[0] = id;
+        bytes
+    };
+    let evt = || utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+    let serial: Vec<_> = (0..4)
+        .map(|_| devices::legacy::Serial::new_sink(evt()).snapshot_state())
+        .collect();
+    serde_json::json!({
+        "compatibility": {"cpuid": [], "msrs": [], "xsave_size": 0, "caps": []},
+        "cpus": [{
+            "cpuid": [],
+            "msrs": [],
+            "debug_regs": zeros(size_of::<kvm_debugregs>()),
+            "lapic": zeros(size_of::<kvm_lapic_state>()),
+            "mp_state": zeros(size_of::<kvm_mp_state>()),
+            "regs": zeros(size_of::<kvm_regs>()),
+            "sregs": zeros(size_of::<kvm_sregs>()),
+            "vcpu_events": zeros(size_of::<kvm_vcpu_events>()),
+            "xcrs": zeros(size_of::<kvm_xcrs>()),
+            "xsave": [],
+            "tsc_khz": 0,
+        }],
+        "vm": {
+            "pitstate": zeros(size_of::<kvm_pit_state2>()),
+            "clock": zeros(size_of::<kvm_clock_data>()),
+            "pic_master": chip(0),
+            "pic_slave": chip(1),
+            "ioapic": chip(2),
+        },
+        "regions": regions,
+        "disks": [],
+        "nic": null,
+        "rng": null,
+        "balloon": null,
+        "vsock": null,
+        "console": null,
+        "legacy": {
+            "serial": serial,
+            "cmos": devices::legacy::Cmos::new(0, 0).snapshot_state(),
+            "i8042": devices::legacy::I8042Device::new(evt(), evt()).snapshot_state(),
+        },
+        "fs": null,
+    })
+}
+
+/// Every device section relies on validated RAM regions, so the regions
+/// are checked first: a region wrapping the address space next to a legacy
+/// section is refused, never reaching the CMOS capacity arithmetic.
+#[test]
+fn snapshot_full_validates_ram_regions_before_device_sections() {
+    let dir = TempDir::new();
+    let path = dir.path();
+    let valid = minimal_metadata(serde_json::json!([{"gpa": 0, "len": 0x2000, "attributes": 0}]));
+    write_header_only(&path, FULL_VERSION, &serde_json::to_vec(&valid).unwrap());
+    let error = rejection(read_metadata(&mut File::open(&path).unwrap(), 32, 32));
+    assert!(error.contains("length differs"), "{error}");
+    let wrapping = serde_json::json!([{"gpa": u64::MAX - 0xfff, "len": 0x2000, "attributes": 0}]);
+    let metadata = minimal_metadata(wrapping);
+    write_header_only(&path, FULL_VERSION, &serde_json::to_vec(&metadata).unwrap());
+    let error = rejection(read_metadata(&mut File::open(&path).unwrap(), 32, 32));
+    assert!(error.contains("GPA overflow"), "{error}");
+}
+
+/// A share section is checked with the rest of the metadata, before RAM or
+/// any resource exists: its payload lengths decide the image length, and
+/// an inactive device carrying a FUSE session is refused.
+#[test]
+fn snapshot_full_share_sections_are_checked_with_the_image_length() {
+    let dir = TempDir::new();
+    let src = dir.0.join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), b"file").unwrap();
+    let (share, payloads) = crate::ram_snapshot::virtio_fs::tests::captured_share(&src);
+    let image = |metadata: &serde_json::Value, payloads: &[u8]| {
+        let path = dir.path();
+        write_header_only(&path, FULL_VERSION, &serde_json::to_vec(metadata).unwrap());
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0; 0x2000]).unwrap();
+        file.write_all(payloads).unwrap();
+        read_metadata(&mut File::open(&path).unwrap(), 32, 32)
+    };
+    let mut metadata =
+        minimal_metadata(serde_json::json!([{"gpa": 0, "len": 0x2000, "attributes": 0}]));
+    metadata["legacy"] = serde_json::Value::Null;
+    metadata["fs"] = serde_json::to_value(&share).unwrap();
+    let parsed = image(&metadata, &payloads).unwrap();
+    assert_eq!(parsed.fs.unwrap().devices.len(), 1);
+    let error = rejection(image(&metadata, &payloads[1..]));
+    assert!(error.contains("length differs"), "{error}");
+    let device = &mut metadata["fs"]["devices"][0];
+    device["device"]["activated"] = false.into();
+    device["transport"]["device_status"] = 0b1011.into();
+    let error = rejection(image(&metadata, &payloads));
+    assert!(error.contains("carries a FUSE session"), "{error}");
 }
 
 /// Each target resource is required exactly when its device is present.
@@ -635,6 +743,7 @@ fn snapshot_full_restore_resources_must_match_devices() {
         vsock: false,
         console: false,
         legacy: false,
+        fs: false,
     };
     none.check(&RestoreResources::default()).unwrap();
     let with_disks = Requirements {
@@ -682,6 +791,14 @@ fn snapshot_full_restore_resources_must_match_devices() {
     };
     with_console.check(&console_ports).unwrap();
     assert!(none.check(&console_ports).is_err());
+    let with_fs = Requirements { fs: true, ..none };
+    assert!(with_fs.check(&RestoreResources::default()).is_err());
+    let fs_dir = RestoreResources {
+        fs_dir: Some(PathBuf::from("/nonexistent")),
+        ..Default::default()
+    };
+    with_fs.check(&fs_dir).unwrap();
+    assert!(none.check(&fs_dir).is_err());
 }
 
 /// A nonblocking owner end and a blocking-with-timeout test end.

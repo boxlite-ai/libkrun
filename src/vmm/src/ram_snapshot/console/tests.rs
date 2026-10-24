@@ -4,7 +4,7 @@
 //! metadata/resource/ring validation and restore paths on a transport and
 //! the owner's event thread, driven through MMIO and guest RAM. The guest
 //! ring driver here is shared with `kvm_tests`, where the guest vCPU itself
-//! performs every MMIO access. Every test name contains "snapshot" for
+//! performs every MMIO access, and with the virtio-fs tests. Every test name contains "snapshot" for
 //! `make snapshot-test`.
 
 use std::io::{ErrorKind, Read, Write};
@@ -23,13 +23,13 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, VolatileSli
 use super::*;
 use crate::ram_snapshot::events::{Devices, EventThread, Exit, Start};
 
-pub(super) const QSIZE: u16 = 32;
+pub(in crate::ram_snapshot) const QSIZE: u16 = 32;
 /// Queue `q` of the driver: descriptor table, avail ring and used ring in
 /// one 4 KiB page, clear of the fixture (0x1000), the CPU and mailbox areas
 /// (0x8000–0x9200) and the stacks (below 0xc000).
 const RINGS: u64 = 0x2_0000;
 const BUFS: u64 = 0x4_0000;
-pub(super) const RAM_LEN: usize = 2 << 20;
+pub(in crate::ram_snapshot) const RAM_LEN: usize = 2 << 20;
 pub(super) const CONTROL_RX: usize = 2;
 pub(super) const CONTROL_TX: usize = 3;
 const NEXT: u16 = 1;
@@ -37,8 +37,8 @@ const WRITE: u16 = 2;
 pub(super) const DEVICE_READY: u16 = 0;
 pub(super) const PORT_READY: u16 = 3;
 pub(super) const PORT_OPEN: u16 = 6;
-pub(super) const WAIT: Duration = Duration::from_secs(5);
-pub(super) const QUIET: Duration = Duration::from_millis(150);
+pub(in crate::ram_snapshot) const WAIT: Duration = Duration::from_secs(5);
+pub(in crate::ram_snapshot) const QUIET: Duration = Duration::from_millis(150);
 
 pub(super) fn rx(port: usize) -> usize {
     if port == 0 {
@@ -52,7 +52,7 @@ pub(super) fn tx(port: usize) -> usize {
     rx(port) + 1
 }
 
-pub(super) fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+pub(in crate::ram_snapshot) fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + WAIT;
     while !cond() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -60,18 +60,17 @@ pub(super) fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
-/// Register access to the console's MMIO window, from the test (here) or
+/// Register access to a device's MMIO window, from the test (here) or
 /// from the guest vCPU (`kvm_tests`).
-pub(super) trait Mmio {
+pub(in crate::ram_snapshot) trait Mmio {
     fn write(&self, offset: u64, value: u32);
     fn read(&self, offset: u64) -> u32;
 }
 
-/// What a virtio-console guest driver tracks; the rings and buffers live
-/// in guest RAM, so a copy taken with the RAM image continues on a
-/// restored VM.
+/// What a virtio guest driver tracks; the rings and buffers live in guest
+/// RAM, so a copy taken with the RAM image continues on a restored VM.
 #[derive(Clone)]
-pub(super) struct Driver {
+pub(in crate::ram_snapshot) struct Driver {
     queues: usize,
     posted: Vec<u16>,
     next_desc: Vec<u16>,
@@ -80,7 +79,11 @@ pub(super) struct Driver {
 
 impl Driver {
     pub(super) fn new(ports: usize) -> Driver {
-        let queues = 2 + 2 * ports;
+        Driver::with_queues(2 + 2 * ports)
+    }
+
+    /// A driver of `queues` queues.
+    pub(in crate::ram_snapshot) fn with_queues(queues: usize) -> Driver {
         Driver {
             queues,
             posted: vec![0; queues],
@@ -104,10 +107,16 @@ impl Driver {
     /// Negotiate SIZE, MULTIPORT and VERSION_1, configure every queue and
     /// set DRIVER_OK.
     pub(super) fn activate(&self, mmio: &dyn Mmio) {
+        self.activate_with(mmio, 0b11);
+    }
+
+    /// Negotiate VERSION_1 plus the low feature bits `features`, configure
+    /// every queue and set DRIVER_OK.
+    pub(in crate::ram_snapshot) fn activate_with(&self, mmio: &dyn Mmio, features: u32) {
         mmio.write(0x70, 0b0001);
         mmio.write(0x70, 0b0011);
         mmio.write(0x24, 0);
-        mmio.write(0x20, 0b11);
+        mmio.write(0x20, features);
         mmio.write(0x24, 1);
         mmio.write(0x20, 1);
         mmio.write(0x70, 0b1011);
@@ -125,10 +134,10 @@ impl Driver {
             mmio.write(0x44, 1);
         }
         mmio.write(0x70, 0b1111);
-        assert_eq!(mmio.read(0x70), 0b1111, "console activation failed");
+        assert_eq!(mmio.read(0x70), 0b1111, "device activation failed");
     }
 
-    pub(super) fn alloc(&mut self, len: usize) -> u64 {
+    pub(in crate::ram_snapshot) fn alloc(&mut self, len: usize) -> u64 {
         let addr = self.next_buf;
         self.next_buf += (len as u64).next_multiple_of(0x100);
         assert!(self.next_buf <= RAM_LEN as u64);
@@ -137,7 +146,12 @@ impl Driver {
 
     /// Make a chain of (address, length, device-writable) descriptors
     /// available; the device sees it on its next look at the queue.
-    pub(super) fn post(&mut self, mem: &GuestMemoryMmap, q: usize, bufs: &[(u64, u32, bool)]) {
+    pub(in crate::ram_snapshot) fn post(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        q: usize,
+        bufs: &[(u64, u32, bool)],
+    ) {
         let head = self.next_desc[q];
         for (i, &(addr, len, write)) in bufs.iter().enumerate() {
             let index = (head + i as u16) % QSIZE;
@@ -215,7 +229,7 @@ impl Driver {
     }
 
     /// Used entries (id, len) of queue `q` since the start.
-    pub(super) fn used(mem: &GuestMemoryMmap, q: usize) -> Vec<(u32, u32)> {
+    pub(in crate::ram_snapshot) fn used(mem: &GuestMemoryMmap, q: usize) -> Vec<(u32, u32)> {
         let idx: u16 = mem.read_obj(GuestAddress(Self::used_ring(q) + 2)).unwrap();
         (0..idx)
             .map(|i| {
@@ -227,7 +241,7 @@ impl Driver {
             .collect()
     }
 
-    pub(super) fn read(mem: &GuestMemoryMmap, addr: u64, len: u32) -> Vec<u8> {
+    pub(in crate::ram_snapshot) fn read(mem: &GuestMemoryMmap, addr: u64, len: u32) -> Vec<u8> {
         let mut buf = vec![0; len as usize];
         mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
         buf

@@ -9,8 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,12 +27,12 @@ use super::fuse::{
     WriteIn,
 };
 use super::passthrough::{
-    self, DaxMapping, DaxMappingKind, DaxPages, DaxState, DaxWindow, PassthroughCheckpoint,
-    PassthroughFs, PassthroughSnapshotError, PassthroughState, RestoredObject, SnapshotObject,
-    DAX_PAGE_SIZE, SYNTHETIC_INO_BASE,
+    self, DaxMapping, DaxMappingControl, DaxMappingKind, DaxPages, DaxState, DaxWindow,
+    PassthroughCheckpoint, PassthroughFs, PassthroughSnapshotError, PassthroughState,
+    RestoredObject, SnapshotObject, DAX_PAGE_SIZE, SYNTHETIC_INO_BASE,
 };
 use super::worker::{request_gate, FsServer};
-use super::Fs;
+use super::{Fs, FsSessionCheckpoint};
 use crate::legacy::DummyIrqChip;
 use crate::virtio::persist::QueueState;
 use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -90,7 +90,7 @@ fn cstr(name: &str) -> CString {
 
 fn snapshot_config(dir: &Path) -> passthrough::Config {
     passthrough::Config {
-        root_dir: dir.to_str().unwrap().to_string(),
+        root_dir: dir.to_path_buf(),
         snapshot: true,
         ..Default::default()
     }
@@ -895,7 +895,7 @@ fn snapshot_fs_checkpoint_rejects_disabled_and_exported_shares() {
     let dir = TempDir::new();
     dir.file("f", b"");
     let plain = PassthroughFs::new(passthrough::Config {
-        root_dir: dir.path().to_str().unwrap().to_string(),
+        root_dir: dir.path().to_path_buf(),
         ..Default::default()
     })
     .unwrap();
@@ -1093,7 +1093,7 @@ fn snapshot_fs_restore_rejects_malformed_state() {
     assert!(matches!(
         PassthroughFs::restore(
             passthrough::Config {
-                root_dir: dir.path().to_str().unwrap().to_string(),
+                root_dir: dir.path().to_path_buf(),
                 ..Default::default()
             },
             &good,
@@ -1318,6 +1318,18 @@ fn snapshot_fs_dropped_device_joins_its_worker_and_reset_reactivates() {
     let mut again = Rig::activate(guest, device, queues, false);
     again.init();
     again.getattr(fuse::ROOT_ID);
+}
+
+/// A share root is any path of bytes but NUL; one holding a NUL fails
+/// FUSE_INIT with EINVAL instead of panicking the worker.
+#[test]
+fn snapshot_fs_root_with_a_nul_byte_fails_init() {
+    let dir = TempDir::new();
+    let mut cfg = snapshot_config(dir.path());
+    cfg.root_dir = dir.path().join(OsStr::from_bytes(b"a\0b"));
+    let fs = PassthroughFs::new(cfg).unwrap();
+    let error = fs.init(FsOptions::empty()).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 }
 
 #[test]
@@ -1834,6 +1846,7 @@ fn snapshot_fs_dax_host_failures_lose_the_window() {
     let removal = remove(&fs, &w, &[(2, 1), (1, 1), (3, 1)]);
     assert_eq!(removal.unwrap_err().raw_os_error(), Some(libc::ENOMEM));
     assert_lost(&fs, &w, 3 * p, 7);
+    assert_eq!(fs.dax_unowned(), [(p, p)]);
     reclaim(w, p, p);
 
     // An init.krun copy that unmaps untouched memory and then fails: a
@@ -1845,6 +1858,7 @@ fn snapshot_fs_dax_host_failures_lose_the_window() {
     arm(w.addr + p, Fault::MapAfterUnmap);
     assert!(setup(&fs, &w, init.inode, 0, 1, true, 1).is_err());
     assert_lost(&fs, &w, 0, 8);
+    assert_eq!(fs.dax_unowned(), [(p, p)]);
     reclaim(w, p, p);
 
     // A read-only init.krun copy whose mprotect stops after one page.
@@ -1855,6 +1869,7 @@ fn snapshot_fs_dax_host_failures_lose_the_window() {
     arm(w.addr + p, Fault::ProtectPartly);
     assert!(setup(&fs, &w, init.inode, 0, 2, false, 1).is_err());
     assert_lost(&fs, &w, 3 * p, 9);
+    assert!(fs.dax_unowned().is_empty());
 }
 
 #[test]
@@ -1893,6 +1908,147 @@ fn snapshot_fs_dax_device_freeze_fails_on_a_lost_window() {
     // Dropping the rig stops and joins the worker before the window goes.
     drop(rig);
     reclaim(w, p, p);
+}
+
+/// A new device on `dir` over `w` and the result of restoring `session`
+/// into it.
+fn restore_into(
+    w: &Window,
+    dir: &Path,
+    session: &FsSessionCheckpoint,
+) -> (Fs, Result<(), PassthroughSnapshotError>) {
+    let mut device = Rig::device(dir);
+    device.set_shm_region(w.shm());
+    let restored = device.restore_session(
+        session.options,
+        &session.passthrough.state,
+        same_host_objects(&session.passthrough),
+        session.passthrough.init_binary.clone(),
+        &session.passthrough.dax_pages,
+    );
+    (device, restored)
+}
+
+/// A frozen session over `w` with "f" mapped read-only at window page 1
+/// and a nonzero byte in the anonymous page 0.
+fn mapped_session(dir: &Path, w: &Window) -> Rig {
+    let p = host_page();
+    let mut device = Rig::device(dir);
+    device.set_shm_region(w.shm());
+    let guest = Guest::new(0xfffe);
+    let queues = (0..NUM_QUEUES).map(|q| guest.queue(q)).collect();
+    let mut rig = Rig::activate(guest, device, queues, false);
+    rig.init();
+    let f = rig.lookup(fuse::ROOT_ID, "f");
+    let setup = SetupmappingIn {
+        fh: 0,
+        foffset: 0,
+        len: 2 * p,
+        flags: SetupmappingFlags::READ.bits(),
+        moffset: p,
+    };
+    rig.ok(Opcode::SetupMapping, f.nodeid, setup.as_slice());
+    w.write(0, &[5]);
+    rig.freeze();
+    rig
+}
+
+/// A restore whose `map_dax` fails part way leaves a window that is neither
+/// the saved one nor wholly the device's: the device is retired, so no
+/// second restore maps over it and nothing activates or captures it.
+#[test]
+fn snapshot_fs_failed_map_dax_retires_the_device() {
+    use passthrough::dax_faults::{arm, Fault};
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("f", &paged(2, 0x33));
+    let source = Window::new(4);
+    let rig = mapped_session(dir.path(), &source);
+    let session = rig.fs.snapshot_session().unwrap().unwrap();
+    let w = Window::new(4);
+    // The file mapping's MAP_FIXED unmaps its range, then fails.
+    arm(w.addr + p, Fault::MapAfterUnmap);
+    let (mut device, restored) = restore_into(&w, dir.path(), &session);
+    assert!(restored.is_err());
+    let again = device.restore_session(
+        session.options,
+        &session.passthrough.state,
+        same_host_objects(&session.passthrough),
+        session.passthrough.init_binary.clone(),
+        &session.passthrough.dax_pages,
+    );
+    assert!(matches!(again, Err(PassthroughSnapshotError::DaxLost)));
+    assert!(matches!(
+        device.archive_source(),
+        Err(PassthroughSnapshotError::DaxLost)
+    ));
+    let guest = Guest::new(0xfffe);
+    let interrupt =
+        InterruptTransport::new(DummyIrqChip::new().into(), "test".to_string()).unwrap();
+    let queues = (0..NUM_QUEUES)
+        .map(|q| {
+            DeviceQueue::new(
+                guest.queue(q),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            )
+        })
+        .collect();
+    assert!(device
+        .activate(guest.mem.clone(), interrupt, queues)
+        .is_err());
+    drop(device);
+    reclaim(w, p, 2 * p);
+}
+
+/// Retiring stops the worker but leaves the window exactly as mapped (only
+/// a guest reset returns it to zero memory), and every device names the
+/// ranges a failed `MAP_FIXED` may have handed to other memory: one failed
+/// `map_dax` mapping, a failed reset remapping (the whole window), never a
+/// failed `mprotect`.
+#[test]
+fn snapshot_fs_retired_devices_name_the_window_ranges_they_may_not_own() {
+    use passthrough::dax_faults::{arm, Fault};
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("f", &paged(2, 0x33));
+    let w = Window::new(4);
+    let mut rig = mapped_session(dir.path(), &w);
+    let session = rig.fs.snapshot_session().unwrap().unwrap();
+    rig.fs.retire();
+    assert!(rig.fs.must_discard());
+    assert!(rig.fs.dax_unowned().is_empty());
+    assert_eq!(w.read(0, 1), [5]);
+    assert_eq!(w.read(p, 1), [0x33]);
+    assert!(rig.fs.archive_source().is_err());
+    assert!(rig.fs.snapshot_session().unwrap().is_none());
+
+    let target = Window::new(4);
+    arm(target.addr + p, Fault::MapAfterUnmap);
+    let (failed, _) = restore_into(&target, dir.path(), &session);
+    assert!(failed.must_discard());
+    assert_eq!(failed.dax_unowned(), [(p, 2 * p)]);
+    drop(failed);
+    reclaim(target, p, 2 * p);
+
+    let target = Window::new(4);
+    let (mut restored, result) = restore_into(&target, dir.path(), &session);
+    result.unwrap();
+    assert_eq!(target.read(p, 1), [0x33]);
+    arm(target.addr, Fault::MapAfterUnmap);
+    restored.reset();
+    assert!(restored.must_discard());
+    assert_eq!(restored.dax_unowned(), [(0, 4 * p)]);
+    drop(restored);
+    reclaim(target, 0, 4 * p);
+
+    // A failed mprotect leaves the window lost but still the device's.
+    let w = Window::new(2);
+    let fs = init_share(dir.path());
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    arm(w.addr, Fault::ProtectPartly);
+    assert!(setup(&fs, &w, init.inode, 0, 2, false, 0).is_err());
+    assert!(fs.dax_window_lost());
+    assert!(fs.dax_unowned().is_empty());
 }
 
 /// Set the access time of `path` to `sec`, leaving its modification time.
@@ -2385,6 +2541,160 @@ fn snapshot_fs_reset_keeps_serving_the_restored_init() {
     let mut again = Rig::activate(guest, device, queues, false);
     again.init();
     assert_eq!(read_init(&mut again), &init[..]);
+}
+
+/// A snapshot owner's execution control as these tests see it: it records
+/// whether each remapping it ran kept the window, and once `ended` it runs
+/// none, as an owner whose guest execution ended.
+#[derive(Default)]
+struct Control {
+    kept: Mutex<Vec<bool>>,
+    ended: AtomicBool,
+}
+
+impl DaxMappingControl for Control {
+    fn exclusive(&self, remap: &mut dyn FnMut() -> bool) {
+        if !self.ended.load(Ordering::SeqCst) {
+            let kept = remap();
+            self.kept.lock().unwrap().push(kept);
+        }
+    }
+}
+
+impl Control {
+    fn kept(&self) -> Vec<bool> {
+        self.kept.lock().unwrap().clone()
+    }
+}
+
+fn controlled_share(dir: &Path, control: &Arc<Control>) -> PassthroughFs {
+    let fs = PassthroughFs::new(passthrough::Config {
+        dax_control: Some(control.clone()),
+        ..snapshot_config(dir)
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+    fs
+}
+
+/// Every host mapping call on a live window runs inside the owner's
+/// control, including a `MAP_FIXED` that fails (the guest must not run over
+/// a range it may have handed to other memory) and an `mprotect` that
+/// fails (which hands nothing away); a control whose guest execution ended
+/// runs nothing, so the window stays as it was and the share gives it up
+/// without naming any range.
+#[test]
+fn snapshot_fs_dax_window_remappings_run_inside_the_owner_control() {
+    use passthrough::dax_faults::{arm, Fault};
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("a", &paged(2, 0x10));
+    let control = Arc::new(Control::default());
+    let w = Window::new(4);
+    let fs = controlled_share(dir.path(), &control);
+    let a = fs.lookup(CTX, fuse::ROOT_ID, &cstr("a")).unwrap();
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    setup(&fs, &w, a.inode, 0, 2, false, 0).unwrap();
+    // The read-only copy: a `MAP_FIXED`, then an `mprotect`.
+    setup(&fs, &w, init.inode, 0, 1, false, 2).unwrap();
+    remove(&fs, &w, &[(0, 1), (3, 1)]).unwrap();
+    assert_eq!(control.kept(), [true; 5]);
+    arm(w.addr + p, Fault::MapAfterUnmap);
+    let failed = setup(&fs, &w, a.inode, 0, 1, true, 1);
+    assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::ENOMEM));
+    assert_eq!(control.kept(), [true, true, true, true, true, false]);
+    assert!(fs.dax_window_lost());
+    assert_eq!(fs.dax_unowned(), [(p, p)]);
+    reclaim(w, p, p);
+
+    let w = Window::new(2);
+    let fs = controlled_share(dir.path(), &control);
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    arm(w.addr, Fault::ProtectPartly);
+    assert!(setup(&fs, &w, init.inode, 0, 2, false, 0).is_err());
+    assert_eq!(control.kept()[6..], [true, false]);
+    assert!(fs.dax_window_lost());
+    assert!(fs.dax_unowned().is_empty());
+
+    let w = Window::new(2);
+    let fs = controlled_share(dir.path(), &control);
+    let a = fs.lookup(CTX, fuse::ROOT_ID, &cstr("a")).unwrap();
+    w.write(0, &[7]);
+    control.ended.store(true, Ordering::SeqCst);
+    let skipped = setup(&fs, &w, a.inode, 0, 1, false, 0);
+    assert_eq!(skipped.unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert_eq!(w.read(0, 1), [7], "the window was remapped");
+    assert!(fs.dax_window_lost());
+    assert!(fs.dax_unowned().is_empty(), "a skipped call named a range");
+    assert_eq!(control.kept().len(), 8);
+}
+
+/// A device's restore maps each saved segment, and its guest reset remaps
+/// the window, inside the owner's control; a reset the control no longer
+/// runs leaves the window untouched and the device discarded, still owning
+/// the whole window.
+#[test]
+fn snapshot_fs_dax_restore_and_reset_remap_inside_the_owner_control() {
+    use passthrough::dax_faults::{arm, Fault};
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("f", &paged(2, 0x33));
+    let source = Window::new(4);
+    let rig = mapped_session(dir.path(), &source);
+    let session = rig.fs.snapshot_session().unwrap().unwrap();
+    let segments = session
+        .passthrough
+        .state
+        .dax
+        .as_ref()
+        .unwrap()
+        .mappings
+        .len();
+    let restore = |w: &Window, control: &Arc<Control>| {
+        let mut device = Rig::device(dir.path());
+        device.set_shm_region(w.shm());
+        device.set_dax_control(control.clone());
+        let restored = device.restore_session(
+            session.options,
+            &session.passthrough.state,
+            same_host_objects(&session.passthrough),
+            session.passthrough.init_binary.clone(),
+            &session.passthrough.dax_pages,
+        );
+        (device, restored)
+    };
+
+    let control = Arc::new(Control::default());
+    let w = Window::new(4);
+    let (mut device, restored) = restore(&w, &control);
+    restored.unwrap();
+    assert_eq!(control.kept(), vec![true; segments]);
+    device.reset();
+    assert_eq!(control.kept(), vec![true; segments + 1]);
+    assert!(!device.must_discard());
+
+    let control = Arc::new(Control::default());
+    let w = Window::new(4);
+    arm(w.addr + p, Fault::MapAfterUnmap);
+    let (failed, restored) = restore(&w, &control);
+    assert!(restored.is_err());
+    assert_eq!(control.kept().last(), Some(&false));
+    assert_eq!(failed.dax_unowned(), [(p, 2 * p)]);
+    drop(failed);
+    reclaim(w, p, 2 * p);
+
+    let control = Arc::new(Control::default());
+    let w = Window::new(4);
+    let (mut device, restored) = restore(&w, &control);
+    restored.unwrap();
+    control.ended.store(true, Ordering::SeqCst);
+    device.reset();
+    assert_eq!(w.read(0, 1), [5], "the window was remapped");
+    assert!(device.must_discard());
+    assert!(
+        device.dax_unowned().is_empty(),
+        "a skipped reset named a range"
+    );
 }
 
 mod archive;

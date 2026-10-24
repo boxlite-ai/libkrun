@@ -2,25 +2,27 @@
 
 //! Full checkpoints for the private minimal owner, independent of KRUNRAM.
 //!
-//! Every full image uses one format, version 6 (`KRUNVM\0\0`), with or
-//! without devices: header, bounded JSON state, RAM payload, then one raw
-//! segment per disk. The JSON holds CPU, KVM and RAM state, the ordered disk
-//! table and the optional NIC, RNG, balloon, vsock, console and
-//! legacy-device (UARTs, CMOS, i8042) sections. Earlier versions are
-//! rejected explicitly.
+//! Every full image uses one format, version 7 (`KRUNVM\0\0`), with or
+//! without devices: header, bounded JSON state, RAM payload, one raw
+//! segment per disk, then the virtio-fs file, init.krun and DAX page
+//! payloads. The JSON holds CPU, KVM and RAM state, the ordered disk table
+//! and the optional NIC, RNG, balloon, vsock, console, legacy-device
+//! (UARTs, CMOS, i8042) and virtio-fs sections. Versions 1–6 are rejected
+//! explicitly.
 
 use super::*;
 use crate::ram_snapshot::console::{self, ConsoleMeta};
 use crate::ram_snapshot::event_devices::{self, BalloonMeta, DeviceMeta};
 use crate::ram_snapshot::events;
 use crate::ram_snapshot::legacy::{self, LegacyMeta};
+use crate::ram_snapshot::virtio_fs::{self, FsMeta};
 use crate::ram_snapshot::vsock::{self, VsockMeta};
 use crate::vstate::snapshot::{self, Compatibility, CpuState, Request};
 use crate::vstate::VmState;
 use serde::{Deserialize, Serialize};
 
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const FULL_VERSION: u32 = 6;
+const FULL_VERSION: u32 = 7;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
@@ -57,6 +59,7 @@ struct Metadata {
     vsock: Option<VsockMeta>,
     console: Option<ConsoleMeta>,
     legacy: Option<LegacyMeta>,
+    fs: Option<FsMeta>,
 }
 
 /// Which target resources an image needs; each must be supplied exactly
@@ -67,6 +70,7 @@ struct Requirements {
     vsock: bool,
     console: bool,
     legacy: bool,
+    fs: bool,
 }
 
 impl Requirements {
@@ -77,6 +81,7 @@ impl Requirements {
             vsock: metadata.vsock.is_some(),
             console: metadata.console.is_some(),
             legacy: metadata.legacy.is_some(),
+            fs: metadata.fs.is_some(),
         }
     }
 
@@ -104,6 +109,11 @@ impl Requirements {
         if self.legacy != resources.serial.is_some() {
             return Err(Error::Invalid(
                 "restore resources: serial endpoints are required exactly when the image has legacy devices",
+            ));
+        }
+        if self.fs != resources.fs_dir.is_some() {
+            return Err(Error::Invalid(
+                "restore resources: a virtio-fs directory is required exactly when the image has shares",
             ));
         }
         Ok(())
@@ -143,6 +153,29 @@ fn disk_segments_len(_disks: &DiskTable) -> Result<u64> {
     Ok(0)
 }
 
+/// The MMIO slots of every device in `metadata` but the virtio-fs shares,
+/// for the shares' DAX window checks.
+fn device_slots(metadata: &Metadata) -> Vec<u64> {
+    #[cfg_attr(not(feature = "blk"), allow(unused_mut))]
+    let mut slots = Vec::new();
+    #[cfg(feature = "blk")]
+    slots.extend(metadata.disks.iter().map(|disk| disk.mmio_addr));
+    #[cfg(all(feature = "blk", feature = "net"))]
+    slots.extend(metadata.nic.as_ref().map(|_| nic::NIC_MMIO_ADDR));
+    slots.extend(event_devices::slots(
+        metadata.rng.as_ref(),
+        metadata.balloon.as_ref(),
+    ));
+    slots.extend(metadata.vsock.as_ref().map(|_| vsock::VSOCK_MMIO_ADDR));
+    slots.extend(
+        metadata
+            .console
+            .as_ref()
+            .map(|_| console::CONSOLE_MMIO_ADDR),
+    );
+    slots
+}
+
 /// Read and check the fixed header; returns the JSON length.
 fn read_header(file: &mut File) -> Result<usize> {
     let mut header = [0; 16];
@@ -152,7 +185,7 @@ fn read_header(file: &mut File) -> Result<usize> {
     }
     match u32::from_le_bytes(header[8..12].try_into().unwrap()) {
         FULL_VERSION => {}
-        old @ 1..=5 => {
+        old @ 1..=6 => {
             return Err(Error::Full(format!(
                 "full snapshot version {old} predates the unified version {FULL_VERSION} and is not supported"
             )))
@@ -180,16 +213,27 @@ fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<M
         ));
     }
     metadata.vm.validate_snapshot().map_err(Error::Full)?;
+    // Every device section relies on validated RAM regions.
+    let ram = payload_len(&metadata.regions, max_slots)?;
+    let shares = validate_devices(&metadata, max_slots)?;
     let segments = disk_segments_len(&metadata.disks)?;
     let expected = (16 + len as u64)
-        .checked_add(payload_len(&metadata.regions, max_slots)?)
+        .checked_add(ram)
         .and_then(|total| total.checked_add(segments))
+        .and_then(|total| total.checked_add(shares))
         .ok_or(Error::Invalid("full snapshot length overflow"))?;
     if expected != file.metadata()?.len() {
         return Err(Error::Invalid(
-            "full snapshot length differs from metadata and disk segments",
+            "full snapshot length differs from metadata, disk segments and share payloads",
         ));
     }
+    Ok(metadata)
+}
+
+/// Every device section against its fixed slot and the validated RAM
+/// regions, and the virtio-fs shares' DAX windows against everything else;
+/// returns the length of the share payloads.
+fn validate_devices(metadata: &Metadata, max_slots: usize) -> Result<u64> {
     #[cfg(feature = "blk")]
     blk::validate_disk_metadata(&metadata.disks, &metadata.regions)?;
     #[cfg(all(feature = "blk", feature = "net"))]
@@ -210,7 +254,15 @@ fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<M
     if let Some(legacy) = &metadata.legacy {
         legacy::validate_metadata(legacy, &metadata.regions)?;
     }
-    Ok(metadata)
+    match &metadata.fs {
+        Some(meta) => virtio_fs::payload_len(virtio_fs::validate_metadata(
+            meta,
+            &metadata.regions,
+            &device_slots(metadata),
+            max_slots,
+        )?),
+        None => Ok(0),
+    }
 }
 
 fn read_ram(file: &mut File, regions: &[Region]) -> Result<GuestMemoryMmap> {
@@ -250,16 +302,20 @@ fn validate_rings(metadata: &Metadata, memory: &GuestMemoryMmap) -> Result<()> {
     if let Some(meta) = &metadata.console {
         console::validate_rings(meta, memory)?;
     }
+    if let Some(meta) = &metadata.fs {
+        virtio_fs::validate_rings(meta, memory)?;
+    }
     Ok(())
 }
 
 /// Create the 0600 exclusive image with an invalid magic placeholder, then
-/// write the header, JSON state, RAM and disk segments.
+/// write the header, JSON state, RAM, disk segments and share payloads.
 fn write_pending(
     path: &Path,
     memory: &GuestMemoryMmap,
     metadata: &Metadata,
     #[cfg(feature = "blk")] disks: &[blk::BlkDevice],
+    shares: Option<&devices::virtio::fs::passthrough::ShareArchive>,
 ) -> Result<PendingSnapshot> {
     let mut encoded = BoundedMetadata(Vec::new());
     serde_json::to_writer(&mut encoded, metadata)
@@ -297,6 +353,9 @@ fn write_pending(
     }
     #[cfg(feature = "blk")]
     blk::copy_disk_segments(&mut pending.file, disks, &metadata.disks)?;
+    if let Some(shares) = shares {
+        virtio_fs::write_payloads(&mut pending.file, shares)?;
+    }
     pending.file.sync_all()?;
     Ok(pending)
 }
@@ -344,11 +403,16 @@ impl RamSnapshotVm {
     /// capture -> sync file -> publish valid magic. Nothing is resumed, so
     /// repeated exports capture the same RAM, device and CPU state; each
     /// captures the KVM clock and TSC at its own time, which keep running
-    /// while paused. A failed export removes its partial image and leaves
+    /// while paused, and re-reads the virtio-fs host trees
+    /// (`virtio_fs::capture`). A failed export removes its partial image and leaves
     /// the owner paused and retryable, except a vCPU that never answers its
     /// state request: that uncertain control disables the owner and stops
-    /// every thread.
+    /// every thread. With virtio-fs shares the caller must have declared
+    /// every host writer stopped (`declare_host_writers_stopped`); the
+    /// shares are archived as they are at the cut, and a share whose DAX
+    /// window was lost disables the owner.
     pub(crate) fn export(&mut self, path: &Path) -> Result<()> {
+        self.check_execution()?;
         // Only worker devices retain cursors.
         #[cfg_attr(not(feature = "blk"), allow(unused_variables))]
         let paused = match &self.pause {
@@ -358,6 +422,7 @@ impl RamSnapshotVm {
         if self.exit.requested() {
             return Err(Error::Invalid("the VM is exiting"));
         }
+        virtio_fs::require_declared(self.fs.len(), self.host_writers_stopped)?;
         let regions = self.topology.regions(&self.memory)?;
         payload_len(&regions, self.max_slots)?;
         let kvm = KvmContext::new().map_err(Error::State)?;
@@ -375,6 +440,12 @@ impl RamSnapshotVm {
         let vsock = vsock::capture(self, &regions)?;
         let console = console::capture(self, &regions)?;
         let legacy = legacy::capture(self, &regions)?;
+        if virtio_fs::any_discarded(&self.fs) {
+            self.disable();
+            return Err(Error::Invalid("a virtio-fs share lost its DAX window"));
+        }
+        let paused = self.pause.as_ref().expect("checked above");
+        let (fs, shares) = virtio_fs::capture(&self.fs, &paused.fs)?.unzip();
         let cpus = match self.save_cpus(&compatibility) {
             Err(unanswered @ Error::Control(_)) => {
                 self.disable();
@@ -395,13 +466,24 @@ impl RamSnapshotVm {
             vsock,
             console,
             legacy,
+            fs,
         };
+        if let Some(meta) = &metadata.fs {
+            virtio_fs::validate_metadata(
+                meta,
+                &metadata.regions,
+                &device_slots(&metadata),
+                self.max_slots,
+            )?;
+            virtio_fs::validate_rings(meta, &self.memory)?;
+        }
         write_pending(
             path,
             &self.memory,
             &metadata,
             #[cfg(feature = "blk")]
             &self.disks,
+            shares.as_ref(),
         )?
         .finish(FULL_MAGIC)
     }
@@ -477,7 +559,12 @@ impl RamSnapshotVm {
     /// transport reset still owed until `resume`. The console takes the
     /// caller's `resources.console_ports` endpoints without any endpoint
     /// I/O or new guest handshake; its open ports come back with frozen
-    /// workers holding the saved EOF and partial-TX offsets.
+    /// workers holding the saved EOF and partial-TX offsets. The virtio-fs
+    /// shares are imported into the new 0700 `resources.fs_dir` (an
+    /// existing directory is refused untouched), each DAX window is mapped
+    /// and its session restored before any vCPU thread exists, and the
+    /// imported tree is kept once the import succeeds; host writers start
+    /// declared stopped, since only the owner uses those copies.
     pub(crate) fn import(path: &Path, mut resources: RestoreResources) -> Result<Self> {
         let kvm = KvmContext::new().map_err(Error::State)?;
         let mut file = File::open(path)?;
@@ -496,6 +583,9 @@ impl RamSnapshotVm {
         if let Some(serial) = &resources.serial {
             legacy::check_endpoints(serial)?;
         }
+        if let Some(dir) = &resources.fs_dir {
+            virtio_fs::check_fs_dir(dir)?;
+        }
         let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
         // RAM first (file order), then every ring against the loaded memory.
         let memory = read_ram(&mut file, &metadata.regions)?;
@@ -513,7 +603,12 @@ impl RamSnapshotVm {
             }
             None => (None, Vec::new()),
         };
+        let shares = match (&metadata.fs, &resources.fs_dir) {
+            (Some(meta), Some(dir)) => Some(virtio_fs::import_shares(&file, meta, dir)?),
+            _ => None,
+        };
         let mut owner = Self::restore_scaffold(&kvm, memory)?;
+        owner.fs_import = shares;
         #[cfg(feature = "blk")]
         {
             owner.imported = imported;
@@ -533,6 +628,9 @@ impl RamSnapshotVm {
         if let (Some(meta), Some(serial)) = (&metadata.legacy, resources.serial.take()) {
             legacy::restore(&mut owner, meta, serial)?;
         }
+        if let Some(meta) = &metadata.fs {
+            virtio_fs::restore(&mut owner, meta)?;
+        }
         owner.start_event_thread(events::Start::Restored)?;
         owner.restore_cpus_and_vm(&target, metadata.cpus, metadata.vm)?;
         // Only now: loading the irqchip state would overwrite an earlier
@@ -544,6 +642,10 @@ impl RamSnapshotVm {
         }
         // After the owed injection: draining flushes it into the irqchip.
         owner.pause = Some(owner.quiesce()?);
+        owner.host_writers_stopped = true;
+        if let Some(shares) = owner.fs_import.take() {
+            shares.persist();
+        }
         Ok(owner)
     }
 }

@@ -359,4 +359,4 @@ pub(super) fn event_device(vm: &RamSnapshotVm) -> Option<Arc<Mutex<Console>>> {
 #[cfg(test)]
 mod kvm_tests;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

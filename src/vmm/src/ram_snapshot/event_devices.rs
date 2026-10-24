@@ -178,6 +178,14 @@ pub(super) fn validate_metadata(
     Ok(())
 }
 
+/// The fixed MMIO slots of the devices present.
+pub(super) fn slots(rng: Option<&DeviceMeta>, balloon: Option<&BalloonMeta>) -> Vec<u64> {
+    rng.map(|_| RNG.mmio_addr)
+        .into_iter()
+        .chain(balloon.map(|_| BALLOON.mmio_addr))
+        .collect()
+}
+
 fn validate_slot(kind: &Kind, meta: &DeviceMeta, regions: &[Region]) -> Result<()> {
     let invalid = |why: &str| Error::Full(format!("{}: {why}", kind.name));
     if meta.mmio_addr != kind.mmio_addr || meta.mmio_len != MMIO_LEN || meta.irq != kind.irq {

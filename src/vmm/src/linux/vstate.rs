@@ -20,6 +20,8 @@ use std::os::unix::io::RawFd;
 use std::env;
 use std::result;
 use std::sync::atomic::{fence, Ordering};
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+use std::sync::Arc;
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
@@ -69,6 +71,9 @@ use super::tee::amdsnp::launch as snp;
 
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 pub(crate) mod snapshot;
+
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+use crate::ram_snapshot::execution::ExecutionBarrier;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
@@ -233,6 +238,9 @@ pub enum Error {
     VcpuTlsNotPresent,
     /// Unexpected KVM_RUN exit reason
     VcpuUnhandledKvmExit,
+    /// The snapshot owner's execution barrier ended guest execution.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    VcpuExecutionEnded,
     /// Unsupported KVM_EXIT_HYPERCALL.
     #[cfg(feature = "tee")]
     VcpuUnsupportedHypercall,
@@ -402,6 +410,8 @@ impl Display for Error {
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
             VcpuUnhandledKvmExit => write!(f, "Unexpected KVM_RUN exit reason"),
+            #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+            VcpuExecutionEnded => write!(f, "The snapshot owner ended guest execution"),
             #[cfg(feature = "tee")]
             VcpuUnsupportedHypercall => write!(f, "Unsupported KVM_EXIT_HYPERCALL"),
             #[cfg(target_arch = "x86_64")]
@@ -953,6 +963,9 @@ pub struct Vcpu {
     kernel_enomem_workaround: bool,
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     snapshot_xsave_size: usize,
+    /// The snapshot owner's barrier around each KVM_RUN; None runs ungated.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    execution: Option<Arc<ExecutionBarrier>>,
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
@@ -1090,6 +1103,8 @@ impl Vcpu {
             #[cfg(not(feature = "tee"))]
             snapshot_xsave_size: snapshot::xsave_size(vm_fd.check_extension_int(Xsave2))
                 .map_err(|_| Error::KvmCap(Xsave2))?,
+            #[cfg(not(feature = "tee"))]
+            execution: None,
             id,
             mmio_bus: None,
             exit_evt,
@@ -1171,6 +1186,12 @@ impl Vcpu {
     }
 
     /// Sets a MMIO bus for this vcpu.
+    /// Run every KVM_RUN of this vCPU under the snapshot owner's `barrier`.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    pub(crate) fn set_execution_barrier(&mut self, barrier: Arc<ExecutionBarrier>) {
+        self.execution = Some(barrier);
+    }
+
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);
     }
@@ -1364,7 +1385,17 @@ impl Vcpu {
             }
         }
 
-        match self.fd.run() {
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        let permit = match &self.execution {
+            Some(barrier) => Some(barrier.enter().ok_or(Error::VcpuExecutionEnded)?),
+            None => None,
+        };
+        let run = self.fd.run();
+        // Before emulating the exit (a guest reset on this thread may need
+        // the barrier) and before an EINTR clears immediate_exit.
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        drop(permit);
+        match run {
             Ok(run) => match run {
                 #[cfg(feature = "tee")]
                 VcpuExit::Hypercall(hypercall) => {

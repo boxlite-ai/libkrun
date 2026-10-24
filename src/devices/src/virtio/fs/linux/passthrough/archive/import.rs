@@ -41,7 +41,6 @@ use super::{
     invalid, ArchiveError, ArchiveManifest, ArchivedKind, ArchivedObject, ObjectView, Topology,
 };
 use crate::virtio::fs::Fs;
-use crate::virtio::VirtioDevice;
 
 /// Chunk size for reading file bytes; all-zero chunks become holes.
 const COPY_CHUNK: usize = 64 * 1024;
@@ -289,9 +288,9 @@ pub struct ImportedSession {
     pub dax_pages: DaxPages,
 }
 
-/// An imported archive. Dropping it before `persist` stops and joins the
-/// workers of every device it holds, then removes everything the import
-/// created.
+/// An imported archive. Dropping it before `persist` retires every device
+/// it holds (stopping and joining its worker), then removes everything the
+/// import created.
 pub struct ImportedArchive {
     devices: Vec<Arc<Mutex<Fs>>>,
     shares: Vec<Share>,
@@ -440,7 +439,7 @@ impl ImportedArchive {
     }
 
     /// Keep `device` (restored from this archive) until the archive is
-    /// persisted; dropping the archive first resets it, stopping and
+    /// persisted; dropping the archive first retires it, stopping and
     /// joining its worker before any imported object is removed.
     pub fn hold(&mut self, device: Arc<Mutex<Fs>>) {
         self.devices.push(device);
@@ -457,7 +456,7 @@ impl Drop for ImportedArchive {
     fn drop(&mut self) {
         for device in self.devices.drain(..) {
             let mut device = device.lock().unwrap_or_else(|e| e.into_inner());
-            device.reset();
+            device.retire();
         }
         // `tree` drops (and cleans up) after this.
     }

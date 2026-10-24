@@ -260,7 +260,8 @@ The private Linux x86_64/KVM `RamSnapshotVm` harness supports an explicit
 lifecycle (described below) for ordinary RAM with a kernel irqchip/PIT. Its base configuration is device-free (no userspace
 devices; uncontrolled background RAM writers are rejected); `attach_rng` and
 `attach_balloon` add internal virtio devices, `attach_vsock` adds a Unix
-IPC vsock, `attach_console` adds a multiport virtio console, `attach_legacy` adds the x86
+IPC vsock, `attach_console` adds a multiport virtio console, `attach_fs`
+adds up to seven virtio-fs shares (stage 12), `attach_legacy` adds the x86
 UARTs, CMOS and i8042, the optional `blk` feature
 described below adds internal block devices, and `blk` plus `net` add one
 internal network device. The harness supports
@@ -276,10 +277,11 @@ Lifecycle contract:
 
 | Call | Requires | Effect | On failure |
 | --- | --- | --- | --- |
-| `pause` | running, usable, no guest exit | quiesce the vsock gate, pause/ack every vCPU, then freeze every disk, the NIC and the event thread (RNG, balloon, vsock queues, console control queues, UART input), then every console port worker, stop the vsock backend, then deassign and drain every irqfd; the frozen worker queue cursors and the drained irqfd count stay with the owner | rejected without effect before any control; otherwise the owner is disabled and every thread stopped and joined |
-| `export` | paused, usable | capture the same cut into a new image; resumes nothing, so it can repeat | partial image removed, still paused and retryable; a vCPU that never answers its state request disables the owner and stops every thread |
-| `import` | an image and matching resources | a new owner in the same paused state as a source after `pause` (devices frozen, cursors retained, irqfds drained), exportable before it ever runs | everything it created is removed after its threads joined |
-| `resume` | paused, usable, no guest exit | shared by sources and imports: reattach the drained irqfds, resume every device (the vsock delivers its transport reset before reopening its backend; the console resumes its port workers and processes its control queues before the event thread), then every vCPU last | the owner is disabled and every thread stopped and joined; no vCPU runs unless every device resumed |
+| `declare_host_writers_stopped` | running, usable, unpaused, no guest exit | records the caller's promise that no host writer changes a virtio-fs share directory or any alias of its files until the next `resume`; kept through `pause`, cleared by `resume` and by disabling | rejected without effect |
+| `pause` | running, usable, no guest exit | quiesce the vsock gate, pause/ack every vCPU, then freeze every disk, the NIC, every virtio-fs worker and the event thread (RNG, balloon, vsock queues, console control queues, UART input), then every console port worker, stop the vsock backend, then deassign and drain every irqfd; the frozen worker queue cursors and the drained irqfd count stay with the owner | rejected without effect before any control; otherwise the owner is disabled and every thread stopped and joined (also when a share lost its DAX window or a DAX remapping failed) |
+| `export` | paused, usable; with virtio-fs shares, host writers declared stopped | capture the same cut into a new image; resumes nothing, so it can repeat (each export re-reads virtio-fs host trees, so images are not promised byte-identical) | an undeclared export with shares is refused before the image exists; otherwise the partial image is removed, still paused and retryable; a vCPU that never answers its state request, a share that lost its DAX window, or an earlier failed DAX remapping disables the owner and stops every thread |
+| `import` | an image and matching resources | a new owner in the same paused state as a source after `pause` (devices frozen, cursors retained, irqfds drained), exportable before it ever runs; imported shares start with host writers declared stopped | everything it created is removed after its threads joined |
+| `resume` | paused, usable, no guest exit | shared by sources and imports: clear the host-writer declaration, reattach the drained irqfds, resume every device (the vsock delivers its transport reset before reopening its backend; the console resumes its port workers and processes its control queues before the event thread), then every vCPU last | the owner is disabled and every thread stopped and joined; no vCPU runs unless every device resumed |
 
 For example, a source checkpoints and continues with `pause()`,
 `export(a)`, `export(b)`, `resume()`; a target runs with
@@ -288,18 +290,22 @@ TSC when it runs; both keep running while the owner is paused (see the timer
 handling below).
 
 Every full image, with or without devices, uses one format: magic
-`KRUNVM\0\0`, version 6, a bounded 16 MiB JSON state section, RAM copied in
-64 KiB chunks into independent anonymous mappings, then one raw segment per
-disk. The JSON holds CPU, KVM and RAM state, the ordered disk table and the
-optional NIC, RNG, balloon, vsock, console and legacy-device (UARTs, CMOS,
-i8042) sections. Versions 1–5 (version 4 had no vsock section, version 5 no
-console section) are rejected explicitly; the RAM-only `KRUNRAM` image stays
-version 1. Images never contain host paths, descriptors or threads:
+`KRUNVM\0\0`, version 7, a bounded 16 MiB JSON state section, RAM copied in
+64 KiB chunks into independent anonymous mappings, one raw segment per
+disk, then the virtio-fs file bytes, distinct init.krun bytes and nonzero
+4 KiB anonymous DAX pages. The JSON holds CPU, KVM and RAM state, the
+ordered disk table and the optional NIC, RNG, balloon, vsock, console,
+legacy-device (UARTs, CMOS, i8042) and virtio-fs sections. Versions 1–6
+(version 4 had no vsock section, version 5 no console section, version 6
+no virtio-fs section) are rejected explicitly; the RAM-only `KRUNRAM` image
+stays version 1. Images never contain host paths, descriptors or threads:
 `RestoreResources` supplies the disk import directory, the NIC backend
-socket, the vsock port paths, the fresh console ports and the four serial
-endpoints, and each must be present exactly when the image has the
-matching device. A mismatch is rejected before any RAM,
-directory, socket or thread is created. Files are created exclusively with mode 0600 and become
+socket, the vsock port paths, the fresh console ports, the four serial
+endpoints and the virtio-fs share directory, and each must be present
+exactly when the image has the matching device. A mismatch is rejected
+before any RAM, directory, socket or thread is created; the RAM regions are
+validated before any device section that relies on them, and every length
+(RAM, disk segments, share payloads) is checked against the file. Files are created exclusively with mode 0600 and become
 valid only after the whole image is synced; an export never resumes the
 source. Uncertain control disables subsequent checkpoints and stops every
 thread. Partial imports stop and join created threads before releasing VM/RAM. External RAM
@@ -320,8 +326,8 @@ pausing a source vCPU does not stop its hardware clocks. TSC frequency differenc
 above 250 ppm require successful scaling. Multi-vCPU restore requires successful
 vCPU0-based TSC offset synchronization before VM clock restore. Every
 attached device below is frozen, drained and saved before CPU/KVM/RAM
-capture. virtio-fs owner checkpoints are in progress: only the device
-backend described in "Internal virtio-fs session checkpoints" below exists.
+capture. virtio-fs shares are described in "Internal virtio-fs session
+checkpoints" below.
 
 ### Internal block-device checkpoints (stage 3, feature `blk`)
 
@@ -486,7 +492,8 @@ descriptor by descriptor). Only page-aligned private anonymous RAM owned by
 guest memory is discarded; other mappings ignore the hint and complete.
 
 This remains an internal closed loop for the minimal VM: no full BoxLite box
-restore and no virtio-fs support.
+restore (stage 13, future work). virtio-fs shares are covered by stage 12
+below.
 
 ### Internal legacy UART, CMOS and i8042 checkpoints (stage 6, no feature)
 
@@ -707,20 +714,165 @@ tests without KVM. The 48 tests that open KVM, the 11 console KVM tests
 among them, fail at opening `/dev/kvm` and are **UNVERIFIED**, as is a
 Linux guest console driver (the harness boots no Linux guest).
 
-### Internal virtio-fs session checkpoints (stage 12, in progress, Linux)
+### Internal virtio-fs session checkpoints (stage 12, Linux)
 
-Step 1 and its review fixes are complete; step 2's DAX window ledger with
-its fail-closed review correction and step 2's independent share archive
-with its review corrections (below) are reviewed and accepted. See
-the
+All three steps (the device backend with its DAX window ledger, the
+independent share archive, and the owner with image version 7 and its DAX
+execution barrier, each with its review corrections) are reviewed, accepted
+and committed locally. Every owner path that needs a VM is compiled but its
+KVM execution is **UNVERIFIED**, and no real BoxLite/shim restore exists:
+wiring the lifecycle into BoxLite is stage 13, still future work. See the
 [checkpoint and remaining work](docs/phase12-virtio-fs-snapshot.md)
-before continuing. This is not a complete virtio-fs VM snapshot.
+before continuing.
 
-Stage 12 adds virtio-fs to the owner in three steps. The device backend,
-its DAX ledger and the share archive exist so far: there is no `attach_fs`,
-no full-image format change (the image stays version 6), no owner DAX
-window or memslot and no `RestoreResources` entry yet, so the owner still
-cannot checkpoint a VM with virtio-fs.
+Stage 12 adds virtio-fs to the owner in three steps: the device backend
+with its DAX ledger, the share archive, then the owner, which attaches,
+pauses, exports and imports up to seven shares.
+
+The owner (step 3, `ram_snapshot/virtio_fs.rs`):
+
+- `attach_fs(FsShareConfig { tag, source, read_only, allow_root_dir_delete,
+  dax })` attaches a snapshot-mode share before vCPUs start. Share `i` sits
+  at MMIO `0xd000d000 + i * 0x1000` with GSI `9 + i` (guest kernel:
+  `virtio_mmio.device=4K@0xd000d000:9` for the first), so at most seven
+  shares attach. The tag is 1–36 bytes without NUL and unique per owner;
+  the source is an absolute path of a directory (not a symlink to one) with
+  any bytes but NUL, non-UTF-8 included. Every check precedes any effect; a
+  later failure poisons the owner, as for every other device.
+- A DAX window `DaxRange { gpa, len }` (4 KiB aligned, nonzero, not
+  wrapping) is private anonymous memory the owner maps itself and registers
+  as one more KVM memslot after the RAM slots, counted against the target's
+  memslot capacity. It is not guest RAM: the RAM image, the RAM alias probe
+  and ring validation see only the `GuestMemoryMmap`, so a ring in a DAX
+  window is refused. A window may not overlap RAM, any attached device's
+  MMIO slot, another window or what KVM serves itself (the EPT identity map
+  page and TSS at `KVM_TSS_ADDRESS - 0x1000` for 16 KiB, the IOAPIC page at
+  `0xfec00000`, the local APIC page at `0xfee00000`), whichever is attached
+  first; a device attached later over a window is refused too, and an
+  import checks the same layout from its metadata. The owner keeps every
+  window it mapped, also one of a failed attach or import, until it drops,
+  after its VM fd (and with it the memslot) closed.
+- Execution barrier (`ram_snapshot/execution.rs`): an owner with a DAX
+  window runs every `KVM_RUN` of its vCPUs under one barrier, which is also
+  the control its shares remap through. A vCPU holds a permit only around
+  the ioctl and releases it before it emulates the exit, so a guest reset
+  handled on a vCPU thread can remap too. A remapping blocks new permits,
+  kicks every holder out of `KVM_RUN` (the vCPU kick signal, repeated every
+  10 ms) and waits until none is left before its host call; remappings
+  serialize. A failed or panicking remapping marks the barrier failed
+  before it reopens: no vCPU enters again (a waiting or later one exits as
+  on any vCPU error), the owner's exit is signalled, whose watch stops every
+  vCPU, and the next `pause`, `resume`, `export` or
+  `declare_host_writers_stopped` disables the owner, joining every thread,
+  and fails. A pause also fails when a remapping failed before the workers
+  froze, and a resume when one failed while the devices resumed (a resumed
+  worker may run queued DAX requests), before any vCPU resumes. Stopping the owner retires the barrier before it joins the
+  vCPUs, releasing any vCPU or remapping waiting on it; a retired barrier
+  runs no remapping (teardown never remaps a window anyway). Only permit
+  holders are kicked, and a holder deregisters under the barrier's lock
+  before it leaves the ioctl path, so a kicked pthread ID never names a
+  joined thread. Lock order: transport, device, DAX ledger, then the
+  barrier's lock, a leaf never held while taking another lock or during a
+  remapping. Owners without a window, and the ordinary VMM, run ungated.
+- The RAM alias probe counts each share's mapping clones: its transport,
+  plus the device state and the worker once activated.
+- `pause` freezes every activated share's worker with the disks and the
+  NIC; a share that lost its DAX window fails the pause, which disables the
+  owner. `resume` resumes the workers. Stopping the owner (disable, failed
+  import, drop) retires every share after the vCPUs stopped
+  (`Fs::retire`, below) and then releases the windows.
+- Before an export the caller calls `declare_host_writers_stopped` while
+  the owner runs: nothing on the host writes a share directory or any
+  alias (hard link, bind mount, open descriptor) of its files until the
+  next resume. A pause keeps the declaration; `resume` and disabling clear
+  it; an export of an owner with shares without it is refused before the
+  image exists. An import starts declared, since only the owner uses its
+  copies.
+- An export archives every share at once (`Fs::archive_source`, one
+  `ShareArchive::capture`). The capture needs CAP_SYS_ADMIN in the initial
+  user namespace (otherwise `trusted.*` xattrs would be hidden); without it
+  the export fails with the archive's `Unsupported` error and the owner
+  stays paused and retryable. The JSON section holds each device (slot,
+  tag, read-only and root-deletion flags, DAX range, transport and virtio
+  state with the frozen worker's cursors) and the archive manifest
+  (objects, share roots, each session with its DAX mappings); no host path
+  or descriptor of a share. The file, init.krun and DAX page payloads follow
+  the disk segments; a file that changed since the capture fails the
+  export.
+- An import needs `RestoreResources::fs_dir`, an absolute path without NUL
+  bytes, exactly when the image has shares. Before RAM exists it checks the
+  manifest, each device against its fixed slot, the tag, the offered
+  features and activation, that an inactive device holds no FUSE session
+  (no options, nodes or handles), that the DAX window matches the session's,
+  that a read-only share holds no writable handle, writable file mapping or
+  writeback cache, the window layout and the memslot capacity; then every
+  ring against the loaded RAM, before any directory, socket or thread. The
+  shares are imported after the disk segments, into `fs_dir` created
+  exclusively with mode 0700 (an existing directory is refused untouched;
+  a failure removes only what the import created). Each device is rebuilt
+  on its imported root (`Fs::new_at`, the native path) at its saved slot,
+  gets a new DAX window and its restored session and window contents, and
+  an activated share is restore-activated with a frozen worker, all before
+  any vCPU thread exists. A successful import keeps the imported tree for
+  good: unlike disk segments it is the guest's file system, so the owner
+  never removes it. `allow_root_dir_delete` removes the imported root
+  itself.
+- Image layout and bounds: the 16-byte `KRUNVM\0\0` version-7 header, the
+  JSON state (at most 16 MiB), RAM, the disk segments, then the share
+  payloads in archive order: file bytes, the distinct init.krun bytes, the
+  nonzero 4 KiB DAX pages. `read_metadata` checks the CPUs and VM, then the
+  RAM regions, then every device section (the fs section returns its
+  payload lengths), then that the header, JSON, RAM, disk and share lengths
+  add up (checked additions) to exactly the file length.
+
+Limits of the owner:
+
+- Capability: an export with shares needs CAP_SYS_ADMIN in the initial user
+  namespace, because only there does the kernel list `trusted.*` xattrs;
+  elsewhere it fails with `Unsupported` before reading the source, and the
+  owner stays paused and retryable. An import that restores `trusted.*`
+  xattrs needs CAP_SYS_ADMIN too.
+- Repeated exports of one pause capture the same paused guest, RAM and
+  device cut, but each re-reads the host trees, so the images are not
+  promised to be byte-identical: reading a symlink moves its atime (and,
+  without `O_NOATIME` permission, reading a file or directory moves its
+  atime), which a later export records, and the first export assigns inode
+  projections in the live share to objects the guest never looked up.
+- DAX ownership failure is fatal: after a failed host mapping call on a
+  window no vCPU runs again, and the next `pause`, `resume`, `export` or
+  `declare_host_writers_stopped` disables the owner and fails.
+  A range such a call may have unmapped is never unmapped or reclaimed by
+  the process; it stays reserved, with a warning, until the process exits.
+- Unknown-identity cleanup: a failed import removes only names it can prove
+  it created. A directory, symlink or whiteout whose identity could not be
+  read right after its creation stays (with a warning, with the directories
+  above it), since the name may already be a foreign replacement.
+
+Device-side changes for the owner (Linux): `passthrough::Config::root_dir`
+is a `PathBuf`, so `Fs::new_at` serves a root whose path is not UTF-8, and
+FUSE_INIT on a root path holding a NUL fails with `EINVAL` instead of
+panicking. `Fs::retire` ends a device on teardown: it stops and joins the
+worker and drops the sessions but never remaps the DAX window, which its
+owner may release next (only a guest reset returns a window to zero
+memory); dropping a device or an import guard that holds one now retires
+it instead of resetting it. A retired device never activates, restores or
+captures again (`Fs::must_discard`). A `map_dax` failing part way now loses
+the window and retires the device. Every failed `mmap(MAP_FIXED)` (a
+mapping request, a `map_dax` restore, a reset remapping, which covers the
+whole window) records the window range it targeted (`Fs::dax_unowned`,
+`PassthroughFs::dax_unowned`); a failed `mprotect` unmaps nothing and
+records none. Such a range may have been unmapped and taken by other memory
+of the process, so the owner never unmaps it: it stays reserved, with a
+warning, for the life of the process. No guest code runs over such a range:
+the owner gives each share with a window a `passthrough::DaxMappingControl`
+(`Fs::set_dax_control`, `passthrough::Config::dax_control`), and every host
+mapping call on the window (the `MAP_FIXED` of a mapping request, an
+init.krun copy, a removal, `map_dax` or a reset remapping, and every
+`mprotect`) runs inside `DaxMappingControl::exclusive`. A call the control
+skips because guest execution ended fails with `EIO` and loses the window
+(a skipped reset discards the device), but it changed nothing, so it names
+no range and teardown still releases the whole window. Ordinary shares
+have no control and are unchanged.
 
 A share opts in with `Fs::enable_snapshot` (`passthrough::Config::snapshot`)
 before activation; ordinary shares and macOS keep the unchanged passthrough
@@ -734,8 +886,8 @@ backend provides:
   guest RAM, ring or interrupt. `resume` re-examines both queues itself, so
   notifications drained while frozen cannot stall requests; restored
   workers start frozen (`activate_frozen`). Dropping a device (also one an
-  owner activated but never inserted) resets it: the worker is stopped and
-  joined while its session and guest memory are still alive, and a reset
+  owner activated but never inserted) retires it: the worker is stopped and
+  joined while its session and guest memory are still alive. A reset
   device can be activated again.
 - Session capture (`Fs::snapshot_session`, worker frozen): the negotiated
   FUSE options and `PassthroughState` — node IDs with lookup counts, handles
@@ -813,9 +965,9 @@ backend provides:
   and maps the whole window (`PassthroughFs::map_dax`) before activation;
   states and pages are validated first (coverage, alignment, object range,
   `off_t` bounds, page order, pages inside anonymous mappings and never all
-  zero). A `map_dax` failure part way leaves the window partly remapped while
-  the ledger stays unmapped (captures and mapping requests are refused), so
-  the device must be discarded. Ordinary shares
+  zero). A `map_dax` failure part way leaves the window partly remapped and
+  lost, and retires the device (captures, mapping requests, another restore
+  and activation are refused). Ordinary shares
   keep the unchanged mapping code. A device reset ends the session the
   device serves or holds for its activation (a restored one included; the
   next activation starts a new session with FUSE_INIT that still serves the
@@ -876,7 +1028,7 @@ backend provides:
   new file's from its creating descriptor (kept for cleanup until read), a
   hard link's before the link exists, and a directory's, symlink's or
   whiteout's from the name at once. A failure, or dropping the guard before
-  `persist`, resets the devices it `hold`s (stopping and joining their
+  `persist`, retires the devices it `hold`s (stopping and joining their
   workers) and removes exactly the names the import created while they
   still name the created object, restrictive modes and foreign ownership
   undone first. A name now naming another object, a directory something
@@ -951,10 +1103,59 @@ activation, and the guard stopping held devices before removing the tree.
 `fs/tests.rs` checks, with the APIs of the reviewed DAX commit, that a
 reset returns the window to zero memory, a reset device keeps serving the
 restored init.krun, and an export-table entry left by FUSE_DESTROY keeps
-refusing checkpoints.
+refusing checkpoints. Step 3 adds device tests (with the APIs of the
+archive commit where they check an earlier defect) for a dropped device
+and a dropped import guard leaving their windows mapped, a `map_dax`
+failure retiring the device, and a root path holding a NUL failing
+FUSE_INIT, plus one for `retire` leaving the window as mapped and the
+ranges each failure records (`map_dax`, reset remapping, a failed removal
+and init.krun copy, none for `mprotect`). The owner's `snapshot_fs_vmm`
+tests run without KVM on a transport over guest RAM and a DAX window
+mapped as the owner maps it: a share whose source directory is gone
+continues on its copy with its interrupt status, a request posted but not
+seen at the cut, its original handle and its read-write DAX file mapping
+(and the expected 1 + 2 mapping clones); a share nested under a non-UTF-8
+name restores on its exact imported root, which root deletion removes;
+metadata refusals (slot, GSI, tags, features, activation, an inactive
+device with a FUSE session, DAX size, read-only state, window overlaps
+with RAM, another device, the share's own slot, the local APIC, the
+IOAPIC, the identity map and TSS, another window, memslot capacity) each
+for its own reason; a ring in a DAX window; tags, sources, window shapes,
+slots and `fs_dir`; a window backing that never unmaps a range it may not
+own. `full/tests.rs` checks a version-7 image's share section and lengths
+through `read_metadata`, versions 1–6 refused, the `fs_dir` requirement,
+and that the RAM regions are validated before any device section uses
+them. The `snapshot_fs_kvm` tests drive a real guest: share register and
+DAX accesses by the vCPU through the fixture's mailbox (`full/guest.S`
+now also unmasks IRQ9 and counts vector 0x29 at 0x9126), a pending GSI-9
+interrupt delivered once after restore, the original handle and DAX
+mapping on the copy after the source directory is deleted, CPU
+continuation, the declaration rules, attachment layout in every order and
+the import's `fs_dir` contract.
 
-Stage-12 (step 1) validation status (macOS arm64 host, x86_64 Linux
-target): `make snapshot-fmt`, `make snapshot-check` (also featureless
+The execution barrier adds `snapshot_execution` tests without KVM, where a
+test thread holding a permit stands in for a vCPU inside `KVM_RUN`: a
+remapping runs only after the holder left and no vCPU enters meanwhile; a
+failed or panicking remapping refuses the waiting and every later permit
+and remapping and signals the exit; concurrent remappings never overlap;
+retiring releases a waiting vCPU and remapping without failing the
+barrier. Device tests check that every host mapping call (setup, init.krun
+copy and its `mprotect`, removal, `map_dax`, reset), including a `MAP_FIXED`
+and an `mprotect` the fault hook fails, runs inside the control, and that a
+control that no longer runs anything leaves the window untouched, the share
+or device discarded and no range named.
+`snapshot_fs_vmm_live_remapping_needs_the_execution_barrier` refuses a
+mapping request past a retired barrier, and its teardown steps then
+release the whole window. Two KVM tests (**UNVERIFIED**):
+`snapshot_fs_kvm_dax_remapping_stops_every_vcpu_and_failure_ends_them`
+checks that the counter two vCPUs increment stands still during a
+remapping, and that a failed one ends both vCPUs and the next pause
+disables the owner; `snapshot_fs_kvm_dax_failure_during_resume_resumes_no_vcpu`
+fails the barrier once the devices resumed (a test-only hook in
+`resume_devices`) and checks that the resume fails and no vCPU runs.
+
+Historical stage-12 records for steps 1 and 2 (macOS arm64 host, x86_64
+Linux target): `make snapshot-fmt`, `make snapshot-check` (also featureless
 `SNAPSHOT_PKGS='-p krun-vmm'`) and `make snapshot-build` pass, and
 `make snapshot-console-host-test` (26/26), `make snapshot-net-host-test`
 (20/20) and `make snapshot-vsock-host-test` (16/16) pass natively. `make
@@ -980,8 +1181,54 @@ a `git archive` of the DAX commit (every non-test file byte-identical; the
 only test-side change drops `mod archive;`) the 3 `fs/tests.rs` checks
 above fail; on the pre-correction archive (only test-only fault points
 added) the 6 correction tests fail and the other 36 pass.
-The owner, image format, owner DAX window and every KVM or guest-driver
-check for virtio-fs are not implemented yet.
+
+Historical step-3 record, before the execution barrier (2026-10-24, the same amd64 container with
+`--cap-add SYS_ADMIN --tmpfs /tmp:rw,exec`, no `/dev/kvm`): `snapshot-fmt`,
+`snapshot-check` (also featureless `krun-vmm` and `krun-devices`),
+`snapshot-build`, `snapshot-guest` (a rebuild of the old `guest.S` is
+byte-identical to the old `guest.bin`) and a macOS `snapshot-check` of
+`krun-devices` pass. `make snapshot-test`: 130/130 `krun-devices` snapshot
+tests (47 `snapshot_fs`); `krun-vmm` 54 pass and 52 fail, every failure at
+opening `/dev/kvm` (the 48 earlier KVM tests and the 4 new
+`snapshot_fs_kvm` tests, which are **UNVERIFIED**). Featureless
+`krun-vmm`: 50 pass, 39 fail the same way. `snapshot-console-host-test`
+(26/26), `snapshot-net-host-test` (20/20) and `snapshot-vsock-host-test`
+(16/16) pass natively. On a `git archive` of the archive commit (every
+non-test file byte-identical; the test-side adapter only builds the
+`String` root and leaves out the new-API assertions) the 4 defect tests
+above fail at their checks: both teardown windows read 0 instead of 0x33,
+a second restore after a failed `map_dax` is accepted, and FUSE_INIT
+panics on the NUL; the other 42 pass.
+
+Final stage-12 validation, the accepted evidence for the committed tree
+(DAX execution barrier pass, 2026-10-24, same container and macOS
+host): `snapshot-fmt` (no diff), `snapshot-check` (also featureless
+`krun-vmm` and `krun-devices`), `snapshot-build` and a macOS
+`snapshot-check` of `krun-devices --features net` pass. `make
+snapshot-test`: 132/132 `krun-devices` snapshot tests (49 `snapshot_fs`);
+`krun-vmm` 59 pass and 54 fail, every failure at opening `/dev/kvm` (the
+48 earlier KVM tests and the 6 `snapshot_fs_kvm` tests, 2 of them new, all
+**UNVERIFIED**); the 4 `snapshot_execution` tests and the 8
+`snapshot_fs_vmm` tests pass. Featureless `krun-vmm`: 55 pass, 41 fail the
+same way. `snapshot-console-host-test` (26/26), `snapshot-net-host-test`
+(20/20) and `snapshot-vsock-host-test` (16/16) pass natively. On the
+pre-correction owner tree (every non-test file byte-identical; the
+test-side adapter declares the control trait locally, installs controls as
+no-ops and builds the config without `dax_control`) the 2 device tests
+fail at their first check (no host mapping call ran inside a control) and
+`snapshot_fs_vmm_live_remapping_needs_the_execution_barrier` fails because
+the mapping request past the retired barrier succeeds; the other 14 pass.
+The `snapshot_execution` tests exercise the new barrier itself, which no
+test-only adapter can stand in for, so they have no before run.
+
+Validation boundary: what passed is the build and check matrix above, the
+non-KVM tests in an amd64 Linux container without `/dev/kvm` (with
+CAP_SYS_ADMIN and a tmpfs `/tmp`) and the native macOS host tests. Every
+test that opens KVM failed at `/dev/kvm` there; none was skipped and none
+passed. Not verified: KVM execution (the 6 `snapshot_fs_kvm` tests, every
+owner path that needs a VM, and the 48 earlier KVM tests), a Linux guest's
+virtiofs and DAX drivers (the fixture is a real-mode mailbox guest), arm64
+Linux after the first DAX ledger run, clippy, and any BoxLite/shim restore (stage 13).
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 

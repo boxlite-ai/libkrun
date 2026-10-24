@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use super::super::snapshot::HostKey;
@@ -32,7 +34,7 @@ enum Server<'a> {
 
 /// One share to archive: its root and session.
 pub struct ShareSource<'a> {
-    root_dir: &'a str,
+    root_dir: &'a Path,
     server: Server<'a>,
     options: u64,
     checkpoint: PassthroughCheckpoint,
@@ -237,7 +239,7 @@ impl Builder {
         let file = match root_node {
             Some(file) => file.try_clone()?,
             None => {
-                let path = CString::new(source.root_dir)
+                let path = CString::new(source.root_dir.as_os_str().as_bytes())
                     .map_err(|_| ArchiveError::Unsupported("share root path"))?;
                 host::open_at(None, &path, libc::O_PATH | libc::O_DIRECTORY, 0)?
             }

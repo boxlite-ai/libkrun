@@ -787,7 +787,7 @@ fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
     fs::write(&bad_magic_path, &bad_magic).unwrap();
     assert!(RamSnapshotVm::import(&bad_magic_path, disks_at(&destination())).is_err());
     let mut bad_version = valid.clone();
-    bad_version[8..12].copy_from_slice(&7u32.to_le_bytes());
+    bad_version[8..12].copy_from_slice(&8u32.to_le_bytes());
     let bad_version_path = dir.path("bad-version");
     fs::write(&bad_version_path, &bad_version).unwrap();
     assert!(RamSnapshotVm::import(&bad_version_path, disks_at(&destination())).is_err());
