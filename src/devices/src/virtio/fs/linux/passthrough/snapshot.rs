@@ -19,6 +19,10 @@
 //!   number included;
 //! - a restored object reports its saved ctime until the host object is
 //!   really modified (its host ctime leaves the restore baseline).
+//!
+//! The DAX window ledger (see `dax`) joins the checkpoint: its mappings
+//! reference the same object list, and objects only a mapping references
+//! are objects too.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CString;
@@ -33,6 +37,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 
+use super::dax::{DaxLedger, DaxMappingKind, DaxPages, DaxState, DaxWindow};
 use super::{
     einval, forget_one, fuse, stat, statx, Config, DirEntry, Entry, HandleData, Inode, InodeAltKey,
     InodeData, LinuxDirent64, PassthroughFs,
@@ -117,14 +122,17 @@ pub struct PassthroughState {
     pub nodes: Vec<NodeState>,
     /// Every handle, in handle order.
     pub handles: Vec<HandleState>,
+    /// The DAX window, when the share has one.
+    pub dax: Option<DaxState>,
 }
 
 /// A host object referenced by a checkpoint, deduplicated by host identity.
 /// Never serialized: the caller archives it and drops the descriptor.
 pub struct SnapshotObject {
     /// A duplicate of the share's descriptor for the object: the node's
-    /// `O_PATH` descriptor, or the open handle for an object only a handle
-    /// still references.
+    /// `O_PATH` descriptor, the open handle for an object only a handle
+    /// still references, or the mapping descriptor for an object only DAX
+    /// mappings reference.
     pub file: File,
     pub dev: u64,
     pub ino: u64,
@@ -137,10 +145,14 @@ pub struct SnapshotObject {
 /// A consistent capture of a frozen share.
 pub struct PassthroughCheckpoint {
     pub state: PassthroughState,
-    /// Indexed by `NodeState::object` and `HandleState::object`.
+    /// Indexed by `NodeState::object`, `HandleState::object` and DAX file
+    /// mappings.
     pub objects: Vec<SnapshotObject>,
     /// The init.krun bytes this share serves.
     pub init_binary: Arc<[u8]>,
+    /// The nonzero pages of the DAX window's anonymous mappings (init.krun
+    /// copies included); empty without a window.
+    pub dax_pages: DaxPages,
 }
 
 /// A host object rebuilt for a restore, in checkpoint object order.
@@ -165,6 +177,9 @@ pub enum PassthroughSnapshotError {
     HostSubmount(u64),
     /// The saved state is inconsistent.
     Invalid(&'static str),
+    /// A host mapping call failed part way, so this process no longer knows
+    /// what the DAX window maps; the share must be discarded.
+    DaxLost,
     Io(io::Error),
 }
 
@@ -182,6 +197,7 @@ impl std::fmt::Display for PassthroughSnapshotError {
                 write!(f, "virtio-fs node {inode} lies on a host submount")
             }
             Self::Invalid(why) => write!(f, "virtio-fs snapshot state: {why}"),
+            Self::DaxLost => write!(f, "virtio-fs DAX window lost to a failed host mapping"),
             Self::Io(e) => write!(f, "virtio-fs snapshot: {e}"),
         }
     }
@@ -381,19 +397,29 @@ impl PassthroughState {
                 }
             }
         }
+        if let Some(dax) = &self.dax {
+            dax.validate(objects)?;
+            let maps_files = dax
+                .mappings
+                .iter()
+                .any(|m| matches!(m.kind, DaxMappingKind::File { .. }));
+            if self.nodes.is_empty() && maps_files {
+                return invalid("DAX file mapping before FUSE_INIT");
+            }
+        }
         Ok(())
     }
 }
 
 /// Deduplicates checkpoint objects by host identity.
 #[derive(Default)]
-struct ObjectTable {
+pub(super) struct ObjectTable {
     objects: Vec<(File, HostKey)>,
     index: HashMap<HostKey, u64>,
 }
 
 impl ObjectTable {
-    fn add(&mut self, file: &File, key: HostKey) -> io::Result<u64> {
+    pub(super) fn add(&mut self, file: &File, key: HostKey) -> io::Result<u64> {
         if let Some(&object) = self.index.get(&key) {
             return Ok(object);
         }
@@ -557,9 +583,10 @@ impl PassthroughFs {
         })
     }
 
-    /// Flush every writable handle so the host objects hold everything the
-    /// guest already wrote through this share.
+    /// Flush every writable handle and DAX file mapping so the host objects
+    /// hold everything the guest already wrote through this share.
     pub fn sync_for_snapshot(&self) -> io::Result<()> {
+        self.sync_dax()?;
         let handles: Vec<Arc<HandleData>> =
             self.handles.read().unwrap().values().cloned().collect();
         for handle in handles {
@@ -576,9 +603,18 @@ impl PassthroughFs {
         Ok(())
     }
 
-    /// Capture the runtime state of a share whose worker is frozen. Pure:
-    /// it builds no directory list and moves no descriptor offset.
+    /// `checkpoint_with_dax` of the window mapping requests targeted.
     pub fn checkpoint(&self) -> Result<PassthroughCheckpoint, PassthroughSnapshotError> {
+        self.checkpoint_with_dax(None)
+    }
+
+    /// Capture the runtime state of a share whose worker is frozen (and
+    /// guest paused), its DAX window at `dax` if given. Pure: it builds no
+    /// directory list, moves no descriptor offset and reads no host object.
+    pub fn checkpoint_with_dax(
+        &self,
+        dax: Option<DaxWindow>,
+    ) -> Result<PassthroughCheckpoint, PassthroughSnapshotError> {
         if !self.cfg.snapshot {
             return Err(PassthroughSnapshotError::Disabled);
         }
@@ -639,6 +675,7 @@ impl PassthroughFs {
                 listing: data.listing.lock().unwrap().clone(),
             });
         }
+        let (dax, dax_pages) = self.checkpoint_dax(dax, &mut table, root_mnt)?;
 
         // Every share lock is released: `inos` comes before `inodes`.
         let mut inos = self.inos.lock().unwrap();
@@ -664,15 +701,18 @@ impl PassthroughFs {
                 next_synthetic_ino: inos.next_synthetic,
                 nodes: node_states,
                 handles: handle_states,
+                dax,
             },
             objects,
             init_binary: self.init_binary.clone(),
+            dax_pages,
         })
     }
 
     /// Rebuild a share that continues serving the guest of `state` without
     /// FUSE_INIT: same node IDs, refcounts, handles (reopened with their
-    /// saved flags), directory lists, counters and inode numbers.
+    /// saved flags), directory lists, counters and inode numbers. DAX
+    /// mapping objects are reopened; `map_dax` maps them into the window.
     pub fn restore(
         cfg: Config,
         state: &PassthroughState,
@@ -768,6 +808,24 @@ impl PassthroughFs {
                     listing: Mutex::new(handle.listing.clone()),
                 }),
             );
+        }
+
+        if let Some(dax) = &state.dax {
+            let ledger = DaxLedger::restored(dax, |object, writable| {
+                let object = object as usize;
+                if Some(identities[object].1) != root_mnt {
+                    return Err(PassthroughSnapshotError::Invalid(
+                        "DAX mapping object on another mount than the root",
+                    ));
+                }
+                let flags = if writable {
+                    libc::O_RDWR
+                } else {
+                    libc::O_RDONLY
+                };
+                Ok(fs.reopen(&objects[object].file, flags)?)
+            })?;
+            *fs.dax.get_mut().unwrap() = ledger;
         }
 
         fs.writeback.store(state.writeback, Ordering::Relaxed);

@@ -27,7 +27,11 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
 
+mod dax;
 mod snapshot;
+#[cfg(test)]
+pub(crate) use dax::faults as dax_faults;
+pub use dax::{DaxMapping, DaxMappingKind, DaxPages, DaxState, DaxWindow, DAX_PAGE_SIZE};
 use snapshot::InoMap;
 pub use snapshot::{
     DirListEntry, HandleState, NodeState, PassthroughCheckpoint, PassthroughSnapshotError,
@@ -422,6 +426,9 @@ pub struct PassthroughFs {
     // Snapshot mode only: host identity -> guest inode projection. Lock
     // order: `inos` before `inodes`; never taken while holding `inodes`.
     inos: Mutex<InoMap>,
+    // Snapshot mode only: the DAX window as the host maps it. Lock order:
+    // `dax` before `inodes`.
+    dax: Mutex<dax::DaxLedger>,
 
     cfg: Config,
 }
@@ -496,6 +503,7 @@ impl PassthroughFs {
             cap_fowner,
             init_binary: DEFAULT_INIT.clone(),
             inos: Mutex::new(InoMap::new(fuse::ROOT_ID + 1)),
+            dax: Default::default(),
             cfg,
         })
     }
@@ -2166,6 +2174,19 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
+        if self.cfg.snapshot {
+            let writable = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
+            return self.dax_setupmapping(
+                inode,
+                foffset,
+                len,
+                writable,
+                moffset,
+                host_shm_base,
+                shm_size,
+            );
+        }
+
         let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
             libc::O_RDWR
         } else {
@@ -2243,6 +2264,10 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
+        if self.cfg.snapshot {
+            return self.dax_removemapping(&requests, host_shm_base, shm_size);
+        }
+
         for req in requests {
             let addr = host_shm_base + req.moffset;
             if (req.moffset + req.len) > shm_size {

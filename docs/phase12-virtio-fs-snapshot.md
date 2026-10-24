@@ -1,8 +1,9 @@
 # 阶段 12：virtio-fs 快照暂停检查点
 
-状态：**已按用户要求暂停**（2026-10-23，Asia/Shanghai）。
-开发基线：`e9cb351`。本次检查点仅包含批次 1 及审查修正；批次 2
-只完成调研，没有源码改动，批次 3 尚未开始。完整镜像仍为 **v6**，
+状态：批次 1 及审查修正已提交（`32dc08f`）；批次 2 已恢复
+（2026-10-24），**DAX ledger 与映射对象生命周期及 fail-closed 审查修正
+已经 Codex 审查通过并在本地提交**；
+独立对象归档和批次 3 尚未开始。完整镜像仍为 **v6**，
 `RamSnapshotVm` 目前仍不能保存含 virtio-fs 的完整 VM。
 
 ## 已完成并审查
@@ -63,30 +64,85 @@ macOS 原生回归需将 `KRUN_INIT_BINARY_PATH` 指向已生成的 Linux init�
 
 ## 续做顺序
 
-### 批次 2：独立对象归档与 DAX（尚未实现）
+### 批次 2 第一部分：DAX ledger（已审查通过）
+
+`linux/passthrough/dax.rs`，仅快照共享启用；普通共享的映射代码未改动。
+
+- 宿主映射成功后才更新 ledger。窗口划分为文件映射（对象、文件偏移、
+  只读/可写）、私有匿名内存（初始可读写；init.krun 副本按请求的文件
+  偏移复制共享的 init 字节并按请求权限设置）和 PROT_NONE 空洞。覆盖与
+  部分解除映射切分已有段并保留每个字节的文件偏移；多范围解除映射在
+  失败处停止，之前成功的范围保留在 ledger 中。
+- 首个请求绑定窗口，要求整页、页对齐且不溢出地址空间；所有偏移检查
+  均无溢出。每个文件映射持有自己的描述符（按对象和权限共享），仅被映射
+  引用的对象（节点已 forget、名字已 unlink）进入检查点对象表。
+- 冻结在确认前对可写文件映射执行 `msync(MS_SYNC)`。
+- fail-closed（审查修正）：宿主会直接拒绝的请求（窗口外、文件偏移未对齐、
+  非普通文件、未知节点）在任何宿主调用前拒绝，窗口仍可用。宿主
+  `mmap`/`mprotect` 仍失败时（`MAP_FIXED` 可能先解除旧映射再失败，
+  `mprotect` 可能中途停止）宿主布局不确定，窗口记为丢失：之后的映射请求
+  与 `sync_for_snapshot` 返回 `EIO`（freeze 因此报错而不确认），捕获返回
+  `PassthroughSnapshotError::DaxLost`，均不触碰窗口内存；owner 须丢弃
+  共享（停止并 join worker），不做回滚。`map_dax` 中途失败时 ledger 仍为
+  未映射状态，设备须丢弃（保持原约定）。`Fs::restore_session` 在没有
+  DAX 状态/窗口时拒绝非空 `dax_pages`，且早于构建 session。
+- 接口：`PassthroughState::dax: Option<DaxState>`（映射引用同一对象表，
+  便于后续归档做全局对象重映射）；`PassthroughCheckpoint::dax_pages`
+  （排序、唯一、非零 4 KiB 页）；`PassthroughFs::checkpoint_with_dax`；
+  `PassthroughFs::map_dax(DaxWindow, &DaxPages)`；
+  `Fs::restore_session(.., &DaxPages)` 在激活前把窗口映射到本设备窗口，
+  要求窗口存在性和大小与保存一致。状态与页先校验后产生副作用（覆盖、
+  对齐、对象范围、`off_t` 上限、页序、页位于匿名映射内且非全零）。
+- 捕获只读窗口内存，不读取宿主对象，源 atime 不变。
+
+初版验证（2026-10-24）：amd64 离线容器 `make snapshot-fmt`、
+`snapshot-check`（含无 feature 的 `krun-vmm`、`krun-devices`）、
+`snapshot-build` 通过；`snapshot_fs` 20/20、`krun-devices` snapshot
+103/103。原生 arm64 容器（`SNAPSHOT_TARGET=aarch64-unknown-linux-gnu`）
+`snapshot_fs` 20/20，其中 `mseal` 宿主失败用例实际运行；amd64 容器经
+Rosetta 运行，`mseal` 返回 ENOSYS，该段跳过。macOS `snapshot-check`
+（`krun-devices`）编译通过。九项变异检查中八项被测试捕获；去掉 `msync`
+无法从读取观察（共享映射与页缓存一致），属已知测试缺口。clippy 未安装，
+未运行。KVM 仍 **UNVERIFIED**。
+
+fail-closed 修正验证（2026-10-24）：原依赖 `mseal` 的失败段（无 `mseal`
+时跳过）改为仅测试编译的系统调用边界故障钩子
+（`passthrough::dax_faults`，按目标地址触发：`MAP_FIXED` 先 munmap 再
+失败、`mprotect` 只改第一页后失败），任何 Linux 主机均实际运行。新增
+`snapshot_fs_dax_host_failures_lose_the_window`、
+`snapshot_fs_dax_device_freeze_fails_on_a_lost_window`、
+`snapshot_fs_restore_session_rejects_pages_without_a_window`。
+`make snapshot-fmt` 通过；amd64 容器（容器内先 `touch` 改动文件强制
+重新编译）`make snapshot-check` 通过、`snapshot_fs` **23/23**。撤销
+`dax.rs`/`device.rs` 生产修正（仅保留钩子与 `DaxLost` 变体作适配）后
+3 个新测试失败，恢复后通过。未重跑 arm64、macOS 和全部 krun-devices。
+
+后续需要的接口（尚未实现）：归档须在 FUSE_INIT 或激活之前也能捕获
+根目录及整棵树，而此时没有根节点或 server；需要由 owner 从
+`passthrough::Config::root_dir` 打开根目录（或为 `Fs` 增加相应只读
+访问器）。
+
+### 批次 2 其余部分：独立对象归档（尚未实现）
 
 - 跨共享按宿主文件身份去重内容，保留每个共享独立的 guest inode 投影。
   归档整个目录树和未 lookup 对象，支持文件、符号链接、硬链接、权限、
   uid/gid、时间戳、精确 xattr、char 0:0 whiteout 和打开/仅映射引用的孤儿。
 - 明确拒绝 exported FD、宿主子挂载、目录多父或环、不可归档外部对象、
   FIFO/socket/其他设备节点；不能重建元数据时失败，不能静默省略。
-- DAX ledger 保存文件对象、偏移、权限、匿名范围和 PROT_NONE 空洞，
-  正确处理覆盖和部分解除映射；保留仅映射对象 FD。冻结同步可写映射。
-- 归档源 init.krun 内容和当前私有映射字节；匿名数据仅保存排序、唯一的
-  非零 4 KiB 页。恢复不使用目标编译时 init 替代内容。
+- 归档源 init.krun 内容和 `dax_pages`（DAX 部分已产出）；恢复不使用
+  目标编译时 init 替代内容。
 - 导入通过目录 FD 和禁止跟随符号链接的操作创建独立副本；独占创建 0700
   目标目录，孤儿先打开再删除临时名字。校验先于副作用，失败只清理本次资源。
 - 复制优先 O_NOATIME，保存读取前元数据，记录回退读取可能改变源 atime。
 - 实测多共享、只读、rename/unlink、跨共享硬链接、两种孤儿、whiteout、
-  源目录删除后恢复、独立副本、init 私有改写、DAX 覆盖/部分 unmap/空洞，
-  以及畸形结构、复制/导入中途失败和清理。
+  源目录删除后恢复、独立副本，以及畸形结构、复制/导入中途失败和清理。
 
 已做的环境探测：默认容器支持 `user.overlay.*`；`trusted.overlay.*`
 需要 `--cap-add SYS_ADMIN`。在容器内部 tmpfs 上，配合
 `--cap-add SYS_ADMIN --device-cgroup-rule 'c 0:0 m'`，已实际创建 char 0:0
 并设置两类 OverlayFS xattr。此为环境探测，**不是归档功能验收**。
 O_PATH 符号链接通过 `/proc/self/fd/N` 读取 xattr/设置时间的操作也已探测，
-包括 unlink 后的对象。建议从 `passthrough/dax.rs` 和 Linux archive 模块开始。
+包括 unlink 后的对象。下一步从 Linux archive 模块开始。
 
 ### 批次 3：owner、v7 格式和最终回归（尚未实现）
 

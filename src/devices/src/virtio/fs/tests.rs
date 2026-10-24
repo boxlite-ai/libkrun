@@ -7,7 +7,7 @@ use std::mem::{self, size_of};
 use std::num::Wrapping;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,11 +23,13 @@ use super::filesystem::{
 };
 use super::fuse::{
     self, AttrOut, Dirent, EntryOut, GetattrIn, InHeader, InitInCompat, Opcode, OpenIn, OpenOut,
-    OutHeader, ReadIn, WriteIn,
+    OutHeader, ReadIn, RemovemappingIn, RemovemappingOne, SetupmappingFlags, SetupmappingIn,
+    WriteIn,
 };
 use super::passthrough::{
-    self, PassthroughCheckpoint, PassthroughFs, PassthroughSnapshotError, PassthroughState,
-    RestoredObject, SYNTHETIC_INO_BASE,
+    self, DaxMapping, DaxMappingKind, DaxPages, DaxState, DaxWindow, PassthroughCheckpoint,
+    PassthroughFs, PassthroughSnapshotError, PassthroughState, RestoredObject, SnapshotObject,
+    DAX_PAGE_SIZE, SYNTHETIC_INO_BASE,
 };
 use super::worker::{request_gate, FsServer};
 use super::Fs;
@@ -35,7 +37,8 @@ use crate::legacy::DummyIrqChip;
 use crate::virtio::persist::QueueState;
 use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
 use crate::virtio::{
-    Descriptor, DeviceQueue, InterruptTransport, Queue, VirtioDevice, VIRTIO_MMIO_INT_VRING,
+    Descriptor, DeviceQueue, InterruptTransport, Queue, VirtioDevice, VirtioShmRegion,
+    VIRTIO_MMIO_INT_VRING,
 };
 
 const QSIZE: u16 = 16;
@@ -367,6 +370,7 @@ impl Rig {
             &session.passthrough.state,
             same_host_objects(&session.passthrough),
             init.unwrap_or_else(|| session.passthrough.init_binary.clone()),
+            &session.passthrough.dax_pages,
         )
         .unwrap();
         let queues = queues.iter().map(QueueState::to_queue).collect();
@@ -1354,4 +1358,943 @@ fn snapshot_fs_non_utf8_names_list_and_look_up() {
         .lookup(CTX, fuse::ROOT_ID, &CString::new(name).unwrap())
         .unwrap();
     assert_eq!(again.inode, entry.inode);
+}
+
+fn host_page() -> u64 {
+    // Safe because sysconf touches no memory.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+/// An anonymous read-write reservation standing in for a share's DAX
+/// window, as the VMM provides it.
+struct Window {
+    addr: u64,
+    size: u64,
+}
+
+impl Window {
+    fn new(pages: u64) -> Window {
+        let size = pages * host_page();
+        // Safe because a new private mapping touches no existing memory and
+        // we check the result.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!std::ptr::eq(addr, libc::MAP_FAILED));
+        Window {
+            addr: addr as u64,
+            size,
+        }
+    }
+
+    fn dax(&self) -> DaxWindow {
+        DaxWindow {
+            host_addr: self.addr,
+            size: self.size,
+        }
+    }
+
+    fn shm(&self) -> VirtioShmRegion {
+        VirtioShmRegion {
+            host_addr: self.addr,
+            guest_addr: 0,
+            size: self.size as usize,
+        }
+    }
+
+    /// What the guest reads at `offset`.
+    fn read(&self, offset: u64, len: u64) -> Vec<u8> {
+        assert!(offset + len <= self.size);
+        // Safe because the range lies inside the reservation and the caller
+        // reads only readable pages.
+        unsafe { std::slice::from_raw_parts((self.addr + offset) as *const u8, len as usize) }
+            .to_vec()
+    }
+
+    /// What the guest writes at `offset`.
+    fn write(&self, offset: u64, bytes: &[u8]) {
+        assert!(offset + bytes.len() as u64 <= self.size);
+        // Safe because the range lies inside the reservation and the caller
+        // writes only writable pages.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (self.addr + offset) as *mut u8,
+                bytes.len(),
+            )
+        };
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // Safe because the reservation belongs to this window.
+        unsafe { libc::munmap(self.addr as *mut libc::c_void, self.size as usize) };
+    }
+}
+
+/// `pages` host pages, page `i` filled with `first + i`.
+fn paged(pages: u64, first: u8) -> Vec<u8> {
+    (0..pages)
+        .flat_map(|i| vec![first + i as u8; host_page() as usize])
+        .collect()
+}
+
+/// FUSE_SETUPMAPPING, in host pages.
+fn setup(
+    fs: &PassthroughFs,
+    w: &Window,
+    inode: u64,
+    foffset: u64,
+    len: u64,
+    writable: bool,
+    moffset: u64,
+) -> std::io::Result<()> {
+    let p = host_page();
+    let flags = if writable {
+        SetupmappingFlags::READ | SetupmappingFlags::WRITE
+    } else {
+        SetupmappingFlags::READ
+    };
+    fs.setupmapping(
+        CTX,
+        inode,
+        0,
+        foffset * p,
+        len * p,
+        flags.bits(),
+        moffset * p,
+        w.addr,
+        w.size,
+    )
+}
+
+/// FUSE_REMOVEMAPPING of (moffset, len) ranges, in host pages.
+fn remove(fs: &PassthroughFs, w: &Window, ranges: &[(u64, u64)]) -> std::io::Result<()> {
+    let p = host_page();
+    let requests = ranges
+        .iter()
+        .map(|&(moffset, len)| RemovemappingOne {
+            moffset: moffset * p,
+            len: len * p,
+        })
+        .collect();
+    fs.removemapping(CTX, requests, w.addr, w.size)
+}
+
+/// A mapping in host pages; file offsets are in host pages too.
+fn mapping(moffset: u64, len: u64, kind: DaxMappingKind) -> DaxMapping {
+    let p = host_page();
+    let kind = match kind {
+        DaxMappingKind::File {
+            object,
+            foffset,
+            writable,
+        } => DaxMappingKind::File {
+            object,
+            foffset: foffset * p,
+            writable,
+        },
+        other => other,
+    };
+    DaxMapping {
+        moffset: moffset * p,
+        len: len * p,
+        kind,
+    }
+}
+
+fn file(object: u64, foffset: u64, writable: bool) -> DaxMappingKind {
+    DaxMappingKind::File {
+        object,
+        foffset,
+        writable,
+    }
+}
+
+const ANON: DaxMappingKind = DaxMappingKind::Anonymous { writable: true };
+const HOLE: DaxMappingKind = DaxMappingKind::Hole;
+
+fn object_of(checkpoint: &PassthroughCheckpoint, path: &Path) -> u64 {
+    let ino = fs::metadata(path).unwrap().ino();
+    checkpoint
+        .objects
+        .iter()
+        .position(|o| o.ino == ino)
+        .unwrap() as u64
+}
+
+fn dax_layout(fs: &PassthroughFs, w: &Window) -> Vec<DaxMapping> {
+    fs.checkpoint_with_dax(Some(w.dax()))
+        .unwrap()
+        .state
+        .dax
+        .unwrap()
+        .mappings
+}
+
+/// Check every window page against the host's own mappings
+/// (/proc/self/maps): protection, sharing, and for file mappings the
+/// object's inode and the file offset.
+fn assert_host_matches(w: &Window, state: &DaxState, objects: &[SnapshotObject]) {
+    let maps = fs::read_to_string("/proc/self/maps").unwrap();
+    let vmas: Vec<(u64, u64, String, u64, u64)> = maps
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let (start, end) = fields.next().unwrap().split_once('-').unwrap();
+            let perms = fields.next().unwrap().to_string();
+            let offset = u64::from_str_radix(fields.next().unwrap(), 16).unwrap();
+            fields.next();
+            let inode = fields.next().unwrap().parse().unwrap();
+            (
+                u64::from_str_radix(start, 16).unwrap(),
+                u64::from_str_radix(end, 16).unwrap(),
+                perms,
+                offset,
+                inode,
+            )
+        })
+        .collect();
+    let p = host_page();
+    for m in &state.mappings {
+        for at in (m.moffset..m.moffset + m.len).step_by(p as usize) {
+            let addr = w.addr + at;
+            let (start, _, perms, offset, inode) = vmas
+                .iter()
+                .find(|v| v.0 <= addr && addr < v.1)
+                .unwrap_or_else(|| panic!("window page {at:#x} is unmapped"));
+            match m.kind {
+                DaxMappingKind::File {
+                    object,
+                    foffset,
+                    writable,
+                } => {
+                    assert_eq!(perms, if writable { "rw-s" } else { "r--s" }, "{at:#x}");
+                    assert_eq!(*inode, objects[object as usize].ino, "{at:#x}");
+                    assert_eq!(offset + (addr - start), foffset + (at - m.moffset));
+                }
+                DaxMappingKind::Anonymous { writable } => {
+                    assert_eq!(perms, if writable { "rw-p" } else { "r--p" }, "{at:#x}");
+                    assert_eq!(*inode, 0, "{at:#x}");
+                }
+                DaxMappingKind::Hole => {
+                    assert_eq!(perms, "---p", "{at:#x}");
+                    assert_eq!(*inode, 0, "{at:#x}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn snapshot_fs_dax_ledger_tracks_overlap_partial_unmap_and_holes() {
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("a", &paged(4, 0x10));
+    dir.file("b", &paged(2, 0x40));
+    let w = Window::new(8);
+    let fs = init_share(dir.path());
+    let a = fs.lookup(CTX, fuse::ROOT_ID, &cstr("a")).unwrap();
+    let b = fs.lookup(CTX, fuse::ROOT_ID, &cstr("b")).unwrap();
+
+    setup(&fs, &w, a.inode, 0, 4, false, 0).unwrap();
+    // A writable mapping over the middle of the first one.
+    setup(&fs, &w, b.inode, 0, 2, true, 2).unwrap();
+    setup(&fs, &w, a.inode, 0, 3, false, 4).unwrap();
+    // One request removing a page from each of the three mappings.
+    remove(&fs, &w, &[(1, 1), (3, 1), (5, 1)]).unwrap();
+
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    let (oa, ob) = (
+        object_of(&checkpoint, &dir.path().join("a")),
+        object_of(&checkpoint, &dir.path().join("b")),
+    );
+    let state = checkpoint.state.dax.as_ref().unwrap();
+    assert_eq!(state.size, w.size);
+    assert_eq!(
+        state.mappings,
+        vec![
+            mapping(0, 1, file(oa, 0, false)),
+            mapping(1, 1, HOLE),
+            mapping(2, 1, file(ob, 0, true)),
+            mapping(3, 1, HOLE),
+            mapping(4, 1, file(oa, 0, false)),
+            mapping(5, 1, HOLE),
+            // The rest of a cut mapping keeps each byte's file offset.
+            mapping(6, 1, file(oa, 2, false)),
+            mapping(7, 1, ANON),
+        ]
+    );
+    assert_host_matches(&w, state, &checkpoint.objects);
+    assert_eq!(w.read(6 * p, 1), [0x12]);
+    // The guest writes through the writable mapping into the host object.
+    w.write(2 * p, b"guest");
+    assert_eq!(&fs::read(dir.path().join("b")).unwrap()[..5], b"guest");
+
+    // Adjacent views continuing one object merge; removing everything
+    // leaves one hole and no object or page references.
+    remove(&fs, &w, &[(0, 8)]).unwrap();
+    setup(&fs, &w, a.inode, 0, 2, false, 0).unwrap();
+    setup(&fs, &w, a.inode, 2, 2, false, 2).unwrap();
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    let oa = object_of(&checkpoint, &dir.path().join("a"));
+    let state = checkpoint.state.dax.as_ref().unwrap();
+    assert_eq!(
+        state.mappings,
+        vec![mapping(0, 4, file(oa, 0, false)), mapping(4, 4, HOLE)]
+    );
+    assert_host_matches(&w, state, &checkpoint.objects);
+    remove(&fs, &w, &[(0, 4)]).unwrap();
+    assert_eq!(dax_layout(&fs, &w), vec![mapping(0, 8, HOLE)]);
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    assert!(checkpoint.dax_pages.offsets.is_empty());
+    // Only the root and the looked-up files remain objects.
+    assert_eq!(checkpoint.objects.len(), 3);
+}
+
+#[test]
+fn snapshot_fs_dax_failed_mappings_keep_ledger_and_host_consistent() {
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("a", &paged(4, 0x10));
+    let w = Window::new(4);
+    // A first request on a window that is not whole host pages inside the
+    // address space fails and binds nothing.
+    let unbound = init_share(dir.path());
+    for (base, size) in [
+        (w.addr + 1, w.size),
+        (w.addr, w.size - 1),
+        (w.addr, 0),
+        (u64::MAX - p + 1, 2 * p),
+    ] {
+        let one = vec![RemovemappingOne { moffset: 0, len: p }];
+        assert!(unbound.removemapping(CTX, one, base, size).is_err());
+    }
+    assert_eq!(unbound.checkpoint().unwrap().state.dax, None);
+
+    let fs = init_share(dir.path());
+    let a = fs.lookup(CTX, fuse::ROOT_ID, &cstr("a")).unwrap();
+    setup(&fs, &w, a.inode, 0, 2, false, 0).unwrap();
+    let before = dax_layout(&fs, &w);
+
+    // Every refusal comes before a host call (the host would refuse a
+    // directory or an unaligned file offset too), so the window stays
+    // usable.
+    let read = SetupmappingFlags::READ.bits();
+    let failures: Vec<(&str, std::io::Result<()>)> = vec![
+        ("directory", setup(&fs, &w, fuse::ROOT_ID, 0, 1, false, 2)),
+        (
+            "unaligned file offset",
+            fs.setupmapping(CTX, a.inode, 0, 1, p, read, 2 * p, w.addr, w.size),
+        ),
+        ("unknown node", setup(&fs, &w, 1 << 40, 0, 1, false, 2)),
+        ("past the window", setup(&fs, &w, a.inode, 0, 2, false, 3)),
+        (
+            "wrapping window offset",
+            fs.setupmapping(
+                CTX,
+                a.inode,
+                0,
+                0,
+                2 * p,
+                read,
+                u64::MAX - p + 1,
+                w.addr,
+                w.size,
+            ),
+        ),
+        (
+            "unaligned window offset",
+            fs.setupmapping(CTX, a.inode, 0, 0, p, read, 1, w.addr, w.size),
+        ),
+        (
+            "file offset past off_t",
+            fs.setupmapping(
+                CTX,
+                a.inode,
+                0,
+                u64::MAX - p + 1,
+                p,
+                read,
+                2 * p,
+                w.addr,
+                w.size,
+            ),
+        ),
+        (
+            "another window",
+            fs.setupmapping(CTX, a.inode, 0, 0, p, read, 0, w.addr + p, w.size - p),
+        ),
+    ];
+    for (what, result) in failures {
+        assert!(result.is_err(), "{what} accepted");
+    }
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    let state = checkpoint.state.dax.as_ref().unwrap();
+    assert_eq!(state.mappings, before);
+    assert_host_matches(&w, state, &checkpoint.objects);
+
+    // A removal whose second range fails keeps the first and never tries
+    // the third.
+    assert!(remove(&fs, &w, &[(1, 1), (3, 2), (0, 1)]).is_err());
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    let oa = object_of(&checkpoint, &dir.path().join("a"));
+    let state = checkpoint.state.dax.as_ref().unwrap();
+    assert_eq!(
+        state.mappings,
+        vec![
+            mapping(0, 1, file(oa, 0, false)),
+            mapping(1, 1, HOLE),
+            mapping(2, 2, ANON),
+        ]
+    );
+    assert_host_matches(&w, state, &checkpoint.objects);
+    assert_eq!(w.read(0, 1), [0x10]);
+}
+
+/// After a failed host call: every capture, sync and mapping request on
+/// `fs` fails, and the untouched window page at `offset` still holds `byte`.
+fn assert_lost(fs: &PassthroughFs, w: &Window, offset: u64, byte: u8) {
+    let p = host_page();
+    assert!(matches!(
+        fs.checkpoint_with_dax(Some(w.dax())),
+        Err(PassthroughSnapshotError::DaxLost)
+    ));
+    assert!(matches!(
+        fs.checkpoint(),
+        Err(PassthroughSnapshotError::DaxLost)
+    ));
+    let eio = Some(libc::EIO);
+    assert_eq!(fs.sync_for_snapshot().unwrap_err().raw_os_error(), eio);
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    let mapped = setup(fs, w, init.inode, 0, 1, true, offset / p);
+    assert_eq!(mapped.unwrap_err().raw_os_error(), eio);
+    let removal = remove(fs, w, &[(offset / p, 1)]);
+    assert_eq!(removal.unwrap_err().raw_os_error(), eio);
+    assert_eq!(w.read(offset, 1), [byte]);
+}
+
+/// Give back `len` bytes at `offset` that a failure unmapped from `w`
+/// before it is dropped; if another mapping took them, leak `w` instead.
+fn reclaim(w: Window, offset: u64, len: u64) {
+    let at = w.addr + offset;
+    // Safe because the range is the window's own unmapped part and
+    // MAP_FIXED_NOREPLACE never replaces another mapping.
+    let addr = unsafe {
+        libc::mmap(
+            at as *mut libc::c_void,
+            len as usize,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if addr as u64 != at {
+        if !std::ptr::eq(addr, libc::MAP_FAILED) {
+            // Safe because the kernel placed this new mapping elsewhere.
+            unsafe { libc::munmap(addr, len as usize) };
+        }
+        mem::forget(w);
+    }
+}
+
+#[test]
+fn snapshot_fs_dax_host_failures_lose_the_window() {
+    use passthrough::dax_faults::{arm, Fault};
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("a", &paged(4, 0x10));
+
+    // A removal whose second range unmaps a file mapping and then fails:
+    // the ledger would still show the file there.
+    let w = Window::new(4);
+    let fs = init_share(dir.path());
+    let a = fs.lookup(CTX, fuse::ROOT_ID, &cstr("a")).unwrap();
+    setup(&fs, &w, a.inode, 0, 2, false, 0).unwrap();
+    w.write(3 * p, &[7]);
+    arm(w.addr + p, Fault::MapAfterUnmap);
+    let removal = remove(&fs, &w, &[(2, 1), (1, 1), (3, 1)]);
+    assert_eq!(removal.unwrap_err().raw_os_error(), Some(libc::ENOMEM));
+    assert_lost(&fs, &w, 3 * p, 7);
+    reclaim(w, p, p);
+
+    // An init.krun copy that unmaps untouched memory and then fails: a
+    // capture would read the unmapped page.
+    let w = Window::new(2);
+    let fs = init_share(dir.path());
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    w.write(0, &[8]);
+    arm(w.addr + p, Fault::MapAfterUnmap);
+    assert!(setup(&fs, &w, init.inode, 0, 1, true, 1).is_err());
+    assert_lost(&fs, &w, 0, 8);
+    reclaim(w, p, p);
+
+    // A read-only init.krun copy whose mprotect stops after one page.
+    let w = Window::new(4);
+    let fs = init_share(dir.path());
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    w.write(3 * p, &[9]);
+    arm(w.addr + p, Fault::ProtectPartly);
+    assert!(setup(&fs, &w, init.inode, 0, 2, false, 1).is_err());
+    assert_lost(&fs, &w, 3 * p, 9);
+}
+
+#[test]
+fn snapshot_fs_dax_device_freeze_fails_on_a_lost_window() {
+    use passthrough::dax_faults::{arm, Fault};
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("f", &paged(1, 0x33));
+    let w = Window::new(4);
+    let mut device = Rig::device(dir.path());
+    device.set_shm_region(w.shm());
+    let guest = Guest::new(0xfffe);
+    let queues = (0..NUM_QUEUES).map(|q| guest.queue(q)).collect();
+    let mut rig = Rig::activate(guest, device, queues, false);
+    rig.init();
+    let f = rig.lookup(fuse::ROOT_ID, "f");
+    let request = |moffset| SetupmappingIn {
+        fh: 0,
+        foffset: 0,
+        len: p,
+        flags: SetupmappingFlags::READ.bits(),
+        moffset,
+    };
+    arm(w.addr + p, Fault::MapAfterUnmap);
+    let (header, _) = rig.call(Opcode::SetupMapping, f.nodeid, request(p).as_slice());
+    assert_eq!(header.error, -libc::ENOMEM);
+    let (header, _) = rig.call(Opcode::SetupMapping, f.nodeid, request(2 * p).as_slice());
+    assert_eq!(header.error, -libc::EIO);
+    // The worker reports the failure instead of confirming the freeze.
+    let control = rig.fs.worker_control().unwrap();
+    assert!(control.freeze_with_timeout(WAIT).is_err());
+    assert!(matches!(
+        rig.fs.snapshot_session(),
+        Err(PassthroughSnapshotError::DaxLost)
+    ));
+    // Dropping the rig stops and joins the worker before the window goes.
+    drop(rig);
+    reclaim(w, p, p);
+}
+
+/// Set the access time of `path` to `sec`, leaving its modification time.
+fn set_atime(path: &Path, sec: i64) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: sec,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    ];
+    // Safe because both arguments are valid for the call.
+    let res = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(res, 0);
+}
+
+/// The nonzero DAX pages of `bytes` placed at window offset `at`.
+fn nonzero_pages(at: u64, bytes: &[u8]) -> DaxPages {
+    let mut pages = DaxPages::default();
+    for (index, page) in bytes.chunks(DAX_PAGE_SIZE as usize).enumerate() {
+        if page.iter().any(|&b| b != 0) {
+            pages.offsets.push(at + index as u64 * DAX_PAGE_SIZE);
+            pages.data.extend_from_slice(page);
+        }
+    }
+    pages
+}
+
+#[test]
+fn snapshot_fs_dax_mapped_only_objects_and_private_init_bytes_survive_restore() {
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("data", &paged(1, 0x55));
+    dir.file("ro", &paged(1, 0x66));
+    let (w, target) = (Window::new(8), Window::new(8));
+    let fs = init_share(dir.path());
+    let data = fs.lookup(CTX, fuse::ROOT_ID, &cstr("data")).unwrap();
+    let ro = fs.lookup(CTX, fuse::ROOT_ID, &cstr("ro")).unwrap();
+    let init = fs.lookup(CTX, fuse::ROOT_ID, &cstr("init.krun")).unwrap();
+    let init_bytes = fs.checkpoint().unwrap().init_binary;
+
+    setup(&fs, &w, data.inode, 0, 1, true, 0).unwrap();
+    setup(&fs, &w, ro.inode, 0, 1, false, 1).unwrap();
+    // A writable init.krun copy from offset 0, and a read-only one from
+    // the second host page.
+    setup(&fs, &w, init.inode, 0, 2, true, 2).unwrap();
+    setup(&fs, &w, init.inode, 1, 1, false, 4).unwrap();
+    w.write(0, b"through the window");
+    // The guest modifies its private init.krun copy and untouched memory.
+    w.write(2 * p + 10, &[0xee]);
+    w.write(6 * p + 7, &[0x77]);
+    // Only the mapping references "data" now.
+    fs.forget(CTX, data.inode, 1);
+    fs.unlink(CTX, fuse::ROOT_ID, &cstr("data")).unwrap();
+    set_atime(&dir.path().join("ro"), 1);
+
+    fs.sync_for_snapshot().unwrap();
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    assert!(checkpoint.state.nodes.iter().all(|n| n.inode != data.inode));
+    let state = checkpoint.state.dax.as_ref().unwrap();
+    let DaxMappingKind::File { object, .. } = state.mappings[0].kind else {
+        panic!("{:?}", state.mappings[0]);
+    };
+    let mapped = &checkpoint.objects[object as usize];
+    assert_eq!(mapped.file.metadata().unwrap().nlink(), 0);
+    let mut written = [0u8; 18];
+    mapped.file.read_exact_at(&mut written, 0).unwrap();
+    assert_eq!(&written, b"through the window");
+    let oro = object_of(&checkpoint, &dir.path().join("ro"));
+    assert_eq!(
+        state.mappings,
+        vec![
+            mapping(0, 1, file(object, 0, true)),
+            mapping(1, 1, file(oro, 0, false)),
+            mapping(2, 2, ANON),
+            mapping(4, 1, DaxMappingKind::Anonymous { writable: false }),
+            mapping(5, 3, ANON),
+        ]
+    );
+    assert_host_matches(&w, state, &checkpoint.objects);
+    // The copies hold the source init.krun bytes from their offsets, plus
+    // the guest's change; anonymous data is the sorted nonzero pages.
+    let copy = |from: u64, len: u64| {
+        let mut bytes = vec![0u8; len as usize];
+        let start = (from as usize).min(init_bytes.len());
+        let end = (start + len as usize).min(init_bytes.len());
+        bytes[..end - start].copy_from_slice(&init_bytes[start..end]);
+        bytes
+    };
+    let mut first = copy(0, 2 * p);
+    first[10] = 0xee;
+    let second = copy(p, p);
+    assert_eq!(w.read(2 * p, 2 * p), first);
+    assert_eq!(w.read(4 * p, p), second);
+    let mut expected = nonzero_pages(2 * p, &first);
+    let more = nonzero_pages(4 * p, &second);
+    expected.offsets.extend(more.offsets);
+    expected.data.extend(more.data);
+    let mut touched = vec![0u8; DAX_PAGE_SIZE as usize];
+    touched[((6 * p + 7) % DAX_PAGE_SIZE) as usize] = 0x77;
+    expected
+        .offsets
+        .push((6 * p + 7) / DAX_PAGE_SIZE * DAX_PAGE_SIZE);
+    expected.data.extend(touched);
+    assert_eq!(checkpoint.dax_pages, expected);
+    assert!(checkpoint.dax_pages.validate(state).is_ok());
+    // Capturing read no host object.
+    assert_eq!(fs::metadata(dir.path().join("ro")).unwrap().atime(), 1);
+
+    // A restore maps the same window elsewhere, the unlinked object again.
+    let restored = PassthroughFs::restore(
+        snapshot_config(dir.path()),
+        &checkpoint.state,
+        same_host_objects(&checkpoint),
+        checkpoint.init_binary.clone(),
+    )
+    .unwrap();
+    restored
+        .map_dax(target.dax(), &checkpoint.dax_pages)
+        .unwrap();
+    assert_eq!(target.read(0, 18), b"through the window");
+    assert_eq!(target.read(p, 1), [0x66]);
+    assert_eq!(target.read(2 * p, 2 * p), first);
+    assert_eq!(target.read(4 * p, p), second);
+    assert_eq!(target.read(6 * p + 7, 1), [0x77]);
+    let again = restored.checkpoint_with_dax(Some(target.dax())).unwrap();
+    assert_eq!(again.state.dax, checkpoint.state.dax);
+    assert_eq!(again.dax_pages, checkpoint.dax_pages);
+    assert_host_matches(&target, state, &again.objects);
+    // The restored writable mapping reaches the same object.
+    target.write(0, b"T");
+    restored.sync_for_snapshot().unwrap();
+    mapped.file.read_exact_at(&mut written[..1], 0).unwrap();
+    assert_eq!(&written[..1], b"T");
+
+    // Removing the source mapping releases the mapped-only object there.
+    let ino = mapped.ino;
+    remove(&fs, &w, &[(0, 1)]).unwrap();
+    let after = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    assert!(after.objects.iter().all(|o| o.ino != ino));
+}
+
+#[test]
+fn snapshot_fs_dax_restore_rejects_malformed_mappings_and_pages() {
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("a", &paged(1, 0x10));
+    let (w, target) = (Window::new(4), Window::new(4));
+    let fs = init_share(dir.path());
+    let a = fs.lookup(CTX, fuse::ROOT_ID, &cstr("a")).unwrap();
+    setup(&fs, &w, a.inode, 0, 1, false, 0).unwrap();
+    remove(&fs, &w, &[(1, 1)]).unwrap();
+    w.write(3 * p, &[1]);
+    let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
+    let objects = checkpoint.objects.len();
+    let good = checkpoint.state.clone();
+    assert!(good.validate(objects).is_ok());
+
+    let cases: Vec<(&str, Box<dyn Fn(&mut DaxState)>)> = vec![
+        ("gap", Box::new(move |s| s.mappings[1].moffset += p)),
+        ("overlap", Box::new(move |s| s.mappings[1].moffset -= p)),
+        ("empty mapping", Box::new(|s| s.mappings[1].len = 0)),
+        ("unaligned length", Box::new(|s| s.mappings[1].len -= 1)),
+        (
+            "uncovered tail",
+            Box::new(|s| {
+                s.mappings.pop();
+            }),
+        ),
+        ("past the window", Box::new(move |s| s.size -= p)),
+        ("unaligned size", Box::new(|s| s.size += 1)),
+        ("empty window", Box::new(|s| s.size = 0)),
+        (
+            "object range",
+            Box::new(move |s| s.mappings[0].kind = file(objects as u64, 0, false)),
+        ),
+        (
+            "unaligned file offset",
+            Box::new(|s| s.mappings[0].kind = file(0, 1, false)),
+        ),
+        (
+            "file offset past off_t",
+            Box::new(|s| s.mappings[0].kind = file(0, i64::MAX as u64, false)),
+        ),
+    ];
+    for (what, mutate) in cases {
+        let mut state = good.clone();
+        mutate(state.dax.as_mut().unwrap());
+        assert!(
+            matches!(
+                state.validate(objects),
+                Err(PassthroughSnapshotError::Invalid(_))
+            ),
+            "{what} accepted"
+        );
+        assert!(
+            PassthroughFs::restore(
+                snapshot_config(dir.path()),
+                &state,
+                same_host_objects(&checkpoint),
+                checkpoint.init_binary.clone(),
+            )
+            .is_err(),
+            "{what} restored"
+        );
+    }
+    let mut before_init = good.clone();
+    before_init.nodes.clear();
+    before_init.handles.clear();
+    assert!(before_init.validate(objects).is_err());
+
+    let pages = &checkpoint.dax_pages;
+    assert_eq!(pages.offsets, [3 * p]);
+    let page_cases: Vec<(&str, DaxPages)> = vec![
+        (
+            "duplicate",
+            DaxPages {
+                offsets: vec![3 * p, 3 * p],
+                data: [pages.data.clone(), pages.data.clone()].concat(),
+            },
+        ),
+        (
+            "unsorted",
+            DaxPages {
+                offsets: vec![3 * p, 2 * p],
+                data: [pages.data.clone(), pages.data.clone()].concat(),
+            },
+        ),
+        (
+            "unaligned",
+            DaxPages {
+                offsets: vec![3 * p + 1],
+                data: pages.data.clone(),
+            },
+        ),
+        (
+            "in a file mapping",
+            DaxPages {
+                offsets: vec![0],
+                data: pages.data.clone(),
+            },
+        ),
+        (
+            "in a hole",
+            DaxPages {
+                offsets: vec![p],
+                data: pages.data.clone(),
+            },
+        ),
+        (
+            "past the window",
+            DaxPages {
+                offsets: vec![4 * p],
+                data: pages.data.clone(),
+            },
+        ),
+        (
+            "short data",
+            DaxPages {
+                offsets: vec![3 * p],
+                data: pages.data[1..].to_vec(),
+            },
+        ),
+        (
+            "zero page",
+            DaxPages {
+                offsets: vec![3 * p],
+                data: vec![0; DAX_PAGE_SIZE as usize],
+            },
+        ),
+    ];
+    let state = good.dax.as_ref().unwrap();
+    let restore = || {
+        PassthroughFs::restore(
+            snapshot_config(dir.path()),
+            &good,
+            same_host_objects(&checkpoint),
+            checkpoint.init_binary.clone(),
+        )
+        .unwrap()
+    };
+    let restored = restore();
+    // A restored ledger is not capturable before it is mapped.
+    assert!(restored.checkpoint_with_dax(Some(target.dax())).is_err());
+    target.write(0, &[9]);
+    for (what, bad) in page_cases {
+        assert!(bad.validate(state).is_err(), "{what} accepted");
+        assert!(
+            restored.map_dax(target.dax(), &bad).is_err(),
+            "{what} mapped"
+        );
+    }
+    // Refused before any mapping: the target window is untouched.
+    assert_eq!(target.read(0, 1), [9]);
+    let small = DaxWindow {
+        host_addr: target.addr,
+        size: target.size - p,
+    };
+    assert!(restored.map_dax(small, pages).is_err());
+    restored.map_dax(target.dax(), pages).unwrap();
+    assert!(restored.map_dax(target.dax(), pages).is_err());
+    assert_eq!(target.read(3 * p, 1), [1]);
+}
+
+#[test]
+fn snapshot_fs_dax_device_session_maps_the_window_on_restore() {
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("f", &paged(1, 0x33));
+    let (w, target) = (Window::new(4), Window::new(4));
+    let mut device = Rig::device(dir.path());
+    device.set_shm_region(w.shm());
+    let guest = Guest::new(0xfffe);
+    let queues = (0..NUM_QUEUES).map(|q| guest.queue(q)).collect();
+    let mut rig = Rig::activate(guest, device, queues, false);
+    rig.init();
+    let f = rig.lookup(fuse::ROOT_ID, "f");
+    let setup = SetupmappingIn {
+        fh: 0,
+        foffset: 0,
+        len: p,
+        flags: (SetupmappingFlags::READ | SetupmappingFlags::WRITE).bits(),
+        moffset: p,
+    };
+    rig.ok(Opcode::SetupMapping, f.nodeid, setup.as_slice());
+    w.write(p, b"dax");
+    let removal = [
+        RemovemappingIn { count: 1 }.as_slice(),
+        RemovemappingOne {
+            moffset: 3 * p,
+            len: p,
+        }
+        .as_slice(),
+    ]
+    .concat();
+    rig.ok(Opcode::RemoveMapping, 0, &removal);
+    rig.freeze();
+    // The frozen worker wrote the writable mapping back.
+    assert_eq!(&fs::read(dir.path().join("f")).unwrap()[..3], b"dax");
+
+    let session = rig.fs.snapshot_session().unwrap().unwrap();
+    let state = &session.passthrough.state;
+    let object = object_of(&session.passthrough, &dir.path().join("f"));
+    assert_eq!(
+        state.dax.as_ref().unwrap().mappings,
+        vec![
+            mapping(0, 1, ANON),
+            mapping(1, 1, file(object, 0, true)),
+            mapping(2, 1, ANON),
+            mapping(3, 1, HOLE),
+        ]
+    );
+    let restore = |device: &mut Fs| {
+        device.restore_session(
+            session.options,
+            state,
+            same_host_objects(&session.passthrough),
+            session.passthrough.init_binary.clone(),
+            &session.passthrough.dax_pages,
+        )
+    };
+    // A device without a window, or with another size, refuses the session.
+    let mut plain = Rig::device(dir.path());
+    assert!(restore(&mut plain).is_err());
+    let small = Window::new(2);
+    let mut other = Rig::device(dir.path());
+    other.set_shm_region(small.shm());
+    assert!(restore(&mut other).is_err());
+    // The restored device maps its own window before it runs.
+    let mut restored = Rig::device(dir.path());
+    restored.set_shm_region(target.shm());
+    restore(&mut restored).unwrap();
+    assert_eq!(target.read(p, 3), b"dax");
+    assert_host_matches(
+        &target,
+        state.dax.as_ref().unwrap(),
+        &session.passthrough.objects,
+    );
+}
+
+#[test]
+fn snapshot_fs_restore_session_rejects_pages_without_a_window() {
+    let dir = TempDir::new();
+    let mut rig = Rig::new(dir.path());
+    rig.init();
+    rig.freeze();
+    let session = rig.fs.snapshot_session().unwrap().unwrap();
+    let checkpoint = &session.passthrough;
+    assert_eq!(checkpoint.state.dax, None);
+    let restore = |device: &mut Fs, pages: &DaxPages| {
+        device.restore_session(
+            session.options,
+            &checkpoint.state,
+            same_host_objects(checkpoint),
+            checkpoint.init_binary.clone(),
+            pages,
+        )
+    };
+    let mut device = Rig::device(dir.path());
+    let pages = DaxPages {
+        offsets: vec![0],
+        data: vec![1; DAX_PAGE_SIZE as usize],
+    };
+    assert!(matches!(
+        restore(&mut device, &pages),
+        Err(PassthroughSnapshotError::Invalid(_))
+    ));
+    // Refused before the session was built: the device still takes one.
+    restore(&mut device, &DaxPages::default()).unwrap();
 }

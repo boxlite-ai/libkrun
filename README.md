@@ -709,16 +709,17 @@ Linux guest console driver (the harness boots no Linux guest).
 
 ### Internal virtio-fs session checkpoints (stage 12, in progress, Linux)
 
-**Paused at the user's request on 2026-10-23.** Step 1 and its review
-fixes are complete; step 2 reached investigation only and has no code changes.
-See the [checkpoint and remaining work](docs/phase12-virtio-fs-snapshot.md)
-before resuming. This checkpoint is not a complete virtio-fs VM snapshot.
+Step 1 and its review fixes are complete; step 2's DAX window ledger and
+its fail-closed review correction (below) are reviewed and accepted, and the
+share archive is next. See the
+[checkpoint and remaining work](docs/phase12-virtio-fs-snapshot.md)
+before continuing. This is not a complete virtio-fs VM snapshot.
 
-Stage 12 adds virtio-fs to the owner in three steps. Only the first, the
-device backend, exists so far: there is no `attach_fs`, no full-image
-format change (the image stays version 6), no share archive, no DAX window
-handling and no `RestoreResources` entry yet, so the owner still cannot
-checkpoint a VM with virtio-fs.
+Stage 12 adds virtio-fs to the owner in three steps. The device backend
+and its DAX ledger exist so far: there is no `attach_fs`, no full-image
+format change (the image stays version 6), no share archive, no owner DAX
+window or memslot and no `RestoreResources` entry yet, so the owner still
+cannot checkpoint a VM with virtio-fs.
 
 A share opts in with `Fs::enable_snapshot` (`passthrough::Config::snapshot`)
 before activation; ordinary shares and macOS keep the unchanged passthrough
@@ -776,6 +777,45 @@ backend provides:
   synthetic number and a restore refuses an object saved with it. Restored
   objects report their saved ctime until their host ctime moves (a real
   modification).
+- DAX window ledger (`passthrough/dax.rs`): a snapshot-mode share records
+  every FUSE_SETUPMAPPING and FUSE_REMOVEMAPPING only after its host mapping
+  succeeded, as a partition of the window into file mappings (checkpoint
+  object, file offset, read-only or writable), private anonymous memory
+  (read-write initially; an init.krun copy holds the share's init.krun bytes
+  from the requested file offset with the requested access) and
+  `PROT_NONE` holes. An overlapping setup or partial removal cuts what it
+  overlaps, keeping each remaining byte's file offset; a multi-range removal
+  with a refused range keeps the ranges removed before it. The first request
+  binds the window, which must be whole host pages inside the address space,
+  and requests are checked against it without overflow. Requests the host
+  would refuse up front (outside the window, unaligned file offset, not a
+  regular file, unknown node) are refused before any host call and leave
+  the window usable. A host `mmap`/`mprotect` that still fails may have
+  changed part of its range (`MAP_FIXED` can unmap the old range and then
+  fail; `mprotect` can stop part way), so the share's window is lost: every
+  later mapping request and `sync_for_snapshot` fail with `EIO`, so `freeze`
+  reports an error instead of confirming, and a capture fails with
+  `PassthroughSnapshotError::DaxLost`, all before touching window memory.
+  The owner must discard the share (stop and join its worker); there is no
+  rollback. Each file mapping
+  keeps its descriptor (one per object and access), so an object only
+  mappings reference — its node forgotten, its name unlinked — joins the
+  checkpoint's object list. `freeze` also `msync`s writable file mappings
+  before confirming. `Fs::snapshot_session` (`checkpoint_with_dax` with the
+  device's window) adds the `DaxState` to `PassthroughState` and the sorted,
+  unique, nonzero 4 KiB pages of every anonymous mapping (`DaxPages`), so
+  modified private init.krun bytes survive; capturing reads window memory
+  only, never a host object, so no source atime changes.
+  `Fs::restore_session` takes the pages, requires a window of the saved size
+  exactly when the state has one, refuses pages without a window before
+  building the session, reopens mapped objects with their access
+  and maps the whole window (`PassthroughFs::map_dax`) before activation;
+  states and pages are validated first (coverage, alignment, object range,
+  `off_t` bounds, page order, pages inside anonymous mappings and never all
+  zero). A `map_dax` failure part way leaves the window partly remapped while
+  the ledger stays unmapped (captures and mapping requests are refused), so
+  the device must be discarded. Ordinary shares
+  keep the unchanged mapping code.
 - Bounds on every Linux share: ID counters never wrap. Once the node or
   handle counter is exhausted (`u64::MAX`, a valid saved state) every
   allocation fails with `EOVERFLOW` instead of reissuing 0, a reserved or a
@@ -795,7 +835,20 @@ inode and ctime projection, init.krun's reserved number, restored lookup
 counts and init.krun bytes, restored init.krun reads at, past and far past
 its end, exhausted counters, a forgotten node's open handle, dropping an
 activated restored device and reactivating a reset one, the export and mode
-refusals, and malformed state and option rejection.
+refusals, and malformed state and option rejection. The `snapshot_fs_dax`
+tests map real host memory and compare the ledger with `/proc/self/maps`
+page by page: overlapping and partial removal with file offsets, merging,
+permissions and holes, refused mappings and windows that leave the window
+usable, host failures injected at the syscall boundary in tests
+(`MAP_FIXED` that unmaps and then fails, in a multi-range removal and an
+init.krun copy, and an `mprotect` that stops after one page) that refuse
+every later capture, sync and mapping without touching the window, a
+device whose `freeze` and `snapshot_session` fail after one, pages without a
+window refused by `restore_session`, a mapped-only unlinked
+object written through the window, init.krun copies at two offsets with a
+modified byte, untouched-memory capture, unchanged source atime, a restore
+into another window, malformed mappings and pages, and a device-level
+session restored into its own window.
 
 Stage-12 (step 1) validation status (macOS arm64 host, x86_64 Linux
 target): `make snapshot-fmt`, `make snapshot-check` (also featureless
@@ -805,8 +858,18 @@ target): `make snapshot-fmt`, `make snapshot-check` (also featureless
 snapshot-test` in the amd64 `rust:1-bookworm` container without `/dev/kvm`:
 98/98 `krun-devices` snapshot tests pass, the 15 `snapshot_fs` tests among
 them; the `krun-vmm` result is unchanged (45 pass, the 48 tests that open
-KVM fail at `/dev/kvm`). The owner, image format, share archive, DAX and
-every KVM or guest-driver check for virtio-fs are not implemented yet.
+KVM fail at `/dev/kvm`). Step 2's DAX ledger adds 5 `snapshot_fs_dax`
+tests: in the same amd64 container `snapshot_fs` passes 20/20 and the
+`krun-devices` snapshot tests 103/103, `snapshot-check` (also featureless
+`krun-vmm` and `krun-devices`) and `snapshot-build` pass, and a macOS
+`snapshot-check` of `krun-devices` compiles. The fail-closed correction
+replaces the earlier `mseal`-dependent check (skipped where the kernel
+lacks `mseal`) with test-only fault hooks that run on every Linux host, and
+adds 3 tests: `snapshot-fmt` and amd64 `snapshot-check` pass and
+`snapshot_fs` passes 23/23; with the production fix reverted (hooks kept),
+the 3 new tests fail.
+The owner, image format, share archive, owner DAX window and every KVM or
+guest-driver check for virtio-fs are not implemented yet.
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 

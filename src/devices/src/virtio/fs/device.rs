@@ -19,7 +19,8 @@ use super::super::{
 use super::passthrough;
 #[cfg(target_os = "linux")]
 use super::passthrough::{
-    PassthroughCheckpoint, PassthroughSnapshotError, PassthroughState, RestoredObject,
+    DaxPages, DaxWindow, PassthroughCheckpoint, PassthroughSnapshotError, PassthroughState,
+    RestoredObject,
 };
 use super::worker::{FsServer, FsWorker, FsWorkerHandle};
 use super::ExportTable;
@@ -160,8 +161,18 @@ impl Fs {
         self.worker_control.as_ref()
     }
 
-    /// Capture the FUSE session; None for an inactive device. The caller
-    /// must hold a freeze confirmation: no request runs concurrently.
+    /// The DAX window as this process maps it, if the device has one.
+    #[cfg(target_os = "linux")]
+    fn dax_window(&self) -> Option<DaxWindow> {
+        self.shm_region.as_ref().map(|shm| DaxWindow {
+            host_addr: shm.host_addr,
+            size: shm.size as u64,
+        })
+    }
+
+    /// Capture the FUSE session and the DAX window; None for an inactive
+    /// device. The caller must hold a freeze confirmation (no request runs
+    /// concurrently) and keep the guest paused.
     #[cfg(target_os = "linux")]
     pub fn snapshot_session(
         &self,
@@ -171,13 +182,17 @@ impl Fs {
         };
         Ok(Some(FsSessionCheckpoint {
             options: server.options(),
-            passthrough: server.passthrough().checkpoint()?,
+            passthrough: server
+                .passthrough()
+                .checkpoint_with_dax(self.dax_window())?,
         }))
     }
 
     /// Prepare the session a restored, activated device continues; the
     /// next `activate_frozen` serves it instead of a new share, without
-    /// FUSE_INIT.
+    /// FUSE_INIT. The saved DAX window is mapped into this device's window
+    /// (set before) with `dax_pages`; on a failure the device must be
+    /// discarded.
     #[cfg(target_os = "linux")]
     pub fn restore_session(
         &mut self,
@@ -185,20 +200,36 @@ impl Fs {
         state: &PassthroughState,
         objects: Vec<RestoredObject>,
         init_binary: Arc<[u8]>,
+        dax_pages: &DaxPages,
     ) -> Result<(), PassthroughSnapshotError> {
         if self.is_activated() || self.restored_server.is_some() {
             return Err(PassthroughSnapshotError::Invalid(
                 "device already holds a session",
             ));
         }
-        self.restored_server = Some(FsServer::restored(
+        let window = self.dax_window();
+        if state.dax.as_ref().map(|dax| dax.size) != window.map(|w| w.size) {
+            return Err(PassthroughSnapshotError::Invalid(
+                "DAX window differs from the saved one",
+            ));
+        }
+        if window.is_none() && *dax_pages != DaxPages::default() {
+            return Err(PassthroughSnapshotError::Invalid(
+                "DAX pages without a DAX window",
+            ));
+        }
+        let server = FsServer::restored(
             self.passthrough_cfg.clone(),
             self.read_only,
             options,
             state,
             objects,
             init_binary,
-        )?);
+        )?;
+        if let Some(window) = window {
+            server.passthrough().map_dax(window, dax_pages)?;
+        }
+        self.restored_server = Some(server);
         Ok(())
     }
 
