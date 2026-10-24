@@ -144,6 +144,12 @@ impl DaxState {
         Ok(())
     }
 
+    /// Checks page offsets (without their data) against a validated state:
+    /// aligned, strictly increasing, each page inside one anonymous mapping.
+    pub fn validate_page_offsets(&self, offsets: &[u64]) -> Result<(), PassthroughSnapshotError> {
+        validate_offsets(offsets, self.anonymous())
+    }
+
     fn anonymous(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.mappings
             .iter()
@@ -174,9 +180,24 @@ fn validate_pages(
     if pages.offsets.len().checked_mul(DAX_PAGE_SIZE as usize) != Some(pages.data.len()) {
         return invalid("DAX page data does not match its offsets");
     }
+    validate_offsets(&pages.offsets, anonymous)?;
+    if pages
+        .data
+        .chunks(DAX_PAGE_SIZE as usize)
+        .any(|page| page.iter().all(|&b| b == 0))
+    {
+        return invalid("DAX page is all zeros");
+    }
+    Ok(())
+}
+
+fn validate_offsets(
+    offsets: &[u64],
+    anonymous: impl Iterator<Item = (u64, u64)>,
+) -> Result<(), PassthroughSnapshotError> {
     let mut anonymous = anonymous.peekable();
     let mut previous = None;
-    for &offset in &pages.offsets {
+    for &offset in offsets {
         if offset % DAX_PAGE_SIZE != 0 {
             return invalid("DAX page offset is unaligned");
         }
@@ -196,13 +217,6 @@ fn validate_pages(
         if !inside {
             return invalid("DAX page outside the anonymous mappings");
         }
-    }
-    if pages
-        .data
-        .chunks(DAX_PAGE_SIZE as usize)
-        .any(|page| page.iter().all(|&b| b == 0))
-    {
-        return invalid("DAX page is all zeros");
     }
     Ok(())
 }
@@ -373,6 +387,18 @@ unsafe fn map_fixed(
     } else {
         Ok(())
     }
+}
+
+/// Return a window to its initial state, private zero read-write memory,
+/// once no share maps it (a device reset), so the next session's ledger
+/// starts from what the host maps.
+pub fn reset_dax_window(window: DaxWindow) -> io::Result<()> {
+    if !valid_window(window.host_addr, window.size) {
+        return Err(einval());
+    }
+    // Safe because the caller hands over the whole window and no share
+    // maps it anymore.
+    unsafe { UNTOUCHED.map(window.host_addr, window.size) }
 }
 
 /// Host call failures for tests, armed per target address so tests running
@@ -606,6 +632,12 @@ impl DaxLedger {
 }
 
 impl PassthroughFs {
+    /// A host mapping call of this share failed, so the window may no
+    /// longer be what it maps, nor wholly its own.
+    pub fn dax_window_lost(&self) -> bool {
+        self.dax.lock().unwrap().lost
+    }
+
     /// Snapshot-mode FUSE_SETUPMAPPING: the host mapping, then the ledger.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn dax_setupmapping(

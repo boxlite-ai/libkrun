@@ -39,8 +39,8 @@ use vm_memory::ByteValued;
 
 use super::dax::{DaxLedger, DaxMappingKind, DaxPages, DaxState, DaxWindow};
 use super::{
-    einval, forget_one, fuse, stat, statx, Config, DirEntry, Entry, HandleData, Inode, InodeAltKey,
-    InodeData, LinuxDirent64, PassthroughFs,
+    einval, forget_one, fuse, stat, statx, Config, DirEntry, Entry, FsOptions, HandleData, Inode,
+    InodeAltKey, InodeData, LinuxDirent64, PassthroughFs,
 };
 
 /// Open flags that only matter when a file is created; a recorded handle
@@ -62,7 +62,7 @@ const MAX_NAME_LEN: usize = 255;
 const DIRENT_BUFFER: usize = 64 * 1024;
 
 /// (st_dev, st_ino) of a host object.
-type HostKey = (u64, u64);
+pub(super) type HostKey = (u64, u64);
 
 /// One entry of a stable directory list; its offset cookie is its index + 1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,11 +314,29 @@ impl InoMap {
     }
 }
 
-fn valid_name(name: &[u8]) -> bool {
+pub(super) fn valid_name(name: &[u8]) -> bool {
     !name.is_empty() && name.len() <= MAX_NAME_LEN && !name.contains(&b'/') && !name.contains(&0)
 }
 
 impl PassthroughState {
+    /// Checks the FUSE options FUSE_INIT negotiated (0 before it) against
+    /// this build and the state.
+    pub fn check_options(&self, options: u64) -> Result<FsOptions, PassthroughSnapshotError> {
+        let Some(negotiated) = FsOptions::from_bits(options) else {
+            return Err(PassthroughSnapshotError::Invalid(
+                "unknown negotiated FUSE options",
+            ));
+        };
+        if negotiated.contains(FsOptions::WRITEBACK_CACHE) != self.writeback
+            || negotiated.contains(FsOptions::SUBMOUNTS) != self.announce_submounts
+        {
+            return Err(PassthroughSnapshotError::Invalid(
+                "negotiated FUSE options disagree with the share",
+            ));
+        }
+        Ok(negotiated)
+    }
+
     /// Structural checks against this build, before any host side effect.
     pub fn validate(&self, objects: usize) -> Result<(), PassthroughSnapshotError> {
         let invalid = |why| Err(PassthroughSnapshotError::Invalid(why));
@@ -583,6 +601,19 @@ impl PassthroughFs {
         })
     }
 
+    /// The inode number and ctime the guest sees for host object `key`
+    /// whose host ctime is `host_ctime`.
+    pub(super) fn guest_view(&self, key: HostKey, host_ctime: (i64, i64)) -> (u64, (i64, i64)) {
+        let mut inos = self.inos.lock().unwrap();
+        let ino = inos.project(key, |ino| self.host_ino_is_live(ino));
+        (ino, inos.ctime(key, host_ctime))
+    }
+
+    /// The next synthetic inode number the projection would try.
+    pub(super) fn next_synthetic_ino(&self) -> u64 {
+        self.inos.lock().unwrap().next_synthetic
+    }
+
     /// Flush every writable handle and DAX file mapping so the host objects
     /// hold everything the guest already wrote through this share.
     pub fn sync_for_snapshot(&self) -> io::Result<()> {
@@ -630,6 +661,14 @@ impl PassthroughFs {
             .find(|(_, data)| data.exported.load(Ordering::Relaxed))
         {
             return Err(PassthroughSnapshotError::ExportedHandle(*handle));
+        }
+        // An exported descriptor outlives its handle in the export table
+        // until another subsystem takes it.
+        if let Some(table) = &self.cfg.export_table {
+            let fsid = self.cfg.export_fsid;
+            if let Some(&(_, handle)) = table.lock().unwrap().keys().find(|(id, _)| *id == fsid) {
+                return Err(PassthroughSnapshotError::ExportedHandle(handle));
+            }
         }
         let nodes: Vec<(Inode, Arc<InodeData>)> = self
             .inodes

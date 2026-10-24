@@ -709,15 +709,16 @@ Linux guest console driver (the harness boots no Linux guest).
 
 ### Internal virtio-fs session checkpoints (stage 12, in progress, Linux)
 
-Step 1 and its review fixes are complete; step 2's DAX window ledger and
-its fail-closed review correction (below) are reviewed and accepted, and the
-share archive is next. See the
+Step 1 and its review fixes are complete; step 2's DAX window ledger with
+its fail-closed review correction and step 2's independent share archive
+with its review corrections (below) are reviewed and accepted. See
+the
 [checkpoint and remaining work](docs/phase12-virtio-fs-snapshot.md)
 before continuing. This is not a complete virtio-fs VM snapshot.
 
-Stage 12 adds virtio-fs to the owner in three steps. The device backend
-and its DAX ledger exist so far: there is no `attach_fs`, no full-image
-format change (the image stays version 6), no share archive, no owner DAX
+Stage 12 adds virtio-fs to the owner in three steps. The device backend,
+its DAX ledger and the share archive exist so far: there is no `attach_fs`,
+no full-image format change (the image stays version 6), no owner DAX
 window or memslot and no `RestoreResources` entry yet, so the owner still
 cannot checkpoint a VM with virtio-fs.
 
@@ -815,7 +816,77 @@ backend provides:
   zero). A `map_dax` failure part way leaves the window partly remapped while
   the ledger stays unmapped (captures and mapping requests are refused), so
   the device must be discarded. Ordinary shares
-  keep the unchanged mapping code.
+  keep the unchanged mapping code. A device reset ends the session the
+  device serves or holds for its activation (a restored one included; the
+  next activation starts a new session with FUSE_INIT that still serves the
+  archived init.krun) and returns a snapshot-mode share's window to private
+  zero memory (what the next session's ledger assumes). A window a failed
+  host call lost is left alone instead, since part of it may no longer be
+  the device's. In both that case and a failed reset remapping the device
+  is retired: activation fails, `restore_session`, `archive_source` and
+  `snapshot_session` refuse with `DaxLost`, and the owner discards it.
+- Independent share archive (`passthrough/archive`): copies every share of a
+  VM so a restore no longer needs the source directories.
+  `Fs::archive_source` (worker frozen) gives the share's session, the
+  restored session a device holds for its activation, or for a device
+  without one a pre-FUSE_INIT session of a fresh share, which still carries
+  its DAX window bytes; `ShareArchive::capture` takes every share at once.
+  It walks each share's whole tree, looked up or not, through that share's
+  own descriptors from its own root (`O_PATH`, no symlink followed, so
+  another bind mount of a directory is listed, and checked for submounts,
+  as each share sees it; directories listed and files read through
+  new `O_NOATIME` descriptions where the host allows it, otherwise the
+  source atime may move; reading a symlink target moves the symlink's
+  atime) and records each object's metadata before reading it. Objects are
+  deduplicated by host identity across shares, so hard links (also between
+  shares) and shared or nested roots stay single objects; a directory has
+  one parent. Only regular files, directories, symlinks and char 0:0
+  overlay whiteouts are archived, with permission bits, owner, atime,
+  mtime and exact xattrs (ACLs and `trusted.*` included). The kernel lists
+  and reads `trusted.*` only for CAP_SYS_ADMIN in the initial user
+  namespace, so the capture refuses (`Unsupported`, before reading the
+  source) in any other process, such as an unprivileged one or one in a
+  user namespace; it adds no privilege itself. Reading `user.*` xattrs
+  needs read permission on the object, and an import of `trusted.*` ones
+  CAP_SYS_ADMIN too, else they fail. The capture refuses FIFOs, sockets and
+  devices, host submounts (any mount ID other than the root's, same-device
+  bind mounts included), directories with several parents or cycles, a
+  session object that is still linked but outside every share, and
+  exported descriptors (also ones left in the export table after their
+  handle). Objects only a session keeps (an unlinked open file, an
+  unlinked file only a DAX mapping holds, an unlinked directory or symlink
+  a node holds) are archived as such. Each share keeps its views: the
+  inode number and ctime its guest sees for every object it can reach,
+  never-looked-up ones included (the synthetic counter is updated after).
+  The manifest (`ArchiveManifest`) is plain metadata; regular file bytes,
+  the distinct init.krun bytes and DAX pages are three binary payloads
+  (`write_files`, which streams files and fails if one changed since the
+  capture, `write_init`, `write_pages`; `lengths`).
+  `ImportedArchive::import` validates the whole manifest first (names as
+  raw bytes, IDs, references, kinds, lengths, timestamps, topology, FUSE
+  options and session states, DAX page offsets), then creates the
+  destination exclusively with mode 0700 and everything below it
+  descriptor-relative without following symlinks: share trees as
+  directories `0`, `1`, ..., objects only sessions keep under temporary
+  names that are removed once the objects are open (they stay unlinked),
+  hard links (to each object's own descriptor), then owner, xattrs
+  (inherited ACLs the source lacks removed), mode and times, and compares
+  every object with the archive. Every name it creates, the destination
+  included, is journaled as soon as it exists, then gets its identity: a
+  new file's from its creating descriptor (kept for cleanup until read), a
+  hard link's before the link exists, and a directory's, symlink's or
+  whiteout's from the name at once. A failure, or dropping the guard before
+  `persist`, resets the devices it `hold`s (stopping and joining their
+  workers) and removes exactly the names the import created while they
+  still name the created object, restrictive modes and foreign ownership
+  undone first. A name now naming another object, a directory something
+  else wrote into and an existing destination stay, and so does (with a
+  warning, and the directories above it) a directory, symlink or whiteout
+  whose identity could not be read right after its creation, since the
+  name may already be a foreign replacement. `Fs::restore_imported` restores a share on a device created
+  on `ImportedArchive::root`; the device continues from `activate_frozen`
+  or, for a source that was never activated, from the guest's activation,
+  and serves the archived init.krun, also after a reset.
 - Bounds on every Linux share: ID counters never wrap. Once the node or
   handle counter is exhausted (`u64::MAX`, a valid saved state) every
   allocation fails with `EOVERFLOW` instead of reissuing 0, a reserved or a
@@ -848,7 +919,39 @@ window refused by `restore_session`, a mapped-only unlinked
 object written through the window, init.krun copies at two offsets with a
 modified byte, untouched-memory capture, unchanged source atime, a restore
 into another window, malformed mappings and pages, and a device-level
-session restored into its own window.
+session restored into its own window. The `snapshot_fs_archive` tests need
+root with CAP_SYS_ADMIN and CAP_MKNOD on a tmpfs `/tmp` (for example
+`docker run --cap-add SYS_ADMIN --tmpfs /tmp:rw,exec`): a session that
+continues on an independent copy after its source directory was deleted
+(original handles, nodes and directory cookies, a never-looked-up file's
+inode number, a renamed and an unlinked open file, a non-UTF-8 name, a hard
+link and a symlink), source and restored changes isolated (and a payload
+written after a source change refused), four shares with a cross-share hard
+link, a read-only share, a nested and a shared root, handle-only and
+map-only orphan files and node-held unlinked directories and symlinks,
+modes with set-ID and sticky bits, owners, nanosecond times, empty and
+`trusted.*` xattrs on a symlink distinct from its target, default and
+inherited ACLs under an inheriting destination, a restrictive directory,
+unchanged source atimes, whiteouts with overlay xattrs, the capture
+refusals, a capture refused before reading anything without CAP_SYS_ADMIN
+(a known `trusted.*` xattr would be hidden), one directory seen through
+two bind mounts archived once and a submount only one of them shows
+refused in either share order, 43 malformed manifests and short or long
+payloads refused before any directory exists, an existing destination
+left untouched, an import failing at every created name (the destination
+included, with CAP_DAC_OVERRIDE dropped) once journaled and open or before
+it is reopened leaving nothing, right after the creation leaving only the
+7 names whose identity only the name gives, a foreign object of the same
+type, owner and link count swapped in at that point kept, and a planted
+foreign file kept with its directory, an inactive device's DAX window
+bytes and archived init.krun across a reset, a failed reset remapping
+retiring the device (no activation, restore or capture), a reset leaving
+a lost window alone, a reset ending a restored session still waiting for
+activation, and the guard stopping held devices before removing the tree.
+`fs/tests.rs` checks, with the APIs of the reviewed DAX commit, that a
+reset returns the window to zero memory, a reset device keeps serving the
+restored init.krun, and an export-table entry left by FUSE_DESTROY keeps
+refusing checkpoints.
 
 Stage-12 (step 1) validation status (macOS arm64 host, x86_64 Linux
 target): `make snapshot-fmt`, `make snapshot-check` (also featureless
@@ -867,9 +970,18 @@ replaces the earlier `mseal`-dependent check (skipped where the kernel
 lacks `mseal`) with test-only fault hooks that run on every Linux host, and
 adds 3 tests: `snapshot-fmt` and amd64 `snapshot-check` pass and
 `snapshot_fs` passes 23/23; with the production fix reverted (hooks kept),
-the 3 new tests fail.
-The owner, image format, share archive, owner DAX window and every KVM or
-guest-driver check for virtio-fs are not implemented yet.
+the 3 new tests fail. The share archive first passed `snapshot_fs` 35/35
+and the `krun-devices` snapshot tests 118/118 in the amd64 container with
+`--cap-add SYS_ADMIN --tmpfs /tmp:rw,exec`, with `snapshot-check` (also
+featureless `krun-vmm`), `snapshot-build` and a macOS `snapshot-check` of
+`krun-devices`. After its review corrections, `snapshot-fmt` and
+`snapshot-check` pass and `snapshot_fs` passes 42/42 in that container. On
+a `git archive` of the DAX commit (every non-test file byte-identical; the
+only test-side change drops `mod archive;`) the 3 `fs/tests.rs` checks
+above fail; on the pre-correction archive (only test-only fault points
+added) the 6 correction tests fail and the other 36 pass.
+The owner, image format, owner DAX window and every KVM or guest-driver
+check for virtio-fs are not implemented yet.
 
 Local contributor checks (no public ABI or SDK entry point is provided):
 

@@ -27,11 +27,21 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
 
+mod archive;
 mod dax;
 mod snapshot;
 #[cfg(test)]
+pub(crate) use archive::import_faults;
+pub use archive::{
+    ArchiveError, ArchiveManifest, ArchivedEntry, ArchivedKind, ArchivedObject, ArchivedSession,
+    ArchivedShare, ArchivedTime, ArchivedXattr, ImportedArchive, ImportedSession, ObjectView,
+    PayloadLengths, ShareArchive, ShareSource,
+};
+#[cfg(test)]
 pub(crate) use dax::faults as dax_faults;
-pub use dax::{DaxMapping, DaxMappingKind, DaxPages, DaxState, DaxWindow, DAX_PAGE_SIZE};
+pub use dax::{
+    reset_dax_window, DaxMapping, DaxMappingKind, DaxPages, DaxState, DaxWindow, DAX_PAGE_SIZE,
+};
 use snapshot::InoMap;
 pub use snapshot::{
     DirListEntry, HandleState, NodeState, PassthroughCheckpoint, PassthroughSnapshotError,
@@ -366,6 +376,20 @@ pub struct Config {
     /// Only snapshot-owned shares set it; ordinary shares keep the
     /// unmodified passthrough behavior.
     pub snapshot: bool,
+
+    /// The init.krun bytes to serve; None serves the compiled-in binary. A
+    /// share restored from an archive keeps serving the archived bytes,
+    /// also after a device reset.
+    pub init_binary: Option<Arc<[u8]>>,
+}
+
+impl Config {
+    /// The init.krun bytes a share created from this configuration serves.
+    pub fn served_init(&self) -> Arc<[u8]> {
+        self.init_binary
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INIT.clone())
+    }
 }
 
 impl Default for Config {
@@ -382,6 +406,7 @@ impl Default for Config {
             export_table: None,
             allow_root_dir_delete: false,
             snapshot: false,
+            init_binary: None,
         }
     }
 }
@@ -501,7 +526,7 @@ impl PassthroughFs {
             my_uid,
             my_gid,
             cap_fowner,
-            init_binary: DEFAULT_INIT.clone(),
+            init_binary: cfg.served_init(),
             inos: Mutex::new(InoMap::new(fuse::ROOT_ID + 1)),
             dax: Default::default(),
             cfg,

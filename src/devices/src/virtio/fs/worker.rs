@@ -19,8 +19,6 @@ use vm_memory::GuestMemoryMmap;
 use super::super::Queue;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
-#[cfg(target_os = "linux")]
-use super::filesystem::FsOptions;
 use super::passthrough::{self, PassthroughFs};
 #[cfg(target_os = "linux")]
 use super::passthrough::{PassthroughSnapshotError, PassthroughState, RestoredObject};
@@ -119,15 +117,8 @@ impl FsServer {
         objects: Vec<RestoredObject>,
         init_binary: Arc<[u8]>,
     ) -> result::Result<Self, PassthroughSnapshotError> {
-        let Some(negotiated) = FsOptions::from_bits(options) else {
-            return Err(PassthroughSnapshotError::Invalid(
-                "unknown negotiated FUSE options",
-            ));
-        };
-        if negotiated.contains(FsOptions::WRITEBACK_CACHE) != state.writeback
-            || negotiated.contains(FsOptions::SUBMOUNTS) != state.announce_submounts
-            || (read_only && state.writeback)
-        {
+        state.check_options(options)?;
+        if read_only && state.writeback {
             return Err(PassthroughSnapshotError::Invalid(
                 "negotiated FUSE options disagree with the share",
             ));

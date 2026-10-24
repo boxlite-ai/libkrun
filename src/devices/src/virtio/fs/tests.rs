@@ -107,7 +107,7 @@ fn o_path(file: &File) -> File {
 }
 
 /// Same-host restore objects: the checkpointed objects themselves (the
-/// archive that rebuilds them elsewhere is not part of this layer).
+/// archive tests in `tests/archive.rs` rebuild them elsewhere).
 fn same_host_objects(checkpoint: &PassthroughCheckpoint) -> Vec<RestoredObject> {
     checkpoint
         .objects
@@ -926,6 +926,15 @@ fn snapshot_fs_checkpoint_rejects_disabled_and_exported_shares() {
         &Arc::new(AtomicI32::new(0)),
     )
     .unwrap();
+    assert!(matches!(
+        fs.checkpoint(),
+        Err(PassthroughSnapshotError::ExportedHandle(h)) if h == handle
+    ));
+    // FUSE_DESTROY drops the handle, not its descriptor in the export
+    // table, which another subsystem may still take: a new session cannot
+    // be captured either.
+    fs.destroy();
+    fs.init(FsOptions::empty()).unwrap();
     assert!(matches!(
         fs.checkpoint(),
         Err(PassthroughSnapshotError::ExportedHandle(h)) if h == handle
@@ -2298,3 +2307,84 @@ fn snapshot_fs_restore_session_rejects_pages_without_a_window() {
     // Refused before the session was built: the device still takes one.
     restore(&mut device, &DaxPages::default()).unwrap();
 }
+
+#[test]
+fn snapshot_fs_reset_returns_the_dax_window_to_zero_memory() {
+    let p = host_page();
+    let dir = TempDir::new();
+    dir.file("f", &paged(1, 0x33));
+    let w = Window::new(4);
+    let mut device = Rig::device(dir.path());
+    device.set_shm_region(w.shm());
+    let guest = Guest::new(0xfffe);
+    let queues = (0..NUM_QUEUES).map(|q| guest.queue(q)).collect();
+    let mut rig = Rig::activate(guest, device, queues, false);
+    rig.init();
+    let f = rig.lookup(fuse::ROOT_ID, "f");
+    let setup = SetupmappingIn {
+        fh: 0,
+        foffset: 0,
+        len: p,
+        flags: SetupmappingFlags::READ.bits(),
+        moffset: p,
+    };
+    rig.ok(Opcode::SetupMapping, f.nodeid, setup.as_slice());
+    let removal = [
+        RemovemappingIn { count: 1 }.as_slice(),
+        RemovemappingOne {
+            moffset: 3 * p,
+            len: p,
+        }
+        .as_slice(),
+    ]
+    .concat();
+    rig.ok(Opcode::RemoveMapping, 0, &removal);
+    rig.fs.reset();
+    // The session's file mapping and hole are gone with it (the file page
+    // first: the hole would fault).
+    assert_eq!(w.read(p, p), vec![0; p as usize]);
+    assert_eq!(w.read(0, 4 * p), vec![0; 4 * p as usize]);
+    // The next session's ledger starts from that zero memory.
+    let device = mem::replace(&mut rig.fs, Rig::device(dir.path()));
+    let guest = Guest::new(0xfffe);
+    let queues = (0..NUM_QUEUES).map(|q| guest.queue(q)).collect();
+    let mut again = Rig::activate(guest, device, queues, false);
+    again.init();
+    again.freeze();
+    let session = again.fs.snapshot_session().unwrap().unwrap().passthrough;
+    assert!(session.dax_pages.offsets.is_empty());
+    assert_eq!(
+        session.state.dax.unwrap().mappings,
+        vec![mapping(0, 4, ANON)]
+    );
+}
+
+#[test]
+fn snapshot_fs_reset_keeps_serving_the_restored_init() {
+    let dir = TempDir::new();
+    let mut source = Rig::new(dir.path());
+    source.init();
+    let queues = source.freeze();
+    let init: Arc<[u8]> = Arc::from(&b"archived init"[..]);
+    let mut target = Rig::restored_with_init(&source, dir.path(), &queues, Some(init.clone()));
+    target.resume();
+    let read_init = |rig: &mut Rig| {
+        let read = ReadIn {
+            fh: 0,
+            size: 64,
+            ..Default::default()
+        };
+        rig.ok(Opcode::Read, fuse::ROOT_ID + 1, read.as_slice())
+    };
+    assert_eq!(read_init(&mut target), &init[..]);
+    // After a reset the guest mounts a new session of the same share.
+    target.fs.reset();
+    let device = mem::replace(&mut target.fs, Rig::device(dir.path()));
+    let guest = Guest::new(0xfffe);
+    let queues = (0..NUM_QUEUES).map(|q| guest.queue(q)).collect();
+    let mut again = Rig::activate(guest, device, queues, false);
+    again.init();
+    assert_eq!(read_init(&mut again), &init[..]);
+}
+
+mod archive;

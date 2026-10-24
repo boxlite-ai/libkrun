@@ -3,7 +3,7 @@
 状态：批次 1 及审查修正已提交（`32dc08f`）；批次 2 已恢复
 （2026-10-24），**DAX ledger 与映射对象生命周期及 fail-closed 审查修正
 已经 Codex 审查通过并在本地提交**；
-独立对象归档和批次 3 尚未开始。完整镜像仍为 **v6**，
+独立对象归档及其四项审查修正**已审查通过并在本地提交**；批次 3 尚未开始。完整镜像仍为 **v6**，
 `RamSnapshotVm` 目前仍不能保存含 virtio-fs 的完整 VM。
 
 ## 已完成并审查
@@ -117,32 +117,95 @@ fail-closed 修正验证（2026-10-24）：原依赖 `mseal` 的失败段（无 
 `dax.rs`/`device.rs` 生产修正（仅保留钩子与 `DaxLost` 变体作适配）后
 3 个新测试失败，恢复后通过。未重跑 arm64、macOS 和全部 krun-devices。
 
-后续需要的接口（尚未实现）：归档须在 FUSE_INIT 或激活之前也能捕获
-根目录及整棵树，而此时没有根节点或 server；需要由 owner 从
-`passthrough::Config::root_dir` 打开根目录（或为 `Fs` 增加相应只读
-访问器）。
+### 批次 2 其余部分：独立对象归档（已审查通过）
 
-### 批次 2 其余部分：独立对象归档（尚未实现）
+`linux/passthrough/archive.rs`（清单、校验）及 `archive/{capture,import,host}.rs`。
 
-- 跨共享按宿主文件身份去重内容，保留每个共享独立的 guest inode 投影。
-  归档整个目录树和未 lookup 对象，支持文件、符号链接、硬链接、权限、
-  uid/gid、时间戳、精确 xattr、char 0:0 whiteout 和打开/仅映射引用的孤儿。
-- 明确拒绝 exported FD、宿主子挂载、目录多父或环、不可归档外部对象、
-  FIFO/socket/其他设备节点；不能重建元数据时失败，不能静默省略。
-- 归档源 init.krun 内容和 `dax_pages`（DAX 部分已产出）；恢复不使用
-  目标编译时 init 替代内容。
-- 导入通过目录 FD 和禁止跟随符号链接的操作创建独立副本；独占创建 0700
-  目标目录，孤儿先打开再删除临时名字。校验先于副作用，失败只清理本次资源。
-- 复制优先 O_NOATIME，保存读取前元数据，记录回退读取可能改变源 atime。
-- 实测多共享、只读、rename/unlink、跨共享硬链接、两种孤儿、whiteout、
-  源目录删除后恢复、独立副本，以及畸形结构、复制/导入中途失败和清理。
+- 来源：`Fs::archive_source`（worker 已冻结）给出正在服务的 session、等待
+  激活的恢复 session，或对无 session 的设备（从未激活或已 reset）以临时
+  `PassthroughFs` 生成 pre-FUSE_INIT session，其中包含 DAX 窗口内容。
+  `ShareArchive::capture(Vec<ShareSource>)` 一次捕获 VM 的全部共享。
+- 捕获：每个共享通过 `O_PATH`、不跟随符号链接的描述符遍历整棵树（含未
+  lookup 对象）；先 statx 再读取；目录与文件通过新的 `O_NOATIME` 描述读取，
+  无权限时回退，源 atime 可能变化；读取符号链接目标必然改变该链接的
+  atime（归档保存读取前的值）。按宿主 (dev, ino) 跨共享去重，硬链接
+  （含跨共享）和共享/嵌套根保持单一对象，目录只有一个父目录。每个共享
+  只经自己的根描述符及由此打开的子目录描述符遍历（对象表仍按
+  (dev, ino) 去重），因此同一目录的另一个 bind mount 视图按该共享所见
+  列出并检查子挂载，再次列出的目录必须一致。
+- 扩展属性前置检查：内核仅对初始 user namespace 中具备 CAP_SYS_ADMIN
+  的进程列出和读取 `trusted.*`。`ShareArchive::capture` 在读取任何源对象
+  之前检查有效 CAP_SYS_ADMIN 且 `/proc/self/ns/user` 为初始 user
+  namespace（nsfs inode `0xEFFFFFFD`），否则返回 `Unsupported`，不再
+  静默丢失；归档代码本身不提升任何权限。读取 `user.*` 需要对象读权限，
+  导入 `trusted.*` 同样需要 CAP_SYS_ADMIN，不满足时显式失败。
+- 拒绝：FIFO、socket、设备（char 0:0 whiteout 除外）、mount ID 与根不同的
+  子挂载（含同设备 bind mount）、多父目录或环、仍有链接但不在任何共享内的
+  session 对象、exported FD（含 handle 释放后仍留在导出表中的项）、已删除
+  的共享根；statx 缺少 mount ID 时失败。仅 session 保留的对象（打开或仅被
+  DAX 映射的已删除文件、节点持有的已删除目录/符号链接）按孤儿归档。
+- 视图：每个共享为其可达的全部对象（含未 lookup 对象）保存 guest inode
+  与 ctime；投影后更新 `next_synthetic_ino`。
+- 清单 `ArchiveManifest`（对象、顶层树、共享、init 长度）为纯元数据；
+  文件内容、去重后的 init.krun、DAX 页为三个独立二进制载荷，按
+  files、init、pages 顺序（`write_files` 流式写出并在源文件变化时失败、
+  `write_init`、`write_pages`、`lengths`）。
+- 导入 `ImportedArchive::import`：先完整校验清单（原始字节名、ID、引用、
+  类型、长度、时间戳、拓扑、FUSE options、session 状态、DAX 页偏移）再独占
+  创建 0700 目标；全部按目录 FD 创建且不跟随符号链接：共享树为 `0`、`1`…，
+  孤儿在临时目录下创建、打开后删除名字（保持 nlink 0），再建硬链接，然后
+  按 owner、xattr（删除源中没有的继承 ACL 等）、mode、时间设置元数据，
+  最后逐对象比对。每个新名字（含目标目录本身）在创建成功后立即入日志，
+  再取得身份：普通文件取自 `O_CREAT|O_EXCL` 返回的描述符（读取前保留在
+  日志中供清理使用），硬链接经对象自身描述符的 `/proc/self/fd` 链接创建、
+  身份在创建前已知，目录/符号链接/whiteout 创建后立即按名字 statx。
+  失败或未 `persist` 即 drop 时，先 reset 并 join `hold` 的设备 worker，
+  再按日志仅删除本次创建且仍指向原对象的名字（先恢复本进程所有权与
+  0700）。他人写入的目录和名字、已存在的目标目录保留；目录/符号链接/
+  whiteout 创建后若未能读取身份，该名字可能已被替换，故保守保留（记
+  warning，其上级目录随之保留），不按类型/属主/链接数推断归属。
+- 恢复：`Fs::restore_imported` 在 `ImportedArchive::root` 上的新设备恢复
+  session 与 DAX 窗口；源设备已激活时随后 `activate_frozen`，否则由 guest
+  自行激活。`restore_session` 现将存档 init.krun 写入配置，设备 reset 后
+  仍提供存档内容。设备 reset 结束其正在服务或等待激活的（恢复）session，
+  下次激活重新 FUSE_INIT，并仍提供存档 init.krun；快照共享的 DAX 窗口
+  恢复为私有零内存（新 ledger 的前提）。若 session 的窗口已因宿主映射
+  失败丢失，reset 不再触碰窗口（其中部分可能已不属于设备）。该情形或
+  reset 重映射失败时设备退役：激活失败（早于创建 worker），
+  `restore_session`（早于映射）、`archive_source`、`snapshot_session`
+  返回 `DaxLost`，owner 须丢弃设备。
 
-已做的环境探测：默认容器支持 `user.overlay.*`；`trusted.overlay.*`
-需要 `--cap-add SYS_ADMIN`。在容器内部 tmpfs 上，配合
-`--cap-add SYS_ADMIN --device-cgroup-rule 'c 0:0 m'`，已实际创建 char 0:0
-并设置两类 OverlayFS xattr。此为环境探测，**不是归档功能验收**。
-O_PATH 符号链接通过 `/proc/self/fd/N` 读取 xattr/设置时间的操作也已探测，
-包括 unlink 后的对象。下一步从 Linux archive 模块开始。
+验证（2026-10-24，首版）：amd64 离线容器，参数为下文命令加
+`--cap-add SYS_ADMIN --tmpfs /tmp:rw,exec`（whiteout、`trusted.*`、bind mount
+需要），每次在容器内 `touch` 改动文件。`make snapshot-fmt` 通过；
+`snapshot_fs` 35/35；`krun-devices` snapshot 118/118；`snapshot-check`
+（含无 feature 的 `krun-vmm`）与 `snapshot-build` 通过；macOS
+`snapshot-check`（`krun-devices --features net`）编译通过。KVM 仍
+**UNVERIFIED**。
+
+审查修正验证（2026-10-24）：同一容器参数（容器内先 `touch` fs 源文件）。
+`make snapshot-fmt`、`make snapshot-check` 通过；`snapshot_fs` **42/42**。
+既有行为修正（reset 窗口、reset 后 init、handle 已失效的导出表项）的
+回归测试改用 `c79d6ff` 已有接口写在 `fs/tests.rs`：在 `git archive
+c79d6ff` 树中（全部非测试文件与 `c79d6ff` 逐字节一致，唯一测试侧适配是
+去掉 `mod archive;`）3 个测试失败（读到 `0x33` 文件页、读到默认 ELF
+init、`FUSE_DESTROY`+再 INIT 后导出项被接受），当前树通过。四项修正以
+修正前的完整归档快照为基线：6 个新测试失败（11 个名字在 reopen/stat
+之前失败均遗留目标目录；bind mount 视图被误拒为子挂载；reset 失败后
+仍可激活；reset 重映射了已丢失窗口；reset 未结束待激活的恢复 session，
+窗口仍为 `0x33`；无 CAP_SYS_ADMIN 时捕获成功、`trusted.*` 被静默丢弃），
+其余 36 个通过；基线中仅加入测试编译的故障注入点作适配（导入名字在
+reopen 前、目标目录在 statx 前），未含任何修正逻辑。按协调者审查去掉
+按类型/属主/链接数推断归属的中间版本上，新增的同类型替换测试失败
+（名字 1–9 处换入的外来对象被删除），身份取得前失败的用例清理了全部
+名字（应保留 7 个）。修正后全部通过。
+
+已知限制：捕获需初始 user namespace 中的 CAP_SYS_ADMIN（否则拒绝）；
+`map_dax` 中途失败后设备仍未标记退役（沿用“须丢弃”约定）；chattr 标志、
+稀疏文件空洞布局（导入时全零块保留为空洞）、宿主链接计数中不在共享内的
+链接不归档；捕获与导入均为每个对象持有一个描述符；非 UTF-8 的嵌套根路径
+需要 owner 自行处理（`Fs::new` 取 `String`）；DAX 页在读取载荷后才做
+数据相关校验（全零页），失败时清理已创建资源。
 
 ### 批次 3：owner、v7 格式和最终回归（尚未实现）
 
@@ -155,6 +218,11 @@ O_PATH 符号链接通过 `/proc/self/fd/N` 读取 xattr/设置时间的操作�
   共享及宿主别名的所有外部写入并维持至 resume。pause 保留，resume/disable
   清除；缺声明拒绝导出，导入的独占副本自动满足此前提。
 - `RestoreResources::fs_dir` 当且仅当镜像含共享时提供，独占创建 0700。
+- 使用批次 2 归档接口：导出时各共享 `Fs::archive_source` 后一次
+  `ShareArchive::capture`，清单嵌入 v7 JSON，载荷按 `write_files`、
+  `write_init`、`write_pages` 写出；导入时 `ImportedArchive::import`（目标即
+  `fs_dir`），以 `root(i)` 建设备并 `restore_imported`，`hold` 设备直至恢复
+  成功后 `persist`。读写只读标志由 owner 设备表保证一致。
 - 全镜像升级 **v7**，拒绝 v1–v6；保持 16 MiB 有界 JSON，加入设备表、
   全局文件对象、共享根、FUSE 状态和映射。数据顺序为 RAM、磁盘、文件及
   init 内容、匿名映射非零页；全面检查长度、引用、范围、容量和溢出。
@@ -165,7 +233,7 @@ O_PATH 符号链接通过 `/proc/self/fd/N` 读取 xattr/设置时间的操作�
   按既定安排保留 **UNVERIFIED**。
 
 BoxLite/shim 生命周期接入仍留在阶段 13。恢复工作应继续由 Claude worker
-实施，Codex 审查；当前无正在运行的实施任务。未授权推送、PR 或部署。
+实施，Codex 审查。未授权推送、PR 或部署。
 
 ## 已知边界与协调记录
 
@@ -176,6 +244,9 @@ BoxLite/shim 生命周期接入仍留在阶段 13。恢复工作应继续由 Cla
 - Orca run：`run_9438a313f694`。批次 1 与修正已完成；批次 2
   `task_d288b3b9b609` / `ctx_af1c26cdb38e` 因用户要求暂停结算为 failed，
   **并非实现或测试失败**。恢复时使用新 Dispatch，不复用已结算的生命周期 ID。
+  DAX ledger 已审查并本地提交（`c79d6ff`）；独立归档由
+  `task_170725846c10` / `ctx_6f4ca8a68320` 实现，审查修正由
+  `task_bbbbe33e568a` / `ctx_bdbf73fe254d` 完成，均已审查并本地提交。
 - 原终端仍可供后续使用；`worker-start --terminal` 返回 agent_unconfigured，
   当前已验证可通过 task-create、dispatch --return-preamble 和 terminal send
   投递新任务。遵循 Orca 技能要求重新确认运行态，不盲目重复启动。

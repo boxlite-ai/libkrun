@@ -19,8 +19,8 @@ use super::super::{
 use super::passthrough;
 #[cfg(target_os = "linux")]
 use super::passthrough::{
-    DaxPages, DaxWindow, PassthroughCheckpoint, PassthroughSnapshotError, PassthroughState,
-    RestoredObject,
+    ArchiveError, DaxPages, DaxWindow, ImportedArchive, PassthroughCheckpoint,
+    PassthroughSnapshotError, PassthroughState, RestoredObject, ShareSource,
 };
 use super::worker::{FsServer, FsWorker, FsWorkerHandle};
 use super::ExportTable;
@@ -69,6 +69,11 @@ pub struct Fs {
     server: Option<Arc<FsServer>>,
     /// A restored session waiting for `activate_frozen`.
     restored_server: Option<FsServer>,
+    /// A reset could not return the DAX window to its initial state, or
+    /// left a window a failed host call lost alone: the device activates,
+    /// restores and captures nothing anymore and must be discarded.
+    #[cfg(target_os = "linux")]
+    dax_lost: bool,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -108,6 +113,8 @@ impl Fs {
             worker_control: None,
             server: None,
             restored_server: None,
+            #[cfg(target_os = "linux")]
+            dax_lost: false,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -180,6 +187,9 @@ impl Fs {
         let Some(server) = &self.server else {
             return Ok(None);
         };
+        if self.dax_lost {
+            return Err(PassthroughSnapshotError::DaxLost);
+        }
         Ok(Some(FsSessionCheckpoint {
             options: server.options(),
             passthrough: server
@@ -202,6 +212,9 @@ impl Fs {
         init_binary: Arc<[u8]>,
         dax_pages: &DaxPages,
     ) -> Result<(), PassthroughSnapshotError> {
+        if self.dax_lost {
+            return Err(PassthroughSnapshotError::DaxLost);
+        }
         if self.is_activated() || self.restored_server.is_some() {
             return Err(PassthroughSnapshotError::Invalid(
                 "device already holds a session",
@@ -218,6 +231,7 @@ impl Fs {
                 "DAX pages without a DAX window",
             ));
         }
+        let served = init_binary.clone();
         let server = FsServer::restored(
             self.passthrough_cfg.clone(),
             self.read_only,
@@ -230,6 +244,65 @@ impl Fs {
             server.passthrough().map_dax(window, dax_pages)?;
         }
         self.restored_server = Some(server);
+        // A reset device serves the same init.krun again.
+        self.passthrough_cfg.init_binary = Some(served);
+        Ok(())
+    }
+
+    /// This share as an archive source (see `passthrough::ShareArchive`):
+    /// the session it serves or holds for its activation, else a
+    /// pre-FUSE_INIT one with its DAX window. The caller must hold a freeze
+    /// confirmation for an activated device and keep the guest paused.
+    #[cfg(target_os = "linux")]
+    pub fn archive_source(&self) -> Result<ShareSource<'_>, PassthroughSnapshotError> {
+        if !self.passthrough_cfg.snapshot {
+            return Err(PassthroughSnapshotError::Disabled);
+        }
+        if self.dax_lost {
+            return Err(PassthroughSnapshotError::DaxLost);
+        }
+        let server = self.server.as_deref().or(self.restored_server.as_ref());
+        let Some(server) = server else {
+            return ShareSource::inactive(&self.passthrough_cfg, self.dax_window());
+        };
+        let checkpoint = server
+            .passthrough()
+            .checkpoint_with_dax(self.dax_window())?;
+        Ok(ShareSource::active(
+            &self.passthrough_cfg,
+            server.passthrough(),
+            server.options(),
+            checkpoint,
+        ))
+    }
+
+    /// Continue share `share` of `archive` on this new device, created on
+    /// `archive.root(share)` with the source's mode and DAX window: its
+    /// session (and DAX window) is restored, and the device continues it
+    /// from `activate_frozen` when the source was activated, else from the
+    /// guest's own activation.
+    #[cfg(target_os = "linux")]
+    pub fn restore_imported(
+        &mut self,
+        archive: &ImportedArchive,
+        share: usize,
+    ) -> Result<(), ArchiveError> {
+        if share >= archive.shares() {
+            return Err(ArchiveError::Invalid("no such imported share"));
+        }
+        if std::path::Path::new(&self.passthrough_cfg.root_dir) != archive.root(share) {
+            return Err(ArchiveError::Invalid(
+                "device root is not the imported share root",
+            ));
+        }
+        let session = archive.session(share)?;
+        self.restore_session(
+            session.options,
+            &session.state,
+            session.objects,
+            archive.init_binary(share),
+            &session.dax_pages,
+        )?;
         Ok(())
     }
 
@@ -242,6 +315,11 @@ impl Fs {
     ) -> ActivateResult {
         if self.worker_thread.is_some() {
             panic!("virtio_fs: worker thread already exists");
+        }
+        #[cfg(target_os = "linux")]
+        if self.dax_lost {
+            error!("virtio_fs: the DAX window was lost; the device must be discarded");
+            return Err(ActivateError::BadActivate);
         }
 
         // Extract queues and eventfds from DeviceQueues.
@@ -369,7 +447,30 @@ impl VirtioDevice for Fs {
             }
         }
         self.worker_control = None;
-        self.server = None;
+        // A reset ends the session the device serves or holds for its
+        // activation (a restore); the next one starts with FUSE_INIT on a
+        // fresh share, which serves the same init.krun (`passthrough_cfg`).
+        let served = self.server.take();
+        let restored = self.restored_server.take();
+        // The session's DAX mappings outlive it; a snapshot-mode share's
+        // next ledger starts from private zero memory. A window a failed
+        // host call lost may no longer be wholly the device's, so it is
+        // left alone.
+        #[cfg(target_os = "linux")]
+        if let (Some(session), Some(window), true, false) = (
+            served.as_deref().or(restored.as_ref()),
+            self.dax_window(),
+            self.passthrough_cfg.snapshot,
+            self.dax_lost,
+        ) {
+            if session.passthrough().dax_window_lost() {
+                self.dax_lost = true;
+            } else if let Err(e) = passthrough::reset_dax_window(window) {
+                error!("virtio_fs: cannot reset the DAX window: {e}");
+                self.dax_lost = true;
+            }
+        }
+        drop((served, restored));
         self.device_state = DeviceState::Inactive;
         true
     }
