@@ -107,6 +107,28 @@ fn compatibility_accepts_only_vmm_synthesized_leaf_1_bits_absent_from_the_target
     assert!(compatibility.validate_cpu(&state).is_err());
 }
 
+/// KVM_GET_SUPPORTED_CPUID reports the APIC IDs of whichever CPU ran the
+/// call, so two captures on one host differ there; any other difference is
+/// still an incompatible target.
+#[test]
+fn target_compatibility_ignores_the_calling_cpus_apic_ids_only() {
+    let (mut source, _) = fixture();
+    let (mut target, _) = fixture();
+    let topology = kvm_cpuid_entry2 {
+        function: 0xb,
+        ..Default::default()
+    };
+    source.cpuid.push(topology);
+    target.cpuid.push(topology);
+    source.cpuid[1].ebx |= 2 << 24;
+    source.cpuid[5].edx = 2;
+    target.cpuid[1].ebx |= 3 << 24;
+    target.cpuid[5].edx = 3;
+    source.validate_target(&target).unwrap();
+    target.cpuid[1].ebx |= 1 << 8;
+    assert!(source.validate_target(&target).is_err());
+}
+
 #[test]
 fn serde_rejects_short_or_long_fixed_kvm_records_instead_of_padding_or_truncating() {
     let (_, state) = fixture();

@@ -112,7 +112,7 @@ impl Compatibility {
         validate_xsave_size(self.xsave_size)?;
         // Exact supported CPUID includes vendor, feature masks and leaf-D layout.
         // This intentionally rejects some otherwise migratable heterogeneous hosts.
-        if self.cpuid != target.cpuid
+        if without_apic_ids(&self.cpuid) != without_apic_ids(&target.cpuid)
             || self.xsave_size != target.xsave_size
             || self.caps != target.caps
             || self.msrs != target.msrs
@@ -223,6 +223,21 @@ impl Compatibility {
         }
         validate_xsave(&state.xsave, self.xsave_size, &state.cpuid, &state.xcrs)
     }
+}
+
+/// KVM_GET_SUPPORTED_CPUID runs CPUID on whichever host CPU makes the call
+/// and passes its APIC IDs through (leaf 1 EBX[31:24], leaf 0xB/0x1F EDX), so
+/// two captures on one host differ there; nothing else in it is per CPU.
+fn without_apic_ids(cpuid: &[kvm_cpuid_entry2]) -> Vec<kvm_cpuid_entry2> {
+    let mut cpuid = cpuid.to_vec();
+    for entry in &mut cpuid {
+        match entry.function {
+            1 => entry.ebx &= 0x00ff_ffff,
+            0xb | 0x1f => entry.edx = 0,
+            _ => (),
+        }
+    }
+    cpuid
 }
 
 fn validate_cpuid(cpuid: &[kvm_cpuid_entry2]) -> Result<()> {
