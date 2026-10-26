@@ -94,6 +94,19 @@ fn compatibility_rejects_actual_vendor_layout_nested_pmu_and_missing_msr() {
     assert!(compatibility.validate_topology(&state, 0, 2).is_err());
 }
 
+/// KVM_GET_SUPPORTED_CPUID never reports the hypervisor, TSC-deadline and
+/// HTT bits a VMM sets itself, so a guest showing them stays compatible;
+/// any other feature the target lacks is still refused.
+#[test]
+fn compatibility_accepts_only_vmm_synthesized_leaf_1_bits_absent_from_the_target() {
+    let (compatibility, mut state) = fixture();
+    state.cpuid[1].ecx |= (1 << 31) | (1 << 24);
+    state.cpuid[1].edx |= 1 << 28;
+    compatibility.validate_cpu(&state).unwrap();
+    state.cpuid[1].ecx |= 1 << 25;
+    assert!(compatibility.validate_cpu(&state).is_err());
+}
+
 #[test]
 fn serde_rejects_short_or_long_fixed_kvm_records_instead_of_padding_or_truncating() {
     let (_, state) = fixture();

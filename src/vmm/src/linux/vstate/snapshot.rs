@@ -26,6 +26,11 @@ const MAX_XSAVE: usize = 1024 * 1024;
 pub(crate) const MAX_CPUS: usize = 128;
 // x87, SSE, AVX, AVX-512 and PKRU have complete XSAVE/XCRS coverage here.
 const COVERED_XSTATE: u64 = 0x2e7;
+// Leaf 1 bits the VMM sets although KVM_GET_SUPPORTED_CPUID never reports
+// them: ECX hypervisor and TSC-deadline (backed by the required in-kernel
+// irqchip and TSC-deadline capabilities), EDX HTT. QEMU accepts the same.
+const VMM_LEAF_1_ECX: u32 = (1 << 31) | (1 << 24);
+const VMM_LEAF_1_EDX: u32 = 1 << 28;
 
 ioctl_iow_nr!(SNAPSHOT_GET_DEVICE_ATTR, KVMIO, 0xe2, kvm_device_attr);
 ioctl_iow_nr!(SNAPSHOT_SET_DEVICE_ATTR, KVMIO, 0xe1, kvm_device_attr);
@@ -183,7 +188,11 @@ impl Compatibility {
                 return Err("actual extended CPU feature differs from target".into());
             }
             let feature_masks = match entry.function {
-                1 => (0, entry.ecx & !(1 << 27), entry.edx),
+                1 => (
+                    0,
+                    entry.ecx & !(1 << 27) & !VMM_LEAF_1_ECX,
+                    entry.edx & !VMM_LEAF_1_EDX,
+                ),
                 7 => (entry.ebx, entry.ecx, entry.edx),
                 0x80000001 => (0, entry.ecx, entry.edx),
                 _ => continue,
