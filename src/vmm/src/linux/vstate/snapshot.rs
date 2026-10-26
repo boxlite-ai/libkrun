@@ -488,7 +488,8 @@ fn needs_tsc_scaling(current: u32, saved: u32) -> Result<bool> {
 }
 
 impl Vcpu {
-    pub(super) fn minimal_cpuid(&mut self) -> super::Result<()> {
+    /// Hide every CPU feature whose state `validate_cpuid` refuses to save.
+    pub(super) fn restrict_cpuid_to_snapshot(&mut self) {
         self.cpuid.retain(|e| {
             e.function != 0x1f
                 && (e.function != 0xd
@@ -530,9 +531,6 @@ impl Vcpu {
                 _ => (),
             }
         }
-        self.fd
-            .set_cpuid2(&self.cpuid)
-            .map_err(super::Error::VcpuSetCpuid)
     }
     pub(super) fn notify_clock(&self) {
         if let Err(e) = self.fd.kvmclock_ctrl() {

@@ -1201,7 +1201,10 @@ impl Vcpu {
     pub(crate) fn configure_minimal(&mut self, entry: u16, count: u8) -> Result<()> {
         let spec = VmSpec::new(self.id, count, false, false).map_err(Error::CpuId)?;
         filter_cpuid(&mut self.cpuid, &spec).map_err(Error::CpuId)?;
-        self.minimal_cpuid()?;
+        self.restrict_cpuid_to_snapshot();
+        self.fd
+            .set_cpuid2(&self.cpuid)
+            .map_err(Error::VcpuSetCpuid)?;
         arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
         let mut sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
         sregs.cs.base = 0;
@@ -1238,6 +1241,28 @@ impl Vcpu {
         vcpu_config: &VcpuConfig,
         kernel_boot: bool,
     ) -> Result<()> {
+        self.boot_cpuid(vcpu_config)?;
+        self.set_boot_state(guest_mem, kernel_start_addr, kernel_boot)
+    }
+
+    /// Configure a vCPU of a checkpointing VM's kernel boot: the ordinary
+    /// boot with the CPUID a snapshot can save, so the guest never enables
+    /// state an export would have to refuse.
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    pub(crate) fn configure_snapshot_x86_64(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        kernel_start_addr: GuestAddress,
+        vcpu_config: &VcpuConfig,
+    ) -> Result<()> {
+        self.boot_cpuid(vcpu_config)?;
+        self.restrict_cpuid_to_snapshot();
+        self.set_boot_state(guest_mem, kernel_start_addr, true)
+    }
+
+    /// Filter the supported CPUID for this vCPU and apply the template.
+    #[cfg(target_arch = "x86_64")]
+    fn boot_cpuid(&mut self, vcpu_config: &VcpuConfig) -> Result<()> {
         let cpuid_vm_spec = VmSpec::new(
             self.id,
             vcpu_config.vcpu_count,
@@ -1261,7 +1286,17 @@ impl Vcpu {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Set the CPUID, then the boot registers when booting a kernel.
+    #[cfg(target_arch = "x86_64")]
+    fn set_boot_state(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        kernel_start_addr: GuestAddress,
+        kernel_boot: bool,
+    ) -> Result<()> {
         self.fd
             .set_cpuid2(&self.cpuid)
             .map_err(Error::VcpuSetCpuid)?;

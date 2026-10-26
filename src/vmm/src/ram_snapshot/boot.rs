@@ -611,7 +611,7 @@ impl RamSnapshotVm {
         }
         let memory = owner.memory.clone();
         owner.start(vcpus.vcpu_count, |cpu| {
-            cpu.configure_x86_64(&memory, entry, &vcpus, true)
+            cpu.configure_snapshot_x86_64(&memory, entry, &vcpus)
                 .map_err(Error::State)
         })?;
         Ok(owner)
