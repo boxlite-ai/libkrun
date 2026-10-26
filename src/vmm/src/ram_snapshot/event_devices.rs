@@ -57,6 +57,10 @@ const BALLOON: Kind = Kind {
     queue_size: BALLOON_QUEUE_SIZE,
 };
 
+/// The RNG's and the balloon's fixed (MMIO address, GSI).
+pub(super) const RNG_SLOT: (u64, u32) = (RNG.mmio_addr, RNG.irq);
+pub(super) const BALLOON_SLOT: (u64, u32) = (BALLOON.mmio_addr, BALLOON.irq);
+
 /// Transport and virtio state of an RNG or balloon. No host resource
 /// appears here.
 #[derive(Serialize, Deserialize)]

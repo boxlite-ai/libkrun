@@ -221,7 +221,7 @@ chattr 标志、稀疏文件空洞布局（导入时全零块保留为空洞）�
 `virtio_fs/{tests,kvm_tests}.rs`；设备侧改动见本节末。
 
 - `RamSnapshotVm::attach_fs(FsShareConfig { tag, source, read_only,
-  allow_root_dir_delete, dax: Option<DaxRange { gpa, len }> })`，仅 vCPU
+  allow_root_dir_delete, vm_owned, dax: Option<DaxRange { gpa, len }> })`，仅 vCPU
   启动前。共享 i 固定在 MMIO `0xd000d000 + i * 0x1000`、GSI `9 + i`，最多
   七个。tag 1–36 字节、无 NUL、owner 内唯一；源目录为绝对路径、不是指向
   目录的符号链接、除 NUL 外任意字节（含非 UTF-8）。所有检查先于任何
@@ -268,7 +268,9 @@ chattr 标志、稀疏文件空洞布局（导入时全零块保留为空洞）�
   （原生路径）上、按保存的槽位重建，获得新的 DAX 窗口与恢复的 session
   和窗口内容；已激活的共享以冻结 worker 恢复激活，全部早于 vCPU 线程。
   成功后保留导入的树（`persist`）：它是 guest 的文件系统，owner 析构时
-  不删除，与磁盘段不同。`allow_root_dir_delete` 删除的是该导入根本身。
+  不删除，与磁盘段不同；例外是 VM 自有共享（阶段 13 批次 2）的副本，随
+  owner 删除。`allow_root_dir_delete` 删除的是该导入根本身（VM 自有共享
+  除外：仍推迟到 owner 析构）。
 
 设备侧改动（Linux）：`passthrough::Config::root_dir` 改为 `PathBuf`，
 `Fs::new_at` 可服务非 UTF-8 根路径；根路径含 NUL 时 FUSE_INIT 返回
@@ -339,7 +341,7 @@ pause 才发现。现在该窗口在 guest 运行时不存在。
   之前、EINTR 清 `immediate_exit` 之前释放（guest reset 可在当前 vCPU 线程
   获取屏障）。重映射：阻止新 permit，用 vCPU kick 信号踢出所有持有者（每
   10 ms 重踢），等待全部离开后才执行系统调用；多个重映射串行。失败或
-  panic 在重新开放之前把屏障永久标为 failed，写 owner 的 exit eventfd
+  panic 在重新开放之前把屏障永久标为 failed，写 owner 的 failure eventfd
   （exit watch 停止所有 vCPU）；之后的 pause/resume/export/declare 禁用 owner
   并 join 全部线程。pause 在 worker 冻结后、resume 在设备恢复后（vCPU
   恢复前及返回成功前）再次检查。`stop_threads` 在 join vCPU 前 retire 屏障，
@@ -365,6 +367,13 @@ pause 才发现。现在该窗口在 guest 运行时不存在。
   1360 行；本阶段只做本地提交，将来若建 PR 须拆分或申请例外。
 
 ## v7 镜像布局与 owner 限制（最终）
+
+> 阶段 13 批次 1 之后：写出格式为 KRUNVM v8（virtio-fs 归档清单增加必填
+> `contract`；批次 2 起共享还有必填 `vm_owned`，fs 段有必填 `exit_code`，
+> v7 读作 false 与未设置），v7 镜像按全属性归档读取；新增 guest-visible 归档模式，无需
+> 特权导出、只能以记录的有效 UID/GID 导入。本节描述的全属性模式及其
+> CAP_SYS_ADMIN 前置不变。详见 README “Guest-visible archive mode and image
+> version 8 (stage 13 batch 1)”。
 
 - 布局：16 字节头（`KRUNVM\0\0`、版本 7、JSON 长度），JSON 状态（非空，
   至多 16 MiB），RAM，各磁盘段，然后按归档顺序的三个共享载荷：文件字节、

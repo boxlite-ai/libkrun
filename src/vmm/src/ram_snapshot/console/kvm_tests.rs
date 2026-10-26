@@ -27,7 +27,7 @@ use super::tests::{
     PORT_OPEN, PORT_READY, QUIET, WAIT,
 };
 use super::*;
-use crate::ram_snapshot::{RestoreResources, VsockPorts};
+use crate::ram_snapshot::{ConsoleEndpoints, RestoreResources, VsockPorts};
 
 const RAM_MIB: usize = 2;
 /// The fixture's MMIO entry (loaded at 0x1000, entry offset 0x900).
@@ -156,7 +156,7 @@ fn source(ports: Vec<PortDescription>) -> RamSnapshotVm {
 
 fn resources(ports: Vec<PortDescription>) -> RestoreResources {
     RestoreResources {
-        console_ports: Some(ports),
+        console_ports: Some(ConsoleEndpoints::Ports(ports)),
         ..Default::default()
     }
 }
@@ -453,7 +453,7 @@ fn snapshot_console_kvm_combined_with_every_device() {
                 .collect(),
         ),
         serial: Some([Some(com1), None, None, None]),
-        console_ports: Some(ports(&fresh_in, &fresh_out)),
+        console_ports: Some(ConsoleEndpoints::Ports(ports(&fresh_in, &fresh_out))),
         ..Default::default()
     };
     let mut target = RamSnapshotVm::import(&dir.path("image"), resources).unwrap();
@@ -706,7 +706,7 @@ fn snapshot_console_kvm_combined_with_disk_and_nic() {
     let resources = RestoreResources {
         disk_dir: Some(dir.path("imported")),
         nic_socket: Some(target_socket),
-        console_ports: Some(ports(&fresh_in, &fresh_out)),
+        console_ports: Some(ConsoleEndpoints::Ports(ports(&fresh_in, &fresh_out))),
         ..Default::default()
     };
     let mut target = RamSnapshotVm::import(&dir.path("image"), resources).unwrap();

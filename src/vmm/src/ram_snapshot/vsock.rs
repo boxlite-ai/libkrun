@@ -14,9 +14,9 @@
 //!
 //! A reopen that fails on the guest's event-queue kick (a listening path
 //! that cannot bind, an interrupt that cannot be raised) has no caller to
-//! report to: the device writes the owner's exit notifier, so the event
-//! thread latches the exit and stops every vCPU, and the backend stays
-//! failed.
+//! report to: the device writes the owner's failure notifier, so the event
+//! thread latches the exit as a failure and stops every vCPU, and the
+//! backend stays failed.
 //!
 //! A send blocked under the device lock (a host peer that reads nothing)
 //! can stall the event thread and any vCPU touching the device's MMIO
@@ -147,7 +147,7 @@ fn new_vsock(cid: u64, ports: &VsockPorts, exit: &Exit) -> Result<(Vsock, Arc<Vs
     let gate = vsock
         .snapshot_control()
         .map_err(|e| Error::Full(format!("vsock snapshot control: {e:?}")))?;
-    vsock.set_failure_notifier(exit.notifier()?);
+    vsock.set_failure_notifier(exit.failure_notifier()?);
     Ok((vsock, gate))
 }
 

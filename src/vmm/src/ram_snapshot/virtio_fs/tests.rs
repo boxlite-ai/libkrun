@@ -7,13 +7,15 @@
 //! memslot and window-ownership checks. The FUSE driver here is shared with
 //! `kvm_tests`, where the guest vCPU performs every MMIO access. Tests that
 //! archive a share need root with CAP_SYS_ADMIN, as the devices crate's
-//! archive tests do. Every test name contains "snapshot".
+//! archive tests do. Every test name contains "snapshot"; the unprivileged
+//! ones in `rootless` also start with "rootless_fs", which
+//! `make snapshot-test` skips.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use devices::legacy::DummyIrqChip;
 use devices::virtio::fs::fuse::{
@@ -36,6 +38,8 @@ pub(super) const INT_VRING: u32 = 1;
 /// `VIRTIO_IOC_REMOVE_ROOT_DIR` (`_IO('v', 3)`, the devices crate's
 /// passthrough ioctl).
 const REMOVE_ROOT_DIR: u32 = (b'v' as u32) << 8 | 3;
+/// `VIRTIO_IOC_EXIT_CODE` (`_IO('v', 2)`): init reports its exit code.
+const EXIT_CODE: u32 = (b'v' as u32) << 8 | 2;
 /// FUSE_INIT flags: ASYNC_READ and BIG_WRITES.
 const INIT_FLAGS: u32 = 1 | 1 << 5;
 const PAGE: u64 = 4096;
@@ -294,6 +298,8 @@ impl Side {
                 root,
                 read_only: false,
                 allow_root_dir_delete: true,
+                vm_owned: false,
+                exit_code: Arc::new(AtomicI32::new(i32::MAX)),
                 window: dax.zip(backing.as_ref()).map(|(r, b)| b.region(r.gpa)),
             },
         )
@@ -317,6 +323,7 @@ impl Side {
                 tag: tag.to_owned(),
                 read_only: false,
                 allow_root_dir_delete: true,
+                vm_owned_root: None,
                 dax: dax.map(|range| (range, 0)),
             },
             backing,
@@ -348,7 +355,19 @@ impl Side {
     /// Capture as an export does, write the payloads to `payloads` and
     /// return the metadata after a JSON round trip.
     fn export(&self, cuts: &[Option<Vec<QueueState>>], payloads: &Path) -> FsMeta {
-        let (meta, archive) = capture(self.shares(), cuts).unwrap().unwrap();
+        self.export_in(ArchiveMode::FullAttributes, cuts, payloads)
+    }
+
+    /// `export` in archive mode `mode`.
+    fn export_in(
+        &self,
+        mode: ArchiveMode,
+        cuts: &[Option<Vec<QueueState>>],
+        payloads: &Path,
+    ) -> FsMeta {
+        let (meta, archive) = capture(self.shares(), cuts, mode, i32::MAX)
+            .unwrap()
+            .unwrap();
         validate_metadata(&meta, &regions(), &[], 32).unwrap();
         validate_rings(&meta, &self.mem).unwrap();
         let mut file = File::create(payloads).unwrap();
@@ -492,7 +511,9 @@ pub(in crate::ram_snapshot) fn captured_share(dir: &Path) -> (FsMeta, Vec<u8>) {
     let f = guest.lookup(mem, &side, fuse::ROOT_ID, b"f");
     guest.open(mem, &side, f.nodeid, libc::O_RDWR);
     let cuts = freeze(side.shares()).unwrap();
-    let (meta, archive) = capture(side.shares(), &cuts).unwrap().unwrap();
+    let (meta, archive) = capture(side.shares(), &cuts, ArchiveMode::FullAttributes, i32::MAX)
+        .unwrap()
+        .unwrap();
     let mut payloads = Vec::new();
     archive.write_files(&mut payloads).unwrap();
     archive.write_init(&mut payloads).unwrap();
@@ -515,7 +536,14 @@ fn snapshot_fs_vmm_non_utf8_nested_root_restores_on_its_imported_root() {
     let mut inner = Side::new(mem, nested.clone(), "inner", None);
     inner.share.index = 1;
     let shares = [clone_share(&outer.share), clone_share(&inner.share)];
-    let (meta, archive) = capture(&shares, &[None, None]).unwrap().unwrap();
+    let (meta, archive) = capture(
+        &shares,
+        &[None, None],
+        ArchiveMode::FullAttributes,
+        i32::MAX,
+    )
+    .unwrap()
+    .unwrap();
     validate_metadata(&meta, &regions(), &[], 32).unwrap();
     let payloads = dir.path("payloads");
     write_payloads(&mut File::create(&payloads).unwrap(), &archive).unwrap();
@@ -568,6 +596,146 @@ fn snapshot_fs_vmm_non_utf8_nested_root_restores_on_its_imported_root() {
     drop((outer, inner));
 }
 
+/// A VM-owned boot root share, as a boot attaches it.
+fn vm_owned_side(mem: GuestMemoryMmap, root: PathBuf, exit_code: Arc<AtomicI32>) -> Side {
+    let parts = build(
+        mem.clone(),
+        DummyIrqChip::new().into(),
+        Share {
+            tag: "/dev/root",
+            root: root.clone(),
+            read_only: false,
+            allow_root_dir_delete: true,
+            vm_owned: true,
+            exit_code,
+            window: None,
+        },
+    )
+    .unwrap();
+    let mut side = Side::wrap(mem, parts, "/dev/root", None, None);
+    side.share.vm_owned_root = Some(root);
+    side
+}
+
+fn ioctl(guest: &mut Fuse, mem: &GuestMemoryMmap, side: &Side, cmd: u32, arg: u64) {
+    let ioctl = IoctlIn {
+        cmd,
+        arg,
+        ..Default::default()
+    };
+    guest.ok(mem, side, Opcode::Ioctl, fuse::ROOT_ID, ioctl.as_slice());
+}
+
+/// The VM-owned boot root outlives the guest's removal request, also on
+/// a share restored from an image captured before that request; only the
+/// owner's teardown removes it, and a restored owner's teardown removes
+/// only its own imported copy, never the source path. A restored share
+/// reports the guest's exit code to its new owner.
+#[test]
+fn snapshot_fs_vmm_vm_owned_root_outlives_guest_removal_and_restore_until_teardown() {
+    let dir = TempDir::new();
+    let src = dir.path("root");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("init"), b"boot").unwrap();
+    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
+    let source_code = Arc::new(AtomicI32::new(i32::MAX));
+    let source = vm_owned_side(mem.clone(), src.clone(), source_code.clone());
+    // Captured before the guest ever asked for the removal.
+    let (meta, archive) = capture(
+        source.shares(),
+        &[None],
+        ArchiveMode::FullAttributes,
+        i32::MAX,
+    )
+    .unwrap()
+    .unwrap();
+    let payloads = dir.path("payloads");
+    write_payloads(&mut File::create(&payloads).unwrap(), &archive).unwrap();
+    let meta: FsMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+    assert!(meta.devices[0].vm_owned);
+
+    let mut guest = Fuse::new();
+    guest.activate(&source);
+    guest.init(&mem, &source);
+    ioctl(&mut guest, &mem, &source, REMOVE_ROOT_DIR, 0);
+    assert!(src.join("init").is_file(), "removal deferred on the source");
+
+    let shares_dir = dir.path("shares");
+    let mut imported = import_shares(&File::open(&payloads).unwrap(), &meta, &shares_dir).unwrap();
+    let root = imported.root(0).to_owned();
+    let target_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
+    let target_code = Arc::new(AtomicI32::new(i32::MAX));
+    let parts = build(
+        target_mem.clone(),
+        DummyIrqChip::new().into(),
+        restored_share(&meta.devices[0], root.clone(), target_code.clone(), None),
+    )
+    .unwrap();
+    let mut target = Side::wrap(target_mem.clone(), parts, "/dev/root", None, None);
+    target.share.vm_owned_root = owned_root(&meta.devices[0], root.clone());
+    imported.hold(target.share.device.clone());
+    restore_parts(
+        &target.share.device,
+        &target.share.transport,
+        &imported,
+        0,
+        &meta.devices[0],
+    )
+    .unwrap();
+    imported.persist();
+    let mut guest = Fuse::new();
+    guest.activate(&target);
+    guest.init(&target_mem, &target);
+    ioctl(&mut guest, &target_mem, &target, REMOVE_ROOT_DIR, 0);
+    assert!(
+        root.join("init").is_file(),
+        "removal deferred after restore"
+    );
+    ioctl(&mut guest, &target_mem, &target, EXIT_CODE, 7);
+    assert_eq!(target_code.load(Ordering::SeqCst), 7);
+    assert_eq!(source_code.load(Ordering::SeqCst), i32::MAX);
+
+    remove_vm_owned_roots(target.shares());
+    assert!(!root.exists(), "the restored owner removes its copy");
+    assert!(src.is_dir(), "never the source path");
+    remove_vm_owned_roots(source.shares());
+    assert!(!src.exists());
+    drop((source, target));
+}
+
+/// The exit code init posted before the cut (the guest has not yet
+/// signalled its shutdown) belongs to the exported state: the restored
+/// owner reports it, not the unset sentinel; a guest that posted none
+/// restores unset.
+#[test]
+fn snapshot_fs_vmm_exit_code_posted_before_the_cut_survives_the_restore() {
+    let dir = TempDir::new();
+    let src = dir.path("root");
+    fs::create_dir(&src).unwrap();
+    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
+    let source_code = Arc::new(AtomicI32::new(i32::MAX));
+    let source = vm_owned_side(mem.clone(), src.clone(), source_code.clone());
+    let restored = |posted: i32| {
+        let cuts = freeze(source.shares()).unwrap();
+        let (meta, _) = capture(source.shares(), &cuts, ArchiveMode::FullAttributes, posted)
+            .unwrap()
+            .unwrap();
+        resume(source.shares()).unwrap();
+        let meta: FsMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        let target_code = AtomicI32::new(i32::MAX);
+        restore_exit_code(&meta, &target_code);
+        target_code.load(Ordering::SeqCst)
+    };
+    let mut guest = Fuse::new();
+    guest.activate(&source);
+    guest.init(&mem, &source);
+    assert_eq!(restored(source_code.load(Ordering::SeqCst)), i32::MAX);
+    ioctl(&mut guest, &mem, &source, EXIT_CODE, 3);
+    assert_eq!(source_code.load(Ordering::SeqCst), 3);
+    assert_eq!(restored(source_code.load(Ordering::SeqCst)), 3);
+    drop(source);
+}
+
 /// A second handle on the same device and transport, for a capture of
 /// several shares.
 fn clone_share(share: &FsDevice) -> FsDevice {
@@ -578,6 +746,7 @@ fn clone_share(share: &FsDevice) -> FsDevice {
         tag: share.tag.clone(),
         read_only: share.read_only,
         allow_root_dir_delete: share.allow_root_dir_delete,
+        vm_owned_root: share.vm_owned_root.clone(),
         dax: share.dax,
     }
 }
@@ -617,7 +786,9 @@ fn snapshot_fs_vmm_metadata_is_validated_before_anything_exists() {
     let f = guest.lookup(&mem, &side, fuse::ROOT_ID, b"f");
     guest.open(&mem, &side, f.nodeid, libc::O_RDWR);
     let cuts = freeze(side.shares()).unwrap();
-    let (meta, _) = capture(side.shares(), &cuts).unwrap().unwrap();
+    let (meta, _) = capture(side.shares(), &cuts, ArchiveMode::FullAttributes, i32::MAX)
+        .unwrap()
+        .unwrap();
     let json = serde_json::to_string(&meta).unwrap();
     let copy = || -> FsMeta { serde_json::from_str(&json).unwrap() };
     let lengths = validate_metadata(&copy(), &regions(), &[0xd000_9000], 32).unwrap();
@@ -737,7 +908,9 @@ fn snapshot_fs_vmm_read_only_shares_hold_no_writable_state() {
     let mapping = Fuse::mapping_body(ro, 0, PAGE, 0, false);
     guest.ok(&mem, &side, Opcode::SetupMapping, f.nodeid, &mapping);
     let cuts = freeze(side.shares()).unwrap();
-    let (meta, _) = capture(side.shares(), &cuts).unwrap().unwrap();
+    let (meta, _) = capture(side.shares(), &cuts, ArchiveMode::FullAttributes, i32::MAX)
+        .unwrap()
+        .unwrap();
     let json = serde_json::to_string(&meta).unwrap();
     let read_only = || -> FsMeta {
         let mut m: FsMeta = serde_json::from_str(&json).unwrap();
@@ -926,3 +1099,5 @@ fn snapshot_fs_vmm_exports_need_declared_host_writers() {
     require_declared(1, true).unwrap();
     assert!(require_declared(1, false).is_err());
 }
+
+mod rootless;

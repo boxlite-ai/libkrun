@@ -27,8 +27,22 @@
 //! 0:0) are archived, with permission bits, owner, atime, mtime and the exact
 //! extended attributes; anything else fails the capture. Each share is
 //! walked through its own descriptors from its own root, so every mount a
-//! share sees is checked; the capture needs CAP_SYS_ADMIN in the initial
-//! user namespace, without which `trusted.*` xattrs are hidden.
+//! share sees is checked.
+//!
+//! The manifest records its contract (`ArchiveContract`), chosen by the
+//! capture's `ArchiveMode`:
+//! - full attributes: the capture needs CAP_SYS_ADMIN in the initial user
+//!   namespace, without which `trusted.*` xattrs are hidden, and holds any
+//!   owner and every xattr; the import needs whatever privilege setting
+//!   them takes;
+//! - guest-visible: what the capturing service, and so its guest, sees and
+//!   an unprivileged process with the same effective IDs can recreate.
+//!   Every object must be owned by those IDs and carry only `user.*` and
+//!   POSIX ACL xattrs naming no other user or group, every directory must
+//!   be listable and searchable and every regular file readable; anything
+//!   else fails the capture, never a partial archive. `trusted.*` xattrs,
+//!   hidden from the service and its guest alike, are outside it. Only a
+//!   process with exactly the recorded effective IDs may import it.
 
 use std::collections::HashSet;
 use std::io;
@@ -55,6 +69,96 @@ const MAX_XATTR_NAME: usize = 255;
 const MAX_XATTR_VALUE: usize = 65536;
 /// Largest init.krun a share may serve.
 const MAX_INIT_LEN: u64 = 64 << 20;
+
+/// The access ACL xattr.
+const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+/// The default ACL xattr.
+const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
+/// The version of the ACL xattr format (`POSIX_ACL_XATTR_VERSION`).
+const ACL_VERSION: u32 = 2;
+/// Entry tags naming a user or group by ID (`ACL_USER`, `ACL_GROUP`).
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP: u16 = 0x08;
+
+/// Which metadata a capture keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// Every attribute, also what only privilege sees or sets.
+    FullAttributes,
+    /// What the capturing service and its guest see, restorable without
+    /// privilege under the same effective IDs.
+    GuestVisible,
+}
+
+/// What an archive guarantees about the metadata it holds, and so which
+/// process can import it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum ArchiveContract {
+    /// Any owner and every xattr, `trusted.*` ones included.
+    FullAttributes,
+    /// Every object owned by `uid`:`gid`, the capturing service's effective
+    /// IDs in its own user namespace, with only `user.*` and POSIX ACL
+    /// xattrs naming no other user or group; importable only by a process
+    /// with exactly these effective IDs.
+    GuestVisible { uid: u32, gid: u32 },
+}
+
+impl ArchiveContract {
+    /// Why `object` is outside this contract, if it is.
+    fn refuses(&self, object: &ArchivedObject) -> Option<&'static str> {
+        let Self::GuestVisible { uid, gid } = *self else {
+            return None;
+        };
+        if (object.uid, object.gid) != (uid, gid) {
+            return Some("owner other than the guest-visible restore identity");
+        }
+        for xattr in &object.xattrs {
+            if xattr.name == ACL_ACCESS || xattr.name == ACL_DEFAULT {
+                if !acl_names_only(&xattr.value, uid, gid) {
+                    return Some("POSIX ACL naming another user or group, or malformed");
+                }
+            } else if !xattr.name.starts_with(b"user.") {
+                return Some("extended attribute outside user.* and POSIX ACLs");
+            }
+        }
+        None
+    }
+
+    /// Fail unless this process may import an archive of this contract: a
+    /// guest-visible one needs exactly the recorded effective IDs, so the
+    /// restored guest sees the same owners as the source's did.
+    pub fn check_importer(&self) -> Result<(), ArchiveError> {
+        match *self {
+            Self::GuestVisible { uid, gid } if host::effective_ids() != (uid, gid) => {
+                Err(ArchiveError::Unsupported(
+                    "import under another identity than the guest-visible archive's",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether `value` is a well-formed ACL xattr whose named entries name
+/// only user `uid` and group `gid`.
+fn acl_names_only(value: &[u8], uid: u32, gid: u32) -> bool {
+    let Some((version, entries)) = value.split_first_chunk::<4>() else {
+        return false;
+    };
+    if u32::from_le_bytes(*version) != ACL_VERSION || entries.len() % 8 != 0 {
+        return false;
+    }
+    entries.chunks_exact(8).all(|entry| {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let id = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+        match tag {
+            ACL_USER => id == uid,
+            ACL_GROUP => id == gid,
+            _ => true,
+        }
+    })
+}
 
 /// A timestamp with nanoseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +265,7 @@ pub struct ArchivedShare {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveManifest {
+    pub contract: ArchiveContract,
     pub objects: Vec<ArchivedObject>,
     /// Share roots outside every other tree; an import creates the k-th as
     /// directory "k" of its destination.
@@ -339,8 +444,10 @@ fn in_range(index: u64, len: usize) -> bool {
 }
 
 impl ArchiveManifest {
-    /// Every check an import makes before it creates anything: names, IDs,
-    /// references, kinds, lengths, timestamps, topology and sessions.
+    /// Every check an import makes before it creates anything but the
+    /// importer's identity (`ArchiveContract::check_importer`): names, IDs,
+    /// references, kinds, lengths, timestamps, topology, sessions and the
+    /// contract's limits on owners and xattrs.
     pub fn validate(&self) -> Result<PayloadLengths, ArchiveError> {
         self.checked().map(|(lengths, _)| lengths)
     }
@@ -350,6 +457,9 @@ impl ArchiveManifest {
         let mut files: u64 = 0;
         for object in &self.objects {
             object.validate(n)?;
+            if let Some(why) = self.contract.refuses(object) {
+                return invalid(why);
+            }
             if let ArchivedKind::Regular { size } = object.kind {
                 files = files
                     .checked_add(size)

@@ -953,3 +953,19 @@ fn blk_snapshot_long_pause_then_export_and_source_resume() {
     drop(restored);
     assert!(!destination.exists());
 }
+
+/// A failed disk import's cleanup removes only what it created: a disk
+/// file that replaced its segment at the same path is someone else's and
+/// stays, and so does the directory holding it.
+#[test]
+fn snapshot_import_disk_cleanup_leaves_a_replacement_at_its_path() {
+    let dir = TempDir::new();
+    let destination = dir.path("imported");
+    let mut imported = ImportedDir::create(&destination).unwrap();
+    drop(imported.create_segment_file(0).unwrap());
+    let segment = destination.join("disk-0.raw");
+    fs::remove_file(&segment).unwrap();
+    fs::write(&segment, b"replacement").unwrap();
+    drop(imported);
+    assert_eq!(fs::read(&segment).unwrap(), b"replacement");
+}

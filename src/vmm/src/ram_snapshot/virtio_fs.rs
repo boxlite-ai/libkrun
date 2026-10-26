@@ -28,8 +28,9 @@
 //! handles and writable DAX file mappings synced. An export needs
 //! `declare_host_writers_stopped`, the caller's promise that no host writer
 //! changes a share directory or any alias of its files until resume. It
-//! archives every share at once (`ShareArchive`), so the image restores
-//! without the source directories: the JSON holds each device and the
+//! archives every share at once (`ShareArchive`) in the owner's archive
+//! mode (full attributes, or guest-visible for an unprivileged owner), so
+//! the image restores without the source directories: the JSON holds each device and the
 //! archive manifest (objects, share roots, sessions with their DAX
 //! mappings), and the file, init.krun and DAX page payloads follow the disk
 //! segments. No host path or descriptor of a share appears in the image.
@@ -38,19 +39,22 @@
 //! and stays untouched), maps each DAX window and restores each session
 //! before any vCPU thread exists, and keeps the imported tree once it
 //! succeeds. Those copies belong to the owner alone, so an import starts
-//! with host writers declared stopped.
+//! with host writers declared stopped. A guest-visible archive imports only
+//! under the effective IDs it recorded, checked before anything exists, and
+//! the imported owner keeps exporting in its image's mode.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) use devices::virtio::fs::passthrough::ArchiveMode;
 use devices::virtio::fs::passthrough::{
-    ArchiveManifest, DaxMappingKind, ImportedArchive, PassthroughState, PayloadLengths,
-    ShareArchive,
+    ArchiveContract, ArchiveManifest, DaxMappingKind, ImportedArchive, PassthroughState,
+    PayloadLengths, ShareArchive,
 };
 use devices::virtio::persist::{MmioTransportState, QueueState, VirtioDeviceState};
 use devices::virtio::{
@@ -94,6 +98,11 @@ pub(crate) struct FsShareConfig {
     pub(crate) read_only: bool,
     /// Let the guest remove the share root (`VIRTIO_IOC_REMOVE_ROOT_DIR`).
     pub(crate) allow_root_dir_delete: bool,
+    /// libkrun created `source` for this VM alone (the temporary boot
+    /// root): the owner acknowledges a guest removal request without
+    /// removing it, keeps it for exports and removes it when it drops.
+    /// Every other share keeps the immediate removal contract.
+    pub(crate) vm_owned: bool,
     pub(crate) dax: Option<DaxRange>,
 }
 
@@ -113,6 +122,8 @@ pub(super) struct FsDevice {
     tag: String,
     read_only: bool,
     allow_root_dir_delete: bool,
+    /// The root of a VM-owned share, which the owner removes when it drops.
+    vm_owned_root: Option<PathBuf>,
     /// The DAX window and its backing's index in `RamSnapshotVm::dax`.
     dax: Option<(DaxRange, usize)>,
 }
@@ -212,6 +223,11 @@ pub(super) struct FsMeta {
     /// Share `i` of the archive is device `i`.
     pub(super) devices: Vec<FsDeviceMeta>,
     pub(super) archive: ArchiveManifest,
+    /// The exit code the guest set through a share
+    /// (`VIRTIO_IOC_EXIT_CODE`) before the cut, `i32::MAX` while unset:
+    /// a guest exporting between setting it and shutting down reports it
+    /// after the restore. Version 7 images restore it unset.
+    pub(super) exit_code: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -223,6 +239,10 @@ pub(super) struct FsDeviceMeta {
     pub(super) tag: String,
     pub(super) read_only: bool,
     pub(super) allow_root_dir_delete: bool,
+    /// The share is the VM-owned boot root: a restore keeps deferring the
+    /// guest's removal request and removes its own imported copy when it
+    /// drops. Version 7 images had no such share.
+    pub(super) vm_owned: bool,
     pub(super) dax: Option<DaxRange>,
     pub(super) transport: MmioTransportState,
     pub(super) device: VirtioDeviceState,
@@ -234,6 +254,11 @@ fn mmio_addr(index: usize) -> u64 {
 
 fn irq(index: usize) -> u32 {
     FS_IRQ_BASE + index as u32
+}
+
+/// Share `index`'s fixed (MMIO address, GSI).
+pub(super) fn slot_of(index: usize) -> (u64, u32) {
+    (mmio_addr(index), irq(index))
 }
 
 /// A share's (transport, MMIO address, GSI) for the shared wiring.
@@ -352,6 +377,10 @@ struct Share<'a> {
     root: PathBuf,
     read_only: bool,
     allow_root_dir_delete: bool,
+    vm_owned: bool,
+    /// The owner's guest exit code (`VIRTIO_IOC_EXIT_CODE`), shared by every
+    /// share.
+    exit_code: Arc<AtomicI32>,
     window: Option<VirtioShmRegion>,
 }
 
@@ -380,12 +409,15 @@ fn build(memory: GuestMemoryMmap, intc: devices::legacy::IrqChip, share: Share) 
     let mut fs = Fs::new_at(
         share.tag.to_owned(),
         share.root,
-        Arc::new(AtomicI32::new(0)),
+        share.exit_code,
         share.allow_root_dir_delete,
         share.read_only,
     )
     .map_err(|e| Error::Full(format!("create virtio-fs device: {e:?}")))?;
     fs.enable_snapshot();
+    if share.vm_owned {
+        fs.defer_root_dir_delete();
+    }
     if let Some(window) = share.window {
         fs.set_shm_region(window);
     }
@@ -440,9 +472,11 @@ pub(super) fn attach(vm: &mut RamSnapshotVm, config: FsShareConfig) -> Result<()
             vm,
             Share {
                 tag: &config.tag,
-                root: config.source,
+                root: config.source.clone(),
                 read_only: config.read_only,
                 allow_root_dir_delete: config.allow_root_dir_delete,
+                vm_owned: config.vm_owned,
+                exit_code: vm.exit_code.clone(),
                 window: dax.map(|(range, backing)| vm.dax[backing].region(range.gpa)),
             },
         )?;
@@ -454,6 +488,7 @@ pub(super) fn attach(vm: &mut RamSnapshotVm, config: FsShareConfig) -> Result<()
             tag: config.tag,
             read_only: config.read_only,
             allow_root_dir_delete: config.allow_root_dir_delete,
+            vm_owned_root: config.vm_owned.then_some(config.source),
             dax,
         })
     })();
@@ -547,6 +582,22 @@ pub(super) fn teardown(vm: &mut RamSnapshotVm) {
     }
 }
 
+/// Remove the root of every VM-owned share (a booted owner's boot root, an
+/// imported owner's copy of it), after `teardown` joined every worker.
+/// Nothing can report a failure at this point, so it is logged.
+pub(super) fn remove_vm_owned_roots(shares: &[FsDevice]) {
+    for root in shares
+        .iter()
+        .filter_map(|share| share.vm_owned_root.as_ref())
+    {
+        if let Err(e) = std::fs::remove_dir_all(root) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::warn!("remove VM-owned share root {}: {e}", root.display());
+            }
+        }
+    }
+}
+
 /// Retire a device that failed to restore, keeping the window ranges it
 /// may no longer own.
 fn discard(vm: &mut RamSnapshotVm, device: &Arc<Mutex<Fs>>, backing: Option<usize>) {
@@ -570,6 +621,7 @@ fn device_meta(
         tag: share.tag.clone(),
         read_only: share.read_only,
         allow_root_dir_delete: share.allow_root_dir_delete,
+        vm_owned: share.vm_owned_root.is_some(),
         dax: share.dax.map(|(range, _)| range),
         transport: transport.save_transport_state(),
         device: VirtioDeviceState {
@@ -590,9 +642,12 @@ fn device_meta(
 /// `O_NOATIME` permission, file and directory atimes) is recorded as found,
 /// and the first capture assigns inode projections to objects the guest
 /// never looked up in the live share. Images are not byte-identical.
+/// `exit_code` is the owner's guest exit code at the cut.
 pub(super) fn capture(
     shares: &[FsDevice],
     cuts: &[Option<Vec<QueueState>>],
+    mode: ArchiveMode,
+    exit_code: i32,
 ) -> Result<Option<(FsMeta, ShareArchive)>> {
     if shares.is_empty() {
         return Ok(None);
@@ -616,11 +671,12 @@ pub(super) fn capture(
                 .map_err(|e| Error::Full(format!("virtio-fs share {}: {e}", share.index)))?,
         );
     }
-    let archive = ShareArchive::capture(sources)
+    let archive = ShareArchive::capture(sources, mode)
         .map_err(|e| Error::Full(format!("virtio-fs archive: {e}")))?;
     let meta = FsMeta {
         devices,
         archive: archive.manifest().clone(),
+        exit_code,
     };
     Ok(Some((meta, archive)))
 }
@@ -796,6 +852,55 @@ pub(super) fn write_payloads(file: &mut File, archive: &ShareArchive) -> Result<
     Ok(())
 }
 
+/// Upgrade a version 7 virtio-fs section (JSON, maybe null) in place: its
+/// archive was captured with full attributes and records no contract, none
+/// of its shares was VM-owned, and it recorded no exit code, so it restores
+/// unset; one that records any of these is no version 7 section.
+pub(super) fn upgrade_contractless(fs: &mut serde_json::Value) -> Result<()> {
+    if let Some(archive) = fs.get_mut("archive").and_then(|a| a.as_object_mut()) {
+        if archive.contains_key("contract") {
+            return Err(Error::Invalid(
+                "a version 7 virtio-fs archive carries a contract",
+            ));
+        }
+        let contract = serde_json::to_value(ArchiveContract::FullAttributes)
+            .map_err(|e| Error::Full(format!("virtio-fs contract: {e}")))?;
+        archive.insert("contract".to_owned(), contract);
+    }
+    if let Some(devices) = fs.get_mut("devices").and_then(|d| d.as_array_mut()) {
+        for device in devices.iter_mut().filter_map(|d| d.as_object_mut()) {
+            if device.contains_key("vm_owned") {
+                return Err(Error::Invalid(
+                    "a version 7 virtio-fs share records VM ownership",
+                ));
+            }
+            device.insert("vm_owned".to_owned(), serde_json::Value::Bool(false));
+        }
+    }
+    if let Some(section) = fs.as_object_mut() {
+        if section.contains_key("exit_code") {
+            return Err(Error::Invalid(
+                "a version 7 virtio-fs section records an exit code",
+            ));
+        }
+        section.insert("exit_code".to_owned(), i32::MAX.into());
+    }
+    Ok(())
+}
+
+/// The mode an owner restored from `meta` exports in, once this process
+/// passed the archive's importer check (before anything exists).
+pub(super) fn imported_mode(meta: &FsMeta) -> Result<ArchiveMode> {
+    let contract = &meta.archive.contract;
+    contract
+        .check_importer()
+        .map_err(|e| Error::Full(format!("virtio-fs: {e}")))?;
+    Ok(match contract {
+        ArchiveContract::FullAttributes => ArchiveMode::FullAttributes,
+        ArchiveContract::GuestVisible { .. } => ArchiveMode::GuestVisible,
+    })
+}
+
 /// Import the shares into the new directory `dir` from the three payloads
 /// at `file`'s position, consuming exactly their bytes. A failure removes
 /// whatever the import created.
@@ -818,6 +923,7 @@ pub(super) fn import_shares(file: &File, meta: &FsMeta, dir: &Path) -> Result<Im
 /// with a frozen worker, before any vCPU thread exists. The archive holds
 /// every device it restored until the import persists it.
 pub(super) fn restore(vm: &mut RamSnapshotVm, meta: &FsMeta) -> Result<()> {
+    restore_exit_code(meta, &vm.exit_code);
     let mut archive = vm
         .fs_import
         .take()
@@ -831,6 +937,22 @@ pub(super) fn restore(vm: &mut RamSnapshotVm, meta: &FsMeta) -> Result<()> {
     restored
 }
 
+/// Each restored share's tag and imported root, except the VM-owned boot
+/// root, whose copy goes with the owner.
+pub(super) fn restored_roots(meta: &FsMeta, archive: &ImportedArchive) -> Vec<(String, PathBuf)> {
+    meta.devices
+        .iter()
+        .enumerate()
+        .filter(|(_, device)| !device.vm_owned)
+        .map(|(index, device)| (device.tag.clone(), archive.root(index).to_owned()))
+        .collect()
+}
+
+/// The restored owner continues from the exit code the image recorded.
+fn restore_exit_code(meta: &FsMeta, exit_code: &AtomicI32) {
+    exit_code.store(meta.exit_code, Ordering::SeqCst);
+}
+
 fn restore_share(
     vm: &mut RamSnapshotVm,
     archive: &mut ImportedArchive,
@@ -841,15 +963,11 @@ fn restore_share(
         Some(range) => Some((range, add_window(vm, range)?)),
         None => None,
     };
+    let root = archive.root(index).to_owned();
+    let window = dax.map(|(range, backing)| vm.dax[backing].region(range.gpa));
     let (device, transport) = new_device(
         vm,
-        Share {
-            tag: &meta.tag,
-            root: archive.root(index).to_owned(),
-            read_only: meta.read_only,
-            allow_root_dir_delete: meta.allow_root_dir_delete,
-            window: dax.map(|(range, backing)| vm.dax[backing].region(range.gpa)),
-        },
+        restored_share(meta, root.clone(), vm.exit_code.clone(), window),
     )?;
     archive.hold(device.clone());
     let restored = restore_parts(&device, &transport, archive, index, meta)
@@ -865,9 +983,35 @@ fn restore_share(
         tag: meta.tag.clone(),
         read_only: meta.read_only,
         allow_root_dir_delete: meta.allow_root_dir_delete,
+        vm_owned_root: owned_root(meta, root),
         dax,
     });
     Ok(())
+}
+
+/// What a restored VM-owned share removes when the owner drops: only its
+/// imported `root`, never a source path.
+fn owned_root(meta: &FsDeviceMeta, root: PathBuf) -> Option<PathBuf> {
+    meta.vm_owned.then_some(root)
+}
+
+/// The device a restore creates for `meta` on its imported `root`: a
+/// VM-owned share keeps deferring the guest's removal request.
+fn restored_share<'a>(
+    meta: &'a FsDeviceMeta,
+    root: PathBuf,
+    exit_code: Arc<AtomicI32>,
+    window: Option<VirtioShmRegion>,
+) -> Share<'a> {
+    Share {
+        tag: &meta.tag,
+        root,
+        read_only: meta.read_only,
+        allow_root_dir_delete: meta.allow_root_dir_delete,
+        vm_owned: meta.vm_owned,
+        exit_code,
+        window,
+    }
 }
 
 /// Adopt the saved device, session and transport state; an activated

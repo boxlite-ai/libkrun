@@ -233,8 +233,7 @@ impl Tree {
         let mut dirs: Vec<&File> = self.objects.iter().flatten().collect();
         dirs.extend(self.staging.iter());
         dirs.extend(self.dest.iter());
-        // Safe because these calls only return the effective IDs.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (uid, gid) = host::effective_ids();
         for dir in dirs {
             if host::statx(dir).is_ok_and(|m| m.kind() == libc::S_IFDIR) {
                 let _ = host::chown(dir, uid, gid);
@@ -320,7 +319,8 @@ fn number(n: u64) -> CString {
 impl ImportedArchive {
     /// Import `manifest` into the new directory `dest` from its three
     /// payloads, each holding exactly the bytes the manifest describes.
-    /// `dest` must not exist; it is left untouched if it does.
+    /// `dest` must not exist; it is left untouched if it does, and so is
+    /// everything when this process may not import the manifest's contract.
     pub fn import(
         manifest: &ArchiveManifest,
         dest: &Path,
@@ -329,6 +329,7 @@ impl ImportedArchive {
         pages: &mut dyn Read,
     ) -> Result<ImportedArchive, ArchiveError> {
         let (_, topology) = manifest.checked()?;
+        manifest.contract.check_importer()?;
         let name = match dest.file_name() {
             Some(name) => CString::new(name.as_bytes())
                 .map_err(|_| ArchiveError::Invalid("destination name"))?,

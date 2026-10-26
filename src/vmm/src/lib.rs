@@ -20,6 +20,9 @@ pub(crate) mod device_manager;
 pub(crate) mod ram_snapshot;
 /// Resource store for configured microVM resources.
 pub mod resources;
+/// The checkpointing VM.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub mod snapshot_vm;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;

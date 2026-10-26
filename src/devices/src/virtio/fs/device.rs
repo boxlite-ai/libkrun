@@ -193,6 +193,15 @@ impl Fs {
         self.passthrough_cfg.dax_control = Some(control);
     }
 
+    /// Acknowledge the guest's root removal request without removing the
+    /// share root; whoever created the root removes it when the VM ends
+    /// (see `passthrough::Config::defer_root_dir_delete`). Must precede
+    /// activation.
+    #[cfg(target_os = "linux")]
+    pub fn defer_root_dir_delete(&mut self) {
+        self.passthrough_cfg.defer_root_dir_delete = true;
+    }
+
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }

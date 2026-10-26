@@ -42,7 +42,7 @@ pub(crate) struct ExecutionBarrier {
     changed: Condvar,
     /// Gets a permit holder out of `KVM_RUN`.
     kick: Kick,
-    /// The owner's exit eventfd, written once a remapping failed.
+    /// The owner's failure eventfd, written once a remapping failed.
     exit: EventFd,
 }
 

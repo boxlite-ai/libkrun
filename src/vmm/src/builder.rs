@@ -525,7 +525,7 @@ pub enum Payload {
     Tee,
 }
 
-fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmError> {
+pub(crate) fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmError> {
     if let Some(_kernel_bundle) = &vm_resources.kernel_bundle {
         #[cfg(feature = "tee")]
         if vm_resources.qboot_bundle.is_none() || vm_resources.initrd_bundle.is_none() {
@@ -547,6 +547,44 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
     } else {
         Err(StartMicrovmError::MissingKernelConfig)
     }
+}
+
+/// The kernel command line before any device: the payload's own (an
+/// external kernel's), else the configured prolog, else the default; then
+/// the krun environment, with `console=` replaced by the configured kernel
+/// console. Shared by the ordinary and the checkpointing boot.
+pub(crate) fn base_kernel_cmdline(
+    vm_resources: &VmResources,
+    payload_cmdline: Option<&str>,
+) -> Result<Cmdline, StartMicrovmError> {
+    let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+    if let Some(cmdline) = payload_cmdline {
+        kernel_cmdline.insert_str(cmdline)?;
+    } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
+        kernel_cmdline.insert_str(cmdline)?;
+    } else {
+        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE)?;
+    }
+
+    if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
+        kernel_cmdline.insert_str(cmdline.as_str())?;
+    }
+
+    if let Some(kernel_console) = &vm_resources.kernel_console {
+        let cmdline = kernel_cmdline.as_str();
+        let console_start_idx = cmdline.find("console=").unwrap();
+        let console_end_idx = cmdline
+            .get(console_start_idx..)
+            .and_then(|s| s.find(" ").map(|i| i + console_start_idx));
+
+        let cmdline = cmdline.replace(
+            &cmdline[console_start_idx..console_end_idx.unwrap()],
+            format!("console={kernel_console}").as_str(),
+        );
+        kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+        kernel_cmdline.insert_str(cmdline)?;
+    }
+    Ok(kernel_cmdline)
 }
 
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
@@ -577,33 +615,8 @@ pub fn build_microvm(
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
-    let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-    if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
-    } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline).unwrap();
-    } else {
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
-    }
-
-    if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
-    }
-
-    if let Some(kernel_console) = &vm_resources.kernel_console {
-        let cmdline = kernel_cmdline.as_str();
-        let console_start_idx = cmdline.find("console=").unwrap();
-        let console_end_idx = cmdline
-            .get(console_start_idx..)
-            .and_then(|s| s.find(" ").map(|i| i + console_start_idx));
-
-        let cmdline = cmdline.replace(
-            &cmdline[console_start_idx..console_end_idx.unwrap()],
-            format!("console={kernel_console}").as_str(),
-        );
-        kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-        kernel_cmdline.insert_str(cmdline).unwrap();
-    }
+    let mut kernel_cmdline =
+        base_kernel_cmdline(vm_resources, payload_config.kernel_cmdline.as_deref())?;
 
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
@@ -1128,7 +1141,7 @@ pub fn build_microvm(
     Ok(vmm)
 }
 
-fn load_external_kernel(
+pub(crate) fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
     external_kernel: &ExternalKernel,

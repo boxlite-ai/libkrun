@@ -734,6 +734,111 @@ fn snapshot_full_share_sections_are_checked_with_the_image_length() {
     assert!(error.contains("carries a FUSE session"), "{error}");
 }
 
+/// Version 8 images record each virtio-fs archive's contract (mode and
+/// restore identity). Version 7 images never did and read as full-attribute
+/// archives; one carrying a contract is no version 7 image, and a version 8
+/// image must carry one. Later versions are refused.
+#[test]
+fn snapshot_full_reads_version_7_shares_as_full_attribute_archives() {
+    use devices::virtio::fs::passthrough::ArchiveContract;
+    let dir = TempDir::new();
+    let src = dir.0.join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), b"file").unwrap();
+    let (share, payloads) = crate::ram_snapshot::virtio_fs::tests::captured_share(&src);
+    let image = |version: u32, metadata: &serde_json::Value| {
+        let path = dir.path();
+        write_header_only(&path, version, &serde_json::to_vec(metadata).unwrap());
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0; 0x2000]).unwrap();
+        file.write_all(&payloads).unwrap();
+        read_metadata(&mut File::open(&path).unwrap(), 32, 32)
+    };
+    let contract = |parsed: Result<Metadata>| parsed.unwrap().fs.unwrap().archive.contract;
+    let mut v8 = minimal_metadata(serde_json::json!([{"gpa": 0, "len": 0x2000, "attributes": 0}]));
+    v8["legacy"] = serde_json::Value::Null;
+    v8["fs"] = serde_json::to_value(&share).unwrap();
+    assert_eq!(v8["fs"]["archive"]["contract"], "full_attributes");
+    assert_eq!(contract(image(8, &v8)), ArchiveContract::FullAttributes);
+    assert_eq!(v8["fs"]["devices"][0]["vm_owned"], false);
+    let mut codeless = v8.clone();
+    codeless["fs"].as_object_mut().unwrap().remove("exit_code");
+    let error = rejection(image(8, &codeless));
+    assert!(error.contains("missing field `exit_code`"), "{error}");
+    let mut contractless = v8.clone();
+    contractless["fs"]["archive"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contract");
+    let error = rejection(image(8, &contractless));
+    assert!(error.contains("missing field `contract`"), "{error}");
+    let mut ownerless = v8.clone();
+    ownerless["fs"]["devices"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("vm_owned");
+    let error = rejection(image(8, &ownerless));
+    assert!(error.contains("missing field `vm_owned`"), "{error}");
+    let mut v7 = ownerless.clone();
+    v7["fs"]["archive"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contract");
+    v7["fs"].as_object_mut().unwrap().remove("exit_code");
+    let parsed = image(7, &v7).unwrap().fs.unwrap();
+    assert_eq!(parsed.archive.contract, ArchiveContract::FullAttributes);
+    assert!(
+        !parsed.devices[0].vm_owned,
+        "version 7 had no VM-owned share"
+    );
+    assert_eq!(parsed.exit_code, i32::MAX, "version 7 restores it unset");
+    let mut coded_v7 = v7.clone();
+    coded_v7["fs"]["exit_code"] = 3.into();
+    let error = rejection(image(7, &coded_v7));
+    assert!(error.contains("records an exit code"), "{error}");
+    let error = rejection(image(7, &contractless));
+    assert!(error.contains("records VM ownership"), "{error}");
+    let mut owned_v7 = v7.clone();
+    owned_v7["fs"]["archive"]["contract"] = v8["fs"]["archive"]["contract"].clone();
+    let error = rejection(image(7, &owned_v7));
+    assert!(
+        error.contains("version 7 virtio-fs archive carries a contract"),
+        "{error}"
+    );
+
+    let owner = &share.archive.objects[0];
+    let (uid, gid) = (owner.uid, owner.gid);
+    let mut visible = v8.clone();
+    visible["fs"]["archive"]["contract"] =
+        serde_json::json!({"guest_visible": {"uid": uid, "gid": gid}});
+    assert_eq!(
+        contract(image(8, &visible)),
+        ArchiveContract::GuestVisible { uid, gid }
+    );
+    let error = rejection(image(7, &visible));
+    assert!(error.contains("carries a contract"), "{error}");
+    visible["fs"]["archive"]["contract"]["guest_visible"]["uid"] = (uid + 1).into();
+    let error = rejection(image(8, &visible));
+    assert!(error.contains("owner other than"), "{error}");
+    let error = rejection(image(9, &v8));
+    assert!(
+        error.contains("unsupported full snapshot version"),
+        "{error}"
+    );
+
+    // A version 7 image without shares reads unchanged.
+    let mut bare = v7.clone();
+    bare["fs"] = serde_json::Value::Null;
+    let path = dir.path();
+    write_header_only(&path, 7, &serde_json::to_vec(&bare).unwrap());
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&[0; 0x2000]).unwrap();
+    assert!(read_metadata(&mut File::open(&path).unwrap(), 32, 32)
+        .unwrap()
+        .fs
+        .is_none());
+}
+
 /// Each target resource is required exactly when its device is present.
 #[test]
 fn snapshot_full_restore_resources_must_match_devices() {
@@ -786,7 +891,7 @@ fn snapshot_full_restore_resources_must_match_devices() {
     };
     assert!(with_console.check(&RestoreResources::default()).is_err());
     let console_ports = RestoreResources {
-        console_ports: Some(Vec::new()),
+        console_ports: Some(ConsoleEndpoints::Ports(Vec::new())),
         ..Default::default()
     };
     with_console.check(&console_ports).unwrap();
@@ -879,4 +984,64 @@ fn snapshot_legacy_restored_vm_continues_then_reset_stops_it() {
     assert!(restored.export(&dir.0.join("after-reset")).is_err());
     assert!(!dir.0.join("after-reset").exists());
     assert!(restored.resume().is_err());
+}
+
+/// An export whose image would pass `RLIMIT_FSIZE` is refused before the
+/// file exists. Writing past the limit raises SIGXFSZ, which would kill the
+/// owner instead of failing the export. The child runs this test under a
+/// 64 KiB limit with a 1 MiB RAM image.
+#[test]
+fn snapshot_full_export_refuses_an_image_above_the_file_size_limit() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    const CHILD: &str = "KRUN_FULL_FSIZE_CHILD";
+    const RAM: u64 = 1 << 20;
+    if let Some(path) = std::env::var_os(CHILD) {
+        let path = PathBuf::from(path);
+        let json = minimal_metadata(serde_json::json!([{"gpa": 0, "len": RAM, "attributes": 0}]));
+        let metadata: Metadata = serde_json::from_value(json).unwrap();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM as usize)]).unwrap();
+        let error = rejection(write_pending(
+            &path,
+            &memory,
+            &metadata,
+            #[cfg(feature = "blk")]
+            &[],
+            None,
+            0,
+        ));
+        assert!(error.contains("file size limit"), "{error}");
+        assert!(!path.exists(), "the refused image must not exist");
+        return;
+    }
+    let dir = TempDir::new();
+    let path = dir.path();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "ram_snapshot::full::tests::snapshot_full_export_refuses_an_image_above_the_file_size_limit",
+            "--test-threads=1",
+        ])
+        .env(CHILD, &path);
+    // SAFETY: setrlimit is async-signal-safe and only touches the child.
+    unsafe {
+        child.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64 << 10,
+                rlim_max: 64 << 10,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = child.status().unwrap();
+    assert!(
+        status.success(),
+        "child status {status:?}, signal {:?} (SIGXFSZ is {})",
+        status.signal(),
+        libc::SIGXFSZ
+    );
+    assert!(!path.exists());
 }

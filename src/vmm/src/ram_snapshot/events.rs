@@ -14,14 +14,16 @@
 //! frozen and, on its first resume, notifies every ready queue itself,
 //! independently of the source's notifications.
 //!
-//! The exit watch latches the owner's exit request (i8042 reset, any vCPU
-//! exit, or a vsock backend that failed to reopen on an event-queue kick)
-//! and stops every vCPU the owner armed it with.
+//! The exit watch latches the owner's exit request (i8042 reset or any vCPU
+//! exit; or, as a failure, a vsock backend that failed to reopen on an
+//! event-queue kick or a failed DAX window remapping) and stops every vCPU
+//! the owner armed it with.
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use devices::legacy::Serial;
@@ -66,49 +68,111 @@ enum Command {
     },
 }
 
-/// The owner's exit request. The i8042 reset, every vCPU and the vsock (for
-/// a fatal backend failure) hold a clone of the eventfd; only the event
-/// thread reads it and latches `exiting`, which
-/// is never cleared: an exiting owner takes no further snapshot or resume.
+/// The owner's exit request. The i8042 reset and every vCPU hold a clone
+/// of `evt`, the vsock (a fatal backend failure) and the execution barrier
+/// (a failed DAX window remapping) one of `failure`; only the event thread
+/// reads them and latches `exiting` (and `failed`), which is never
+/// cleared: an exiting owner takes no further snapshot or resume.
 pub(super) struct Exit {
     evt: EventFd,
+    failure: EventFd,
     exiting: AtomicBool,
+    failed: AtomicBool,
+    /// Set once the exit latched or the owner stopped every thread; wakes
+    /// every `wait`.
+    ended: Mutex<bool>,
+    changed: Condvar,
 }
 
 impl Exit {
     pub(super) fn new() -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             evt: EventFd::new(EFD_NONBLOCK)?,
+            failure: EventFd::new(EFD_NONBLOCK)?,
             exiting: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            ended: Mutex::new(false),
+            changed: Condvar::new(),
         }))
     }
 
-    /// An eventfd an exit source writes.
+    /// An eventfd a guest exit source writes.
     pub(super) fn notifier(&self) -> Result<EventFd> {
         Ok(self.evt.try_clone()?)
+    }
+
+    /// An eventfd a fatal host-side failure writes: it ends guest execution
+    /// like an exit, but without a guest exit status.
+    pub(super) fn failure_notifier(&self) -> Result<EventFd> {
+        Ok(self.failure.try_clone()?)
     }
 
     /// Latched, or signalled but not yet read because the thread is frozen.
     /// Poll before loading the latch: the watch latches before it drains,
     /// so an exit drained between the two steps is still seen as latched.
     pub(super) fn requested(&self) -> bool {
-        let unread = super::wiring::is_readable(&self.evt);
+        let unread = super::wiring::is_readable(&self.evt) || self.failure_pending();
         unread || self.exiting.load(Ordering::SeqCst)
+    }
+
+    /// Whether a host-side failure, not the guest, ended execution.
+    pub(super) fn failed(&self) -> bool {
+        self.failure_pending() || self.failed.load(Ordering::SeqCst)
+    }
+
+    fn failure_pending(&self) -> bool {
+        super::wiring::is_readable(&self.failure)
+    }
+
+    /// Wake every `wait`: the exit latched or no thread runs anymore.
+    pub(super) fn end(&self) {
+        *self.ended.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    /// Block until `end` or `timeout` (None waits for ever); returns
+    /// whether it ended.
+    pub(super) fn wait(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let mut ended = self.ended.lock().unwrap();
+        while !*ended {
+            ended = match deadline {
+                None => self.changed.wait(ended).unwrap(),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    self.changed.wait_timeout(ended, left).unwrap().0
+                }
+            };
+        }
+        true
     }
 }
 
-/// Reads the exit eventfd and latches the request.
+/// Reads the exit and failure eventfds and latches the request.
 struct ExitWatch(Arc<Exit>);
 
 impl Subscriber for ExitWatch {
-    fn process(&mut self, _event: &EpollEvent, _event_manager: &mut EventManager) {
+    fn process(&mut self, event: &EpollEvent, _event_manager: &mut EventManager) {
         // Latch before draining; see `Exit::requested`.
-        self.0.exiting.store(true, Ordering::SeqCst);
-        let _ = self.0.evt.read();
+        if event.data() == self.0.failure.as_raw_fd() as u64 {
+            self.0.failed.store(true, Ordering::SeqCst);
+            self.0.exiting.store(true, Ordering::SeqCst);
+            let _ = self.0.failure.read();
+        } else {
+            self.0.exiting.store(true, Ordering::SeqCst);
+            let _ = self.0.evt.read();
+        }
+        self.0.end();
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(EventSet::IN, self.0.evt.as_raw_fd() as u64)]
+        vec![
+            EpollEvent::new(EventSet::IN, self.0.evt.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.0.failure.as_raw_fd() as u64),
+        ]
     }
 }
 

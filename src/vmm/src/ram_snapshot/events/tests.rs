@@ -223,3 +223,36 @@ fn snapshot_exit_watch_frozen_leaves_exit_pending_for_the_owner() {
     events.stop();
     vcpu.finish();
 }
+
+/// A waiter wakes once a guest exit latches, or a host failure (marked as
+/// a failure), or the owner stops every thread; it times out otherwise.
+#[test]
+fn snapshot_exit_wait_ends_on_exit_failure_or_stop() {
+    let exit = Exit::new().unwrap();
+    let mut events = exit_only(&exit, Start::Running);
+    assert!(!exit.wait(Some(Duration::from_millis(20))));
+    let waiter = {
+        let exit = exit.clone();
+        thread::spawn(move || exit.wait(None))
+    };
+    exit.notifier().unwrap().write(1).unwrap();
+    assert!(waiter.join().unwrap());
+    assert!(exit.requested() && !exit.failed());
+    events.stop();
+
+    let failed = Exit::new().unwrap();
+    let mut events = exit_only(&failed, Start::Running);
+    failed.failure_notifier().unwrap().write(1).unwrap();
+    assert!(failed.wait(Some(Duration::from_secs(3))));
+    assert!(failed.requested() && failed.failed());
+    events.stop();
+
+    let stopped = Exit::new().unwrap();
+    let waiter = {
+        let stopped = stopped.clone();
+        thread::spawn(move || stopped.wait(None))
+    };
+    stopped.end();
+    assert!(waiter.join().unwrap());
+    assert!(!stopped.requested() && !stopped.failed());
+}

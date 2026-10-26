@@ -35,9 +35,9 @@ mod snapshot;
 #[cfg(test)]
 pub(crate) use archive::import_faults;
 pub use archive::{
-    ArchiveError, ArchiveManifest, ArchivedEntry, ArchivedKind, ArchivedObject, ArchivedSession,
-    ArchivedShare, ArchivedTime, ArchivedXattr, ImportedArchive, ImportedSession, ObjectView,
-    PayloadLengths, ShareArchive, ShareSource,
+    ArchiveContract, ArchiveError, ArchiveManifest, ArchiveMode, ArchivedEntry, ArchivedKind,
+    ArchivedObject, ArchivedSession, ArchivedShare, ArchivedTime, ArchivedXattr, ImportedArchive,
+    ImportedSession, ObjectView, PayloadLengths, ShareArchive, ShareSource,
 };
 #[cfg(test)]
 pub(crate) use dax::faults as dax_faults;
@@ -374,6 +374,11 @@ pub struct Config {
     pub export_table: Option<ExportTable>,
     pub allow_root_dir_delete: bool,
 
+    /// Acknowledge an allowed `VIRTIO_IOC_REMOVE_ROOT_DIR` without removing
+    /// the root: its creator removes it when the VM ends. Only a VM-owned
+    /// boot share sets it; every other share removes its root at once.
+    pub defer_root_dir_delete: bool,
+
     /// Opt into checkpointable runtime state: stable directory lists with
     /// index cookies, guest inode projection and the saved-ctime overlay.
     /// Only snapshot-owned shares set it; ordinary shares keep the
@@ -413,6 +418,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             allow_root_dir_delete: false,
+            defer_root_dir_delete: false,
             snapshot: false,
             init_binary: None,
             dax_control: None,
@@ -2391,7 +2397,9 @@ impl FileSystem for PassthroughFs {
                 Ok(Vec::new())
             }
             VIRTIO_IOC_REMOVE_ROOT_DIR_REQ if self.cfg.allow_root_dir_delete => {
-                std::fs::remove_dir_all(&self.cfg.root_dir)?;
+                if !self.cfg.defer_root_dir_delete {
+                    std::fs::remove_dir_all(&self.cfg.root_dir)?;
+                }
                 Ok(Vec::new())
             }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),

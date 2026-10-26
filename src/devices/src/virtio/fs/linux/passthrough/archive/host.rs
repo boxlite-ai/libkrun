@@ -270,6 +270,13 @@ pub(super) fn sees_every_xattr() -> io::Result<bool> {
     Ok(sys_admin && ns.ino() == USER_NS_INIT_INO)
 }
 
+/// This thread's effective user and group IDs, as its user namespace maps
+/// them.
+pub(super) fn effective_ids() -> (u32, u32) {
+    // Safe because these calls only return the effective IDs.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
 /// Every extended attribute of the object behind `file`, sorted by name.
 pub(super) fn xattrs(file: &File) -> io::Result<Vec<ArchivedXattr>> {
     let path = proc_path(file);
@@ -336,7 +343,9 @@ pub(super) fn chown(file: &File, uid: u32, gid: u32) -> io::Result<()> {
 pub(super) fn chmod(file: &File, mode: u32) -> io::Result<()> {
     let path = proc_path(file);
     // Safe because this doesn't modify any memory and we check the result.
-    check(unsafe { libc::chmod(path.as_ptr(), mode) })
+    // fchmodat with no flags is one syscall on every libc, which the shim's
+    // seccomp filter allows.
+    check(unsafe { libc::fchmodat(libc::AT_FDCWD, path.as_ptr(), mode, 0) })
 }
 
 pub(super) fn set_times(file: &File, atime: ArchivedTime, mtime: ArchivedTime) -> io::Result<()> {

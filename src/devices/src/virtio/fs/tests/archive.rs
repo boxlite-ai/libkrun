@@ -11,9 +11,9 @@ use caps::Capability;
 
 use super::super::fuse::RenameIn;
 use super::super::passthrough::{
-    drop_effective_cap, import_faults, ArchiveError, ArchiveManifest, ArchivedEntry, ArchivedKind,
-    ArchivedObject, ArchivedTime, ArchivedXattr, ImportedArchive, ObjectView, ShareArchive,
-    ShareSource,
+    drop_effective_cap, import_faults, ArchiveContract, ArchiveError, ArchiveManifest, ArchiveMode,
+    ArchivedEntry, ArchivedKind, ArchivedObject, ArchivedTime, ArchivedXattr, ImportedArchive,
+    ObjectView, ShareArchive, ShareSource,
 };
 use super::*;
 
@@ -53,10 +53,15 @@ fn import(
     )
 }
 
+/// Capture `shares` with full attributes, the mode these tests cover.
+fn capture_full(shares: Vec<ShareSource<'_>>) -> Result<ShareArchive, ArchiveError> {
+    ShareArchive::capture(shares, ArchiveMode::FullAttributes)
+}
+
 /// Capture one share of `dir` whose device was never activated.
 fn capture_dir(dir: &Path) -> Result<ShareArchive, ArchiveError> {
     let cfg = snapshot_config(dir);
-    ShareArchive::capture(vec![ShareSource::inactive(&cfg, None)?])
+    capture_full(vec![ShareSource::inactive(&cfg, None)?])
 }
 
 fn device_on(root: &Path, read_only: bool) -> Fs {
@@ -292,7 +297,7 @@ fn snapshot_fs_archive_session_continues_after_source_deletion() {
     let queues = rig.freeze();
     let guest = rig.guest.copy();
 
-    let archive = ShareArchive::capture(vec![rig.fs.archive_source().unwrap()]).unwrap();
+    let archive = capture_full(vec![rig.fs.archive_source().unwrap()]).unwrap();
     let p = payloads(&archive);
     let manifest = archive.manifest().clone();
     drop(archive);
@@ -356,9 +361,9 @@ fn snapshot_fs_archive_isolates_source_and_restored_changes() {
     let fh = rig.open(Opcode::Open, f.nodeid, libc::O_RDWR);
     let queues = rig.freeze();
     let guest = rig.guest.copy();
-    let archive = ShareArchive::capture(vec![rig.fs.archive_source().unwrap()]).unwrap();
+    let archive = capture_full(vec![rig.fs.archive_source().unwrap()]).unwrap();
     let p = payloads(&archive);
-    let late = ShareArchive::capture(vec![rig.fs.archive_source().unwrap()]).unwrap();
+    let late = capture_full(vec![rig.fs.archive_source().unwrap()]).unwrap();
 
     // The source continues; a payload written after that is refused.
     rig.resume();
@@ -403,7 +408,7 @@ fn snapshot_fs_archive_multiple_shares_keep_links_roots_and_modes() {
     let nested = device_on(&a.join("sub"), false);
     let shared = device_on(&a, false);
 
-    let archive = ShareArchive::capture(vec![
+    let archive = capture_full(vec![
         ra.fs.archive_source().unwrap(),
         rb.fs.archive_source().unwrap(),
         nested.archive_source().unwrap(),
@@ -501,7 +506,7 @@ fn snapshot_fs_archive_restores_handle_only_and_map_only_orphans() {
 
     let checkpoint = fs.checkpoint_with_dax(Some(w.dax())).unwrap();
     let source = ShareSource::active(&cfg, &fs, 0, checkpoint);
-    let archive = ShareArchive::capture(vec![source]).unwrap();
+    let archive = capture_full(vec![source]).unwrap();
     let pl = payloads(&archive);
     let dest = base.path().join("dest");
     let imported = import(archive.manifest(), &dest, &pl).unwrap();
@@ -767,7 +772,7 @@ fn snapshot_fs_archive_capture_refuses_what_import_cannot_reproduce() {
     let f = fs.lookup(CTX, fuse::ROOT_ID, &cstr("f")).unwrap();
     fs.open(CTX, f.inode, false, libc::O_RDONLY as u32).unwrap();
     fs::rename(inside.join("f"), outside.join("f")).unwrap();
-    let result = ShareArchive::capture(vec![ShareSource::active(
+    let result = capture_full(vec![ShareSource::active(
         &cfg,
         &fs,
         0,
@@ -815,7 +820,7 @@ fn malformed_base(base: &Path) -> (ArchiveManifest, Payloads) {
     fs.open(CTX, f.inode, false, libc::O_RDONLY as u32).unwrap();
     let (dir, _) = fs.opendir(CTX, fuse::ROOT_ID, 0).unwrap();
     names(&fs, dir.unwrap(), 0, 4096);
-    let archive = ShareArchive::capture(vec![ShareSource::active(
+    let archive = capture_full(vec![ShareSource::active(
         &cfg,
         &fs,
         0,
@@ -1283,7 +1288,7 @@ fn eleven_names(base: &Path) -> (ShareArchive, Payloads) {
     fs.open(CTX, orphan.inode, false, libc::O_RDONLY as u32)
         .unwrap();
     fs.unlink(CTX, fuse::ROOT_ID, &cstr("orphan")).unwrap();
-    let archive = ShareArchive::capture(vec![ShareSource::active(
+    let archive = capture_full(vec![ShareSource::active(
         &cfg,
         &fs,
         0,
@@ -1394,7 +1399,7 @@ fn snapshot_fs_archive_inactive_device_keeps_dax_window_and_init() {
     let mut device = Rig::device(&src);
     device.set_shm_region(w.shm());
     w.write(p + 3, b"pre-activation");
-    let archive = ShareArchive::capture(vec![device.archive_source().unwrap()]).unwrap();
+    let archive = capture_full(vec![device.archive_source().unwrap()]).unwrap();
     let session = &archive.manifest().shares[0].session;
     assert!(session.state.nodes.is_empty());
     assert_eq!(session.dax_pages, vec![p]);
@@ -1414,7 +1419,7 @@ fn snapshot_fs_archive_inactive_device_keeps_dax_window_and_init() {
     // A share keeps serving the archived init.krun, also after a reset.
     let mut cfg = snapshot_config(&src);
     cfg.init_binary = Some(Arc::from(&b"archived init"[..]));
-    let archive = ShareArchive::capture(vec![ShareSource::inactive(&cfg, None).unwrap()]).unwrap();
+    let archive = capture_full(vec![ShareSource::inactive(&cfg, None).unwrap()]).unwrap();
     assert_eq!(archive.manifest().inits, vec![13]);
     let pl = payloads(&archive);
     let imported = import(archive.manifest(), &base.path().join("init"), &pl).unwrap();
@@ -1453,7 +1458,7 @@ fn snapshot_fs_archive_guard_stops_held_devices_before_removing_the_tree() {
     rig.init();
     rig.lookup(fuse::ROOT_ID, "f");
     let queues = rig.freeze();
-    let archive = ShareArchive::capture(vec![rig.fs.archive_source().unwrap()]).unwrap();
+    let archive = capture_full(vec![rig.fs.archive_source().unwrap()]).unwrap();
     let p = payloads(&archive);
 
     let held = |dest: &Path| {
@@ -1504,7 +1509,7 @@ fn snapshot_fs_archive_dropped_guard_leaves_held_windows_alone() {
     let w = Window::new(4);
     let rig = mapped_rig(&src, &w);
     let queues = rig.freeze();
-    let archive = ShareArchive::capture(vec![rig.fs.archive_source().unwrap()]).unwrap();
+    let archive = capture_full(vec![rig.fs.archive_source().unwrap()]).unwrap();
     let pl = payloads(&archive);
     let mut imported = import(archive.manifest(), &base.path().join("dest"), &pl).unwrap();
     let target = Window::new(4);
@@ -1593,7 +1598,7 @@ fn snapshot_fs_archive_walks_each_share_through_its_own_mount() {
             .iter()
             .map(|cfg| ShareSource::inactive(cfg, None).unwrap())
             .collect();
-        ShareArchive::capture(sources)
+        capture_full(sources)
     };
 
     // One directory seen through two mounts: one tree of single objects.
@@ -1835,3 +1840,147 @@ fn snapshot_fs_archive_capture_needs_every_xattr_visible() {
         }]
     );
 }
+
+#[test]
+fn snapshot_fs_archive_guest_visible_contract_limits_owners_and_xattrs() {
+    let base = TempDir::new();
+    let src = base.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), b"").unwrap();
+    let mut m = capture_dir(&src).unwrap().manifest().clone();
+    let f = object_at(&m, &["f"]) as usize;
+    let (uid, gid) = (m.objects[f].uid, m.objects[f].gid);
+    m.contract = ArchiveContract::GuestVisible { uid, gid };
+    m.validate().unwrap();
+    let xattr = |name: &str, value: Vec<u8>| ArchivedXattr {
+        name: name.as_bytes().to_vec(),
+        value,
+    };
+    let own = |user: u32, group: u32| {
+        acl(&[
+            (0x01, 6, !0),
+            (0x02, 6, user),
+            (0x04, 4, !0),
+            (0x08, 4, group),
+            (0x10, 6, !0),
+            (0x20, 4, !0),
+        ])
+    };
+    let check = |change: &dyn Fn(&mut ArchivedObject), why: Option<&str>| {
+        let mut changed = m.clone();
+        change(&mut changed.objects[f]);
+        match (changed.validate(), why) {
+            (Ok(_), None) => {}
+            (Err(ArchiveError::Invalid(got)), Some(why)) => assert!(got.contains(why), "{got}"),
+            (result, why) => panic!("{why:?}: {:?}", result.err()),
+        }
+        // Full attributes keep anything.
+        changed.contract = ArchiveContract::FullAttributes;
+        changed.validate().unwrap();
+    };
+    check(&|o| o.xattrs = vec![xattr("user.a", b"1".to_vec())], None);
+    check(
+        &|o| o.xattrs = vec![xattr("system.posix_acl_access", own(uid, gid))],
+        None,
+    );
+    check(&|o| o.uid = uid + 5, Some("owner"));
+    check(&|o| o.gid = gid + 5, Some("owner"));
+    for name in [
+        "trusted.overlay.opaque",
+        "security.selinux",
+        "security.capability",
+    ] {
+        check(
+            &|o| o.xattrs = vec![xattr(name, b"x".to_vec())],
+            Some("outside user.*"),
+        );
+    }
+    let mut bad_version = own(uid, gid);
+    bad_version[0] = 1;
+    let mut ragged = own(uid, gid);
+    ragged.push(0);
+    for value in [
+        own(uid + 5, gid),
+        own(uid, gid + 5),
+        bad_version,
+        ragged,
+        Vec::new(),
+    ] {
+        check(
+            &|o| o.xattrs = vec![xattr("system.posix_acl_default", value.clone())],
+            Some("POSIX ACL"),
+        );
+    }
+}
+
+#[test]
+fn snapshot_fs_archive_guest_visible_import_needs_the_recorded_identity() {
+    let base = TempDir::new();
+    let src = base.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), b"bytes").unwrap();
+    let archive = capture_dir(&src).unwrap();
+    let p = payloads(&archive);
+    let mut m = archive.manifest().clone();
+    let (uid, gid) = (m.objects[0].uid, m.objects[0].gid);
+    m.contract = ArchiveContract::GuestVisible { uid: uid + 1, gid };
+    for object in &mut m.objects {
+        object.uid = uid + 1;
+    }
+    m.validate().unwrap();
+    let dest = base.path().join("dest");
+    match import(&m, &dest, &p) {
+        Err(ArchiveError::Unsupported(why)) => assert!(why.contains("identity"), "{why}"),
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(!dest.exists());
+    // The recorded identity imports.
+    let mut m = archive.manifest().clone();
+    m.contract = ArchiveContract::GuestVisible { uid, gid };
+    let imported = import(&m, &dest, &p).unwrap();
+    assert_eq!(fs::read(imported.root(0).join("f")).unwrap(), b"bytes");
+}
+
+/// A privileged guest-visible capture refuses what an unprivileged import
+/// could not recreate (visible trusted.* xattrs, foreign owners) instead
+/// of dropping it.
+#[test]
+fn snapshot_fs_archive_guest_visible_capture_refuses_instead_of_dropping() {
+    let base = TempDir::new();
+    let visible = |dir: &Path| {
+        let cfg = snapshot_config(dir);
+        ShareArchive::capture(
+            vec![ShareSource::inactive(&cfg, None).unwrap()],
+            ArchiveMode::GuestVisible,
+        )
+    };
+    let refused = |result: Result<ShareArchive, ArchiveError>, why: &str| match result {
+        Err(ArchiveError::Unsupported(got)) => assert!(got.contains(why), "{got}"),
+        other => panic!("{why}: {:?}", other.err()),
+    };
+    let trusted = base.path().join("trusted");
+    fs::create_dir(&trusted).unwrap();
+    fs::write(trusted.join("f"), b"").unwrap();
+    set_xattr(&trusted.join("f"), "trusted.hidden", b"x");
+    refused(visible(&trusted), "outside user.*");
+    let foreign = base.path().join("foreign");
+    fs::create_dir(&foreign).unwrap();
+    fs::write(foreign.join("f"), b"").unwrap();
+    lchown(&foreign.join("f"), 5, 5);
+    refused(visible(&foreign), "owner");
+    let plain = base.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    fs::write(plain.join("f"), b"").unwrap();
+    let archive = visible(&plain).unwrap();
+    // Safe because these calls only return the effective IDs.
+    let ids = unsafe { (libc::geteuid(), libc::getegid()) };
+    assert_eq!(
+        archive.manifest().contract,
+        ArchiveContract::GuestVisible {
+            uid: ids.0,
+            gid: ids.1
+        }
+    );
+}
+
+mod rootless;

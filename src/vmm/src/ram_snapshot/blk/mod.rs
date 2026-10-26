@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use vm_memory::GuestMemoryMmap;
 
 use super::wiring::{self, MMIO_LEN};
-use super::{Error, RamSnapshotVm, Region, Result, CHUNK_SIZE};
+use super::{CreatedName, Error, RamSnapshotVm, Region, Result, CHUNK_SIZE};
 
 /// Fixed internal MMIO window for snapshot disks, above ordinary guest RAM.
 pub(super) const MMIO_BASE: u64 = 0xd000_0000;
@@ -76,6 +76,11 @@ pub(super) fn expected_alias_clones(vm: &RamSnapshotVm) -> usize {
         .iter()
         .map(|device| 1 + usize::from(device.block.lock().unwrap().is_activated()) * 2)
         .sum()
+}
+
+/// Disk `index`'s fixed (MMIO address, GSI).
+pub(super) fn slot_of(index: usize) -> (u64, u32) {
+    (MMIO_BASE + index as u64 * MMIO_LEN, IRQ_BASE + index as u32)
 }
 
 /// Metadata-only validation: everything checkable before guest RAM or any
@@ -203,8 +208,7 @@ pub(super) fn attach_disk(
         // no guest has run yet).
         vm.probe_ram_aliases(vm.expected_device_clones())?;
         let index = vm.disks.len();
-        let mmio_addr = MMIO_BASE + index as u64 * MMIO_LEN;
-        let irq = IRQ_BASE + index as u32;
+        let (mmio_addr, irq) = slot_of(index);
         let ioapic = vm.ensure_kernel_irqchip()?;
         let cache = if writeback {
             CacheType::Writeback
@@ -389,7 +393,9 @@ pub(super) fn copy_disk_segments(
 /// modified or removed.
 pub(super) struct ImportedDir {
     path: PathBuf,
-    files: Vec<PathBuf>,
+    /// The directory and the segment files this import created; None once
+    /// handed over.
+    created: Option<(CreatedName, Vec<CreatedName>)>,
 }
 
 impl ImportedDir {
@@ -399,14 +405,16 @@ impl ImportedDir {
             .mode(0o700)
             .create(path)
             .map_err(|e| Error::Full(format!("create import destination: {e}")))?;
+        // No descriptor: the identity comes from the name right away.
+        let dir = CreatedName::new(path, &fs::symlink_metadata(path)?);
         Ok(Self {
             path: path.to_owned(),
-            files: Vec::new(),
+            created: Some((dir, Vec::new())),
         })
     }
 
-    /// Create the next exclusive 0600 numbered file; its path is tracked
-    /// before any byte is written so partial writes are cleaned up too.
+    /// Create the next exclusive 0600 numbered file; it is tracked before
+    /// any byte is written so partial writes are cleaned up too.
     fn create_segment_file(&mut self, index: usize) -> Result<File> {
         let path = self.path.join(format!("disk-{index}.raw"));
         let file = OpenOptions::new()
@@ -415,17 +423,28 @@ impl ImportedDir {
             .mode(0o600)
             .open(&path)
             .map_err(|e| Error::Full(format!("create imported disk: {e}")))?;
-        self.files.push(path);
+        let created = CreatedName::new(&path, &file.metadata()?);
+        if let Some((_, files)) = &mut self.created {
+            files.push(created);
+        }
         Ok(file)
+    }
+
+    /// Hand the directory and its disk files over to the caller: they are
+    /// never removed anymore.
+    pub(super) fn hand_over(mut self) {
+        self.created = None;
     }
 }
 
 impl Drop for ImportedDir {
     fn drop(&mut self) {
-        for path in &self.files {
-            let _ = fs::remove_file(path);
+        if let Some((dir, files)) = self.created.take() {
+            for file in files.iter().rev() {
+                file.remove();
+            }
+            dir.remove();
         }
-        let _ = fs::remove_dir(&self.path);
     }
 }
 

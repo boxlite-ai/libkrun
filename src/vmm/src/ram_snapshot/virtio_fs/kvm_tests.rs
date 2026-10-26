@@ -133,6 +133,7 @@ fn share(source: &Path, dax: Option<DaxRange>) -> FsShareConfig {
         source: source.to_owned(),
         read_only: false,
         allow_root_dir_delete: false,
+        vm_owned: false,
         dax,
     }
 }
@@ -264,6 +265,36 @@ fn snapshot_fs_kvm_exports_need_host_writers_declared_stopped() {
     vm.pause().unwrap();
     assert!(vm.export(&refused).is_err(), "resume cleared it");
     assert!(!refused.exists());
+}
+
+/// The archive mode is chosen before the CPUs start; a guest-visible
+/// export records the exporter's IDs in the image, and the imported owner
+/// keeps exporting in that mode.
+#[test]
+fn snapshot_fs_kvm_archive_mode_is_set_before_start_and_kept_by_import() {
+    let dir = TempDir::new();
+    let src = share_dir(&dir);
+    let mut vm = fixture();
+    vm.attach_fs(share(&src, Some(DAX))).unwrap();
+    vm.set_fs_archive_mode(ArchiveMode::GuestVisible).unwrap();
+    vm.start_vcpus(1, MMIO_ENTRY).unwrap();
+    assert!(vm.set_fs_archive_mode(ArchiveMode::FullAttributes).is_err());
+    vm.declare_host_writers_stopped().unwrap();
+    vm.pause().unwrap();
+    let image = dir.path("image");
+    vm.export(&image).unwrap();
+    let bytes = fs::read(&image).unwrap();
+    let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let json: serde_json::Value = serde_json::from_slice(&bytes[16..16 + len]).unwrap();
+    // SAFETY: these calls only return the effective IDs.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    assert_eq!(
+        json["fs"]["archive"]["contract"],
+        serde_json::json!({"guest_visible": {"uid": uid, "gid": gid}})
+    );
+    drop(vm);
+    let target = RamSnapshotVm::import(&image, resources(&dir.path("shares"))).unwrap();
+    assert_eq!(target.fs_archive_mode, ArchiveMode::GuestVisible);
 }
 
 /// Attachments are checked whichever comes first: a DAX window over RAM,

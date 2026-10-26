@@ -22,17 +22,25 @@
 //!
 //! A failed DAX window remapping ends guest execution on its own (see
 //! `execution`); the next pause, resume, export or declaration disables
-//! the owner, joining every thread, and fails. A pause also fails when one
+//! the owner, joining every thread, and fails.
+//!
+//! How execution ended is `run_state`: a guest exit (with the code init
+//! set through virtio-fs, else the exiting vCPU's), a host-side failure, or
+//! an owner `stop` or disable. `ExitWaiter` waits for that end without
+//! borrowing the owner. A pause also fails when one
 //! failed before the workers froze, and a resume when one failed while the
 //! devices resumed (a resumed worker may run queued DAX requests), before
 //! any vCPU resumes, and again before it reports success.
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
 use devices::virtio::persist::QueueState;
 
-use super::{console, virtio_fs, vsock, wiring};
+use super::{console, events, virtio_fs, vsock, wiring};
 use super::{Control, Error, RamSnapshotVm, Result, CONTROL_TIMEOUT};
 
 #[cfg(feature = "blk")]
@@ -45,6 +53,38 @@ thread_local! {
     /// Fail the execution barrier once the devices resumed, as a resumed
     /// worker's queued DAX request whose host call fails does.
     pub(super) static FAIL_REMAPPING_ON_RESUME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Where an owner's guest execution stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunState {
+    /// vCPUs run; an exit not yet latched still shows as running.
+    Running,
+    /// A confirmed pause holds every vCPU and device.
+    Paused,
+    /// The guest ended execution (reset, shutdown or a vCPU exit) with
+    /// this status: the code init set through virtio-fs, else the exiting
+    /// vCPU's, else 0, as the ordinary VMM reports it.
+    Exited(i32),
+    /// A host-side failure ended guest execution: a vsock backend that
+    /// could not reopen or a failed DAX window remapping.
+    Failed,
+    /// `stop` ended execution, or an uncertain control operation disabled
+    /// the owner, before any exit; or vCPUs never started.
+    Stopped,
+}
+
+/// Waits for an owner's guest execution to end, without borrowing it.
+#[derive(Clone)]
+pub(crate) struct ExitWaiter(Arc<events::Exit>);
+
+impl ExitWaiter {
+    /// Block until the guest exited or failed, or the owner stopped every
+    /// thread, or `timeout` passed (None waits for ever); returns whether
+    /// execution ended. `RamSnapshotVm::run_state` then tells how.
+    pub(crate) fn wait(&self, timeout: Option<Duration>) -> bool {
+        self.0.wait(timeout)
+    }
 }
 
 /// What a confirmed pause holds until resume.
@@ -132,6 +172,60 @@ impl RamSnapshotVm {
         }
         self.pause = None;
         Ok(())
+    }
+
+    /// How guest execution stands; an ended guest's status is fixed the
+    /// first time it is examined.
+    pub(crate) fn run_state(&mut self) -> RunState {
+        if self.exit.failed() || self.execution.failed() {
+            return RunState::Failed;
+        }
+        if self.exit.requested() {
+            return RunState::Exited(self.exit_status());
+        }
+        if self.control.unusable || self.handles.is_empty() {
+            return RunState::Stopped;
+        }
+        if self.pause.is_some() {
+            RunState::Paused
+        } else {
+            RunState::Running
+        }
+    }
+
+    /// The ended guest's status: the code init set through a virtio-fs
+    /// share, else the code of the vCPU that exited, else 0 (an i8042
+    /// reset), as the ordinary VMM reports it.
+    fn exit_status(&mut self) -> i32 {
+        if let Some(status) = self.exit_status {
+            return status;
+        }
+        let guest = self.exit_code.load(Ordering::SeqCst);
+        let status = if guest != i32::MAX {
+            guest
+        } else {
+            self.handles
+                .iter()
+                .flat_map(|handle| handle.response_receiver().try_iter())
+                .find_map(|response| match response {
+                    crate::vstate::VcpuResponse::Exited(code) => Some(i32::from(code)),
+                    _ => None,
+                })
+                .unwrap_or(i32::from(crate::FC_EXIT_CODE_OK))
+        };
+        self.exit_status = Some(status);
+        status
+    }
+
+    pub(crate) fn exit_waiter(&self) -> ExitWaiter {
+        ExitWaiter(self.exit.clone())
+    }
+
+    /// End guest execution for good: stop and join every thread, paused or
+    /// running. Exports, pauses and resumes are refused afterwards; the
+    /// owner keeps its resources until it drops. Idempotent.
+    pub(crate) fn stop(&mut self) {
+        self.disable();
     }
 
     /// Whether a confirmed pause holds the owner.

@@ -2,15 +2,20 @@
 
 //! Full checkpoints for the private minimal owner, independent of KRUNRAM.
 //!
-//! Every full image uses one format, version 7 (`KRUNVM\0\0`), with or
-//! without devices: header, bounded JSON state, RAM payload, one raw
-//! segment per disk, then the virtio-fs file, init.krun and DAX page
+//! Every full image is written in one format, version 8 (`KRUNVM\0\0`),
+//! with or without devices: header, bounded JSON state, RAM payload, one
+//! raw segment per disk, then the virtio-fs file, init.krun and DAX page
 //! payloads. The JSON holds CPU, KVM and RAM state, the ordered disk table
 //! and the optional NIC, RNG, balloon, vsock, console, legacy-device
-//! (UARTs, CMOS, i8042) and virtio-fs sections. Versions 1–6 are rejected
-//! explicitly.
+//! (UARTs, CMOS, i8042) and virtio-fs sections; the virtio-fs archive
+//! manifest records its contract (archive mode and restore identity), and
+//! the section the guest's exit code. Version 7 is the same format without
+//! that contract or exit code: every version 7 archive was captured with
+//! full attributes, so it is read as one, with the exit code unset.
+//! Versions 1–6 are rejected explicitly.
 
 use super::*;
+use crate::ram_snapshot::boot::NewConsoleOutput;
 use crate::ram_snapshot::console::{self, ConsoleMeta};
 use crate::ram_snapshot::event_devices::{self, BalloonMeta, DeviceMeta};
 use crate::ram_snapshot::events;
@@ -20,9 +25,12 @@ use crate::ram_snapshot::vsock::{self, VsockMeta};
 use crate::vstate::snapshot::{self, Compatibility, CpuState, Request};
 use crate::vstate::VmState;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const FULL_VERSION: u32 = 7;
+const FULL_VERSION: u32 = 8;
+/// The last version without a virtio-fs archive contract.
+const CONTRACTLESS_VERSION: u32 = 7;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
@@ -176,18 +184,19 @@ fn device_slots(metadata: &Metadata) -> Vec<u64> {
     slots
 }
 
-/// Read and check the fixed header; returns the JSON length.
-fn read_header(file: &mut File) -> Result<usize> {
+/// Read and check the fixed header; returns the version and JSON length.
+fn read_header(file: &mut File) -> Result<(u32, usize)> {
     let mut header = [0; 16];
     file.read_exact(&mut header)?;
     if &header[..8] != FULL_MAGIC {
         return Err(Error::Invalid("invalid/incomplete full snapshot"));
     }
-    match u32::from_le_bytes(header[8..12].try_into().unwrap()) {
-        FULL_VERSION => {}
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    match version {
+        FULL_VERSION | CONTRACTLESS_VERSION => {}
         old @ 1..=6 => {
             return Err(Error::Full(format!(
-                "full snapshot version {old} predates the unified version {FULL_VERSION} and is not supported"
+                "full snapshot version {old} predates the unified version {CONTRACTLESS_VERSION} and is not supported"
             )))
         }
         _ => return Err(Error::Invalid("unsupported full snapshot version")),
@@ -196,17 +205,29 @@ fn read_header(file: &mut File) -> Result<usize> {
     if len == 0 || len > MAX_METADATA {
         return Err(Error::Invalid("full metadata exceeds 16 MiB or is empty"));
     }
-    Ok(len)
+    Ok((version, len))
+}
+
+/// The metadata of a `version` image: version 7 JSON is upgraded first.
+fn decode_metadata(version: u32, encoded: &[u8]) -> Result<Metadata> {
+    let json = |e: serde_json::Error| Error::Full(format!("metadata JSON: {e}"));
+    if version == FULL_VERSION {
+        return serde_json::from_slice(encoded).map_err(json);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(encoded).map_err(json)?;
+    if let Some(fs) = value.get_mut("fs") {
+        virtio_fs::upgrade_contractless(fs)?;
+    }
+    serde_json::from_value(value).map_err(json)
 }
 
 /// Read the metadata and validate everything checkable before guest RAM or
 /// any target resource exists, including the exact total length.
 fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<Metadata> {
-    let len = read_header(file)?;
+    let (version, len) = read_header(file)?;
     let mut encoded = vec![0; len];
     file.read_exact(&mut encoded)?;
-    let metadata: Metadata =
-        serde_json::from_slice(&encoded).map_err(|e| Error::Full(format!("metadata JSON: {e}")))?;
+    let metadata = decode_metadata(version, &encoded)?;
     if metadata.cpus.is_empty() || metadata.cpus.len() > max_cpus.min(snapshot::MAX_CPUS) {
         return Err(Error::Invalid(
             "full snapshot vCPU count exceeds target capacity or is zero",
@@ -308,18 +329,53 @@ fn validate_rings(metadata: &Metadata, memory: &GuestMemoryMmap) -> Result<()> {
     Ok(())
 }
 
+/// Refuse an image of `len` bytes that this process may not write in full.
+/// A write past `RLIMIT_FSIZE` raises SIGXFSZ, which would kill the owner
+/// instead of failing the export, so the limit is checked before the file
+/// exists.
+fn check_file_size_limit(len: u64) -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid rlimit for the call to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) } != 0 {
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    if limit.rlim_cur != libc::RLIM_INFINITY && len > limit.rlim_cur {
+        return Err(Error::Full(format!(
+            "the image needs {len} bytes, above this process's file size limit of {} bytes",
+            limit.rlim_cur
+        )));
+    }
+    Ok(())
+}
+
 /// Create the 0600 exclusive image with an invalid magic placeholder, then
-/// write the header, JSON state, RAM, disk segments and share payloads.
+/// write the header, JSON state, RAM, disk segments and the
+/// `share_payloads` bytes of share payloads.
 fn write_pending(
     path: &Path,
     memory: &GuestMemoryMmap,
     metadata: &Metadata,
     #[cfg(feature = "blk")] disks: &[blk::BlkDevice],
     shares: Option<&devices::virtio::fs::passthrough::ShareArchive>,
+    share_payloads: u64,
 ) -> Result<PendingSnapshot> {
     let mut encoded = BoundedMetadata(Vec::new());
     serde_json::to_writer(&mut encoded, metadata)
         .map_err(|e| Error::Full(format!("metadata encoding: {e}")))?;
+    let segments = disk_segments_len(&metadata.disks)?;
+    let len = metadata
+        .regions
+        .iter()
+        .try_fold(16 + encoded.0.len() as u64, |total, region| {
+            total.checked_add(region.len)
+        })
+        .and_then(|total| total.checked_add(segments))
+        .and_then(|total| total.checked_add(share_payloads))
+        .ok_or(Error::Invalid("full snapshot length overflow"))?;
+    check_file_size_limit(len)?;
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -409,8 +465,9 @@ impl RamSnapshotVm {
     /// state request: that uncertain control disables the owner and stops
     /// every thread. With virtio-fs shares the caller must have declared
     /// every host writer stopped (`declare_host_writers_stopped`); the
-    /// shares are archived as they are at the cut, and a share whose DAX
-    /// window was lost disables the owner.
+    /// shares are archived as they are at the cut in the owner's archive
+    /// mode (`set_fs_archive_mode`), and a share whose DAX window was lost
+    /// disables the owner.
     pub(crate) fn export(&mut self, path: &Path) -> Result<()> {
         self.check_execution()?;
         // Only worker devices retain cursors.
@@ -445,7 +502,13 @@ impl RamSnapshotVm {
             return Err(Error::Invalid("a virtio-fs share lost its DAX window"));
         }
         let paused = self.pause.as_ref().expect("checked above");
-        let (fs, shares) = virtio_fs::capture(&self.fs, &paused.fs)?.unzip();
+        let (fs, shares) = virtio_fs::capture(
+            &self.fs,
+            &paused.fs,
+            self.fs_archive_mode,
+            self.exit_code.load(Ordering::SeqCst),
+        )?
+        .unzip();
         let cpus = match self.save_cpus(&compatibility) {
             Err(unanswered @ Error::Control(_)) => {
                 self.disable();
@@ -468,15 +531,19 @@ impl RamSnapshotVm {
             legacy,
             fs,
         };
-        if let Some(meta) = &metadata.fs {
-            virtio_fs::validate_metadata(
-                meta,
-                &metadata.regions,
-                &device_slots(&metadata),
-                self.max_slots,
-            )?;
-            virtio_fs::validate_rings(meta, &self.memory)?;
-        }
+        let share_payloads = match &metadata.fs {
+            Some(meta) => {
+                let lengths = virtio_fs::validate_metadata(
+                    meta,
+                    &metadata.regions,
+                    &device_slots(&metadata),
+                    self.max_slots,
+                )?;
+                virtio_fs::validate_rings(meta, &self.memory)?;
+                virtio_fs::payload_len(lengths)?
+            }
+            None => 0,
+        };
         write_pending(
             path,
             &self.memory,
@@ -484,6 +551,7 @@ impl RamSnapshotVm {
             #[cfg(feature = "blk")]
             &self.disks,
             shares.as_ref(),
+            share_payloads,
         )?
         .finish(FULL_MAGIC)
     }
@@ -557,14 +625,18 @@ impl RamSnapshotVm {
     /// dropped-output counts start at zero. The vsock takes the caller's
     /// `resources.vsock_ports` paths and keeps its backend stopped with the
     /// transport reset still owed until `resume`. The console takes the
-    /// caller's `resources.console_ports` endpoints without any endpoint
-    /// I/O or new guest handshake; its open ports come back with frozen
+    /// caller's `resources.console_ports` endpoints (a new output file is
+    /// the first resource the import creates) without any endpoint I/O or
+    /// new guest handshake; its open ports come back with frozen
     /// workers holding the saved EOF and partial-TX offsets. The virtio-fs
     /// shares are imported into the new 0700 `resources.fs_dir` (an
     /// existing directory is refused untouched), each DAX window is mapped
     /// and its session restored before any vCPU thread exists, and the
     /// imported tree is kept once the import succeeds; host writers start
-    /// declared stopped, since only the owner uses those copies.
+    /// declared stopped, since only the owner uses those copies. A
+    /// guest-visible archive is refused before anything exists unless this
+    /// process has the effective IDs it recorded, and the owner keeps the
+    /// image's archive mode for later exports.
     pub(crate) fn import(path: &Path, mut resources: RestoreResources) -> Result<Self> {
         let kvm = KvmContext::new().map_err(Error::State)?;
         let mut file = File::open(path)?;
@@ -577,7 +649,9 @@ impl RamSnapshotVm {
         if let (Some(meta), Some(ports)) = (&metadata.vsock, &resources.vsock_ports) {
             vsock::check_resources(meta, ports)?;
         }
-        if let (Some(meta), Some(ports)) = (&metadata.console, &resources.console_ports) {
+        if let (Some(meta), Some(ConsoleEndpoints::Ports(ports))) =
+            (&metadata.console, &resources.console_ports)
+        {
             console::check_resources(meta, ports)?;
         }
         if let Some(serial) = &resources.serial {
@@ -586,10 +660,30 @@ impl RamSnapshotVm {
         if let Some(dir) = &resources.fs_dir {
             virtio_fs::check_fs_dir(dir)?;
         }
+        let fs_mode = metadata
+            .fs
+            .as_ref()
+            .map(virtio_fs::imported_mode)
+            .transpose()?;
         let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
         // RAM first (file order), then every ring against the loaded memory.
         let memory = read_ram(&mut file, &metadata.regions)?;
         validate_rings(&metadata, &memory)?;
+        // The first resource the import creates: a new console output file,
+        // checked like given ports and removed again unless the import
+        // succeeds (declared before the owner, so it outlives the owner's
+        // console workers).
+        let (console_output, console_ports) = match resources.console_ports.take() {
+            Some(ConsoleEndpoints::NewOutput(path)) => {
+                let (created, ports) = NewConsoleOutput::create(&path)?;
+                if let Some(meta) = &metadata.console {
+                    console::check_resources(meta, &ports)?;
+                }
+                (Some(created), Some(ports))
+            }
+            Some(ConsoleEndpoints::Ports(ports)) => (None, Some(ports)),
+            None => (None, None),
+        };
         // The creation guard removes ONLY what this import itself created: a
         // pre-existing destination directory is an error and is never
         // modified. The owner takes the guard before any thread starts, so
@@ -609,6 +703,9 @@ impl RamSnapshotVm {
         };
         let mut owner = Self::restore_scaffold(&kvm, memory)?;
         owner.fs_import = shares;
+        if let Some(mode) = fs_mode {
+            owner.fs_archive_mode = mode;
+        }
         #[cfg(feature = "blk")]
         {
             owner.imported = imported;
@@ -622,7 +719,7 @@ impl RamSnapshotVm {
         if let (Some(meta), Some(ports)) = (&metadata.vsock, &resources.vsock_ports) {
             vsock::restore(&mut owner, meta, ports)?;
         }
-        if let (Some(meta), Some(ports)) = (&metadata.console, resources.console_ports.take()) {
+        if let (Some(meta), Some(ports)) = (&metadata.console, console_ports) {
             console::restore(&mut owner, meta, ports)?;
         }
         if let (Some(meta), Some(serial)) = (&metadata.legacy, resources.serial.take()) {
@@ -644,7 +741,13 @@ impl RamSnapshotVm {
         owner.pause = Some(owner.quiesce()?);
         owner.host_writers_stopped = true;
         if let Some(shares) = owner.fs_import.take() {
+            if let Some(meta) = &metadata.fs {
+                owner.restored_shares = virtio_fs::restored_roots(meta, &shares);
+            }
             shares.persist();
+        }
+        if let Some(output) = console_output {
+            output.keep();
         }
         Ok(owner)
     }

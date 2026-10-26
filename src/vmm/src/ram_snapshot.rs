@@ -4,8 +4,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,11 +17,13 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, Gues
 use crate::device_manager::shm::ShmRegion;
 use crate::vstate::{KvmContext, Vcpu, VcpuEvent, VcpuHandle, VcpuResponse, Vm};
 
+pub(crate) use boot::{check_resources, BootDevices, BootImage};
 pub(crate) use legacy::SerialEndpoints;
+pub(crate) use lifecycle::{ExitWaiter, RunState};
 // Callers of the private API name `DaxRange` for `FsShareConfig::dax`; so
 // far only its tests do.
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use virtio_fs::{DaxRange, FsShareConfig};
+pub(crate) use virtio_fs::{ArchiveMode, DaxRange, FsShareConfig};
 pub(crate) use vsock::VsockPorts;
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
@@ -31,6 +34,7 @@ const PAGE_SIZE: u64 = 4096;
 const CHUNK_SIZE: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
+mod boot;
 mod console;
 mod event_devices;
 mod events;
@@ -373,6 +377,39 @@ impl Control {
     }
 }
 
+/// A name an import created, with the identity (st_dev, st_ino) of the
+/// object it was created for, read from the creating descriptor or right
+/// after the creation: cleanup removes the name only while it still names
+/// that object, so a replacement at the same path stays.
+struct CreatedName {
+    path: PathBuf,
+    key: (u64, u64),
+}
+
+impl CreatedName {
+    fn new(path: &Path, created: &fs::Metadata) -> Self {
+        Self {
+            path: path.to_owned(),
+            key: (created.dev(), created.ino()),
+        }
+    }
+
+    /// Remove the name (a directory only when empty) if it still names the
+    /// created object.
+    fn remove(&self) {
+        match fs::symlink_metadata(&self.path) {
+            Ok(meta) if (meta.dev(), meta.ino()) == self.key => {
+                let _ = if meta.is_dir() {
+                    fs::remove_dir(&self.path)
+                } else {
+                    fs::remove_file(&self.path)
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Target resources a full restore needs. Images never name host paths or
 /// descriptors, so each device present in an image takes its new resource
 /// from here; a resource without its device, or a device without its
@@ -390,13 +427,24 @@ pub(crate) struct RestoreResources {
     /// New host socket paths of the vsock's ports; the ports and their
     /// roles must equal the image's.
     pub(crate) vsock_ports: Option<VsockPorts>,
-    /// Fresh console ports in the image's port order: names, directions
-    /// and input, output and terminal kinds must equal the image's.
-    pub(crate) console_ports: Option<Vec<devices::virtio::PortDescription>>,
+    /// The console's fresh endpoints.
+    pub(crate) console_ports: Option<ConsoleEndpoints>,
     /// New directory for the imported virtio-fs shares: an absolute path
     /// without NUL bytes, created exclusively with mode 0700 and kept once
     /// the import succeeds.
     pub(crate) fs_dir: Option<PathBuf>,
+}
+
+/// The endpoints a restored console takes.
+pub(crate) enum ConsoleEndpoints {
+    /// Fresh ports in the image's port order: names, directions and input,
+    /// output and terminal kinds must equal the image's.
+    Ports(Vec<devices::virtio::PortDescription>),
+    /// A booted VM's console port on this new output file. The import
+    /// creates it exclusively only after the image and every other
+    /// resource passed their checks (an existing file is refused untouched)
+    /// and removes it again if the import fails.
+    NewOutput(PathBuf),
 }
 
 /// Owns the minimal VM. No mapping, VM fd, or vCPU handle escapes this owner.
@@ -433,6 +481,9 @@ pub(crate) struct RamSnapshotVm {
     /// The caller declared every host writer of the shares stopped; held
     /// through a pause, cleared by resume and disable.
     host_writers_stopped: bool,
+    /// How exports archive the shares: full attributes unless set before
+    /// vCPU start; an imported owner keeps its image's mode.
+    fs_archive_mode: ArchiveMode,
     /// Every DAX window the owner mapped, in memslot order. Declared after
     /// `vm`: a window is unmapped only after the VM fd (and its memslot)
     /// closed.
@@ -440,6 +491,13 @@ pub(crate) struct RamSnapshotVm {
     /// Gates every KVM_RUN of an owner with a DAX window against the
     /// `MAP_FIXED` calls on its windows; see `execution`.
     execution: Arc<execution::ExecutionBarrier>,
+    /// The guest's exit code, set through any virtio-fs share
+    /// (`VIRTIO_IOC_EXIT_CODE`); `i32::MAX` until the guest sets one.
+    exit_code: Arc<AtomicI32>,
+    /// The exit status, fixed the first time an ended guest is examined.
+    exit_status: Option<i32>,
+    /// Each imported share's tag and root copy, except a VM-owned one.
+    restored_shares: Vec<(String, PathBuf)>,
 }
 
 impl RamSnapshotVm {
@@ -456,7 +514,8 @@ impl RamSnapshotVm {
         vm.memory_init(&memory, kvm.max_memslots())
             .map_err(Error::State)?;
         let exit = events::Exit::new()?;
-        let execution = execution::ExecutionBarrier::new(exit.notifier()?, execution::kick_vcpu);
+        let execution =
+            execution::ExecutionBarrier::new(exit.failure_notifier()?, execution::kick_vcpu);
         Ok(Self {
             handles: Vec::new(),
             vm,
@@ -484,8 +543,12 @@ impl RamSnapshotVm {
             fs: Vec::new(),
             fs_import: None,
             host_writers_stopped: false,
+            fs_archive_mode: ArchiveMode::FullAttributes,
             dax: Vec::new(),
             execution,
+            exit_code: Arc::new(AtomicI32::new(i32::MAX)),
+            exit_status: None,
+            restored_shares: Vec::new(),
         })
     }
 
@@ -517,6 +580,22 @@ impl RamSnapshotVm {
             return Err(Error::Invalid("the VM is exiting"));
         }
         write_ram_image(path, &self.memory, &self.topology, self.max_slots)
+    }
+
+    /// Hand an import's disk directory and files over to the caller: the
+    /// owner never removes them anymore.
+    #[cfg(feature = "blk")]
+    pub(crate) fn hand_over_imported_disks(&mut self) {
+        if let Some(imported) = self.imported.take() {
+            imported.hand_over();
+        }
+    }
+
+    /// Each imported share's tag and the root of its copy, in share order,
+    /// except the VM-owned boot root (removed with the owner); empty unless
+    /// imported.
+    pub(crate) fn restored_shares(&self) -> &[(String, PathBuf)] {
+        &self.restored_shares
     }
 
     /// Attach an internal disk (RAW/QCOW2/VMDK file) before vCPUs start.
@@ -573,6 +652,21 @@ impl RamSnapshotVm {
     /// `FsShareConfig`. Every check precedes any effect.
     pub(crate) fn attach_fs(&mut self, config: FsShareConfig) -> Result<()> {
         virtio_fs::attach(self, config)
+    }
+
+    /// Choose how exports archive the virtio-fs shares, before vCPUs start
+    /// (see `passthrough::ArchiveContract`): full attributes, the default,
+    /// needs CAP_SYS_ADMIN in the initial user namespace at export;
+    /// guest-visible works without privilege, records the effective IDs
+    /// the export runs with, and an import needs exactly those.
+    pub(crate) fn set_fs_archive_mode(&mut self, mode: ArchiveMode) -> Result<()> {
+        if self.control.unusable || !self.handles.is_empty() {
+            return Err(Error::Invalid(
+                "the virtio-fs archive mode is set only before vCPU start of a usable owner",
+            ));
+        }
+        self.fs_archive_mode = mode;
+        Ok(())
     }
 
     /// Declare that the caller stopped every host writer of the virtio-fs
@@ -739,6 +833,8 @@ impl RamSnapshotVm {
         if let Some(events) = &mut self.events {
             events.stop();
         }
+        // No exit can latch anymore: release every waiter.
+        self.exit.end();
         self.execution.retire();
         for handle in &mut self.handles {
             handle.finish();
@@ -785,20 +881,26 @@ impl RamSnapshotVm {
     /// Start a controlled real-mode RAM program, without boot loaders or devices.
     /// This initializes CPUs; it does not restore CPU state from a RAM image.
     pub(crate) fn start_vcpus(&mut self, count: u8, entry: u16) -> Result<()> {
+        self.start(count, |cpu| {
+            cpu.configure_minimal(entry, count).map_err(Error::State)
+        })
+    }
+
+    /// Start `count` vCPUs, each set up by `configure`, on the complete
+    /// buses; a failure stops every thread started here.
+    fn start(&mut self, count: u8, configure: impl FnMut(&mut Vcpu) -> Result<()>) -> Result<()> {
         if self.control.unusable
             || count == 0
             || count as usize > crate::vstate::snapshot::MAX_CPUS
             || !self.handles.is_empty()
         {
-            return Err(Error::Invalid("invalid minimal vCPU count/state"));
+            return Err(Error::Invalid("invalid vCPU count or owner state"));
         }
         self.control.unusable = true;
         let result = (|| {
             self.setup_irqchip()?;
             self.start_event_thread(events::Start::Running)?;
-            self.spawn_vcpus(count, |cpu| {
-                cpu.configure_minimal(entry, count).map_err(Error::State)
-            })?;
+            self.spawn_vcpus(count, configure)?;
             Control::transition(&self.handles, false, CONTROL_TIMEOUT)
         })();
         if result.is_err() {
@@ -815,8 +917,10 @@ impl Drop for RamSnapshotVm {
     fn drop(&mut self) {
         // The imported guards remove only the files they created, after
         // every thread has exited; the DAX windows unmap after the VM fd
-        // closed (field order).
+        // closed (field order). A VM-owned share root goes only now: the
+        // guest may run until the VM ends.
         self.stop_threads();
+        virtio_fs::remove_vm_owned_roots(&self.fs);
         #[cfg(feature = "blk")]
         drop(self.imported.take());
     }

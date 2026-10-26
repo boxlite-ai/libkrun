@@ -17,9 +17,9 @@ use super::super::{
 };
 use super::host::{self, Meta};
 use super::{
-    subtree, valid_entry_name, ArchiveError, ArchiveManifest, ArchivedEntry, ArchivedKind,
-    ArchivedObject, ArchivedSession, ArchivedShare, ArchivedTime, ObjectView, PayloadLengths,
-    MAX_SYMLINK_LEN,
+    subtree, valid_entry_name, ArchiveContract, ArchiveError, ArchiveManifest, ArchiveMode,
+    ArchivedEntry, ArchivedKind, ArchivedObject, ArchivedSession, ArchivedShare, ArchivedTime,
+    ObjectView, PayloadLengths, MAX_SYMLINK_LEN,
 };
 
 /// Chunk size for streaming file bytes.
@@ -101,8 +101,8 @@ pub struct ShareArchive {
     lengths: PayloadLengths,
 }
 
-#[derive(Default)]
 struct Builder {
+    contract: ArchiveContract,
     objects: Vec<ArchivedObject>,
     files: Vec<File>,
     sources: Vec<Meta>,
@@ -116,7 +116,30 @@ fn unsupported<T>(why: &'static str) -> Result<T, ArchiveError> {
     Err(ArchiveError::Unsupported(why))
 }
 
+/// A permission failure reading the source fails the capture as
+/// unsupported: the archive would miss what the guest can see.
+fn readable<T>(result: io::Result<T>) -> Result<T, ArchiveError> {
+    result.map_err(|e| match e.raw_os_error() {
+        Some(libc::EACCES | libc::EPERM) => {
+            ArchiveError::Unsupported("object the capturing service cannot read")
+        }
+        _ => ArchiveError::Io(e),
+    })
+}
+
 impl Builder {
+    fn new(contract: ArchiveContract) -> Self {
+        Builder {
+            contract,
+            objects: Vec::new(),
+            files: Vec::new(),
+            sources: Vec::new(),
+            index: HashMap::new(),
+            listed: Vec::new(),
+            parent: HashMap::new(),
+        }
+    }
+
     /// The archived object of host object `file` (`meta` its statx taken
     /// before anything reads it), captured on first sight, when the table
     /// keeps its own descriptor of it.
@@ -124,12 +147,18 @@ impl Builder {
         if let Some(&id) = self.index.get(&meta.key()) {
             return Ok(id);
         }
-        let xattrs = host::xattrs(file)?;
+        let xattrs = readable(host::xattrs(file))?;
         let kind = match meta.kind() {
             libc::S_IFDIR => ArchivedKind::Directory {
                 entries: Vec::new(),
             },
-            libc::S_IFREG => ArchivedKind::Regular { size: meta.size },
+            libc::S_IFREG => {
+                if self.contract != ArchiveContract::FullAttributes {
+                    // Its bytes are read only when the payload is written.
+                    readable(host::reopen_noatime(file, libc::O_RDONLY))?;
+                }
+                ArchivedKind::Regular { size: meta.size }
+            }
             libc::S_IFLNK => {
                 // readlink may update the symlink's atime; it was captured
                 // above.
@@ -142,8 +171,7 @@ impl Builder {
             libc::S_IFCHR if meta.rdev == 0 => ArchivedKind::Whiteout,
             _ => return unsupported("special file (FIFO, socket or device)"),
         };
-        let id = self.objects.len() as u64;
-        self.objects.push(ArchivedObject {
+        let object = ArchivedObject {
             kind,
             mode: meta.mode & 0o7777,
             uid: meta.uid,
@@ -151,7 +179,12 @@ impl Builder {
             atime: meta.atime,
             mtime: meta.mtime,
             xattrs,
-        });
+        };
+        if let Some(why) = self.contract.refuses(&object) {
+            return unsupported(why);
+        }
+        let id = self.objects.len() as u64;
+        self.objects.push(object);
         self.files.push(file.try_clone()?);
         self.sources.push(meta);
         self.listed.push(false);
@@ -180,12 +213,12 @@ impl Builder {
                 return unsupported("directory cycle");
             }
             let mut entries = Vec::new();
-            for name in host::list(&dir_file)? {
+            for name in readable(host::list(&dir_file))? {
                 if !valid_entry_name(&name) {
                     return unsupported("entry name");
                 }
                 let cname = CString::new(name.clone()).unwrap();
-                let file = host::open_path(Some(&dir_file), &cname)?;
+                let file = readable(host::open_path(Some(&dir_file), &cname))?;
                 let meta = host::statx(&file)?;
                 if meta.mnt_id != mnt_id {
                     return unsupported("host submount inside a share");
@@ -283,20 +316,35 @@ impl Builder {
 }
 
 impl ShareArchive {
-    /// Capture `shares` (every share of one VM, activated ones frozen).
-    /// Reads metadata, directories, symlinks and xattrs now; nothing of the
-    /// source is modified except, without `O_NOATIME` permission, directory
-    /// atimes, and symlink atimes that readlink updates. Refused before
-    /// anything is read unless the caller has CAP_SYS_ADMIN in the initial
-    /// user namespace: elsewhere `trusted.*` xattrs would be silently
-    /// missing.
-    pub fn capture(shares: Vec<ShareSource<'_>>) -> Result<ShareArchive, ArchiveError> {
-        if !host::sees_every_xattr()? {
-            return unsupported(
-                "capture without CAP_SYS_ADMIN in the initial user namespace (trusted.* xattrs hidden)",
-            );
-        }
-        let mut builder = Builder::default();
+    /// Capture `shares` (every share of one VM, activated ones frozen) in
+    /// `mode`. Reads metadata, directories, symlinks and xattrs now (and, in
+    /// guest-visible mode, checks every regular file opens for reading);
+    /// nothing of the source is modified except, without `O_NOATIME`
+    /// permission, directory atimes, and symlink atimes that readlink
+    /// updates. In full-attribute mode it is refused before anything is
+    /// read unless the caller has CAP_SYS_ADMIN in the initial user
+    /// namespace: elsewhere `trusted.*` xattrs would be silently missing. In
+    /// guest-visible mode the archive records the caller's effective IDs,
+    /// and the first object outside that contract fails the capture.
+    pub fn capture(
+        shares: Vec<ShareSource<'_>>,
+        mode: ArchiveMode,
+    ) -> Result<ShareArchive, ArchiveError> {
+        let contract = match mode {
+            ArchiveMode::FullAttributes => {
+                if !host::sees_every_xattr()? {
+                    return unsupported(
+                        "capture without CAP_SYS_ADMIN in the initial user namespace (trusted.* xattrs hidden)",
+                    );
+                }
+                ArchiveContract::FullAttributes
+            }
+            ArchiveMode::GuestVisible => {
+                let (uid, gid) = host::effective_ids();
+                ArchiveContract::GuestVisible { uid, gid }
+            }
+        };
+        let mut builder = Builder::new(contract);
         let mut roots = Vec::with_capacity(shares.len());
         for share in &shares {
             let (root, file, mnt_id) = builder.root(share)?;
@@ -359,6 +407,7 @@ impl ShareArchive {
             }
         }
         let manifest = ArchiveManifest {
+            contract,
             objects: builder.objects,
             trees,
             shares: archived,

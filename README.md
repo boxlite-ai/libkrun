@@ -289,13 +289,20 @@ For example, a source checkpoints and continues with `pause()`,
 TSC when it runs; both keep running while the owner is paused (see the timer
 handling below).
 
-Every full image, with or without devices, uses one format: magic
-`KRUNVM\0\0`, version 7, a bounded 16 MiB JSON state section, RAM copied in
+Every full image, with or without devices, is written in one format:
+magic `KRUNVM\0\0`, version 8, a bounded 16 MiB JSON state section, RAM copied in
 64 KiB chunks into independent anonymous mappings, one raw segment per
 disk, then the virtio-fs file bytes, distinct init.krun bytes and nonzero
 4 KiB anonymous DAX pages. The JSON holds CPU, KVM and RAM state, the
 ordered disk table and the optional NIC, RNG, balloon, vsock, console,
-legacy-device (UARTs, CMOS, i8042) and virtio-fs sections. Versions 1–6
+legacy-device (UARTs, CMOS, i8042) and virtio-fs sections; the virtio-fs
+archive manifest records its contract (archive mode and restore identity),
+and the virtio-fs section the guest's exit code at the cut (`exit_code`,
+`i32::MAX` while unset). Version 7 images, identical but without that
+contract, the shares' `vm_owned` flag and the exit code, are read as
+full-attribute archives of shares none of which is VM-owned, with the exit
+code unset (a version 7 section that carries any of them is refused, and a
+version 8 one must carry all three). Versions 1–6
 (version 4 had no vsock section, version 5 no console section, version 6
 no virtio-fs section) are rejected explicitly; the RAM-only `KRUNRAM` image
 stays version 1. Images never contain host paths, descriptors or threads:
@@ -307,7 +314,10 @@ before any RAM, directory, socket or thread is created; the RAM regions are
 validated before any device section that relies on them, and every length
 (RAM, disk segments, share payloads) is checked against the file. Files are created exclusively with mode 0600 and become
 valid only after the whole image is synced; an export never resumes the
-source. Uncertain control disables subsequent checkpoints and stops every
+source. Before creating the file, an export checks the image's exact length
+against the process's `RLIMIT_FSIZE` and fails without writing anything
+when it would not fit: writing past the limit raises SIGXFSZ, which would
+kill the owner instead of failing the export. Uncertain control disables subsequent checkpoints and stops every
 thread. Partial imports stop and join created threads before releasing VM/RAM. External RAM
 aliases, TEE, nested virtualization, split irqchips, PMU/SMM and uncovered
 extended CPU states are unsupported.
@@ -531,8 +541,9 @@ counts start at zero.
 Every owner with vCPUs (started or full-restored) has one event thread, even
 without devices:
 it also reads UART input and watches the owner's exit eventfd, which the
-i8042 reset, every vCPU exit and a fatal vsock backend failure (see below)
-write. After the vCPU threads are created and
+i8042 reset and every vCPU exit write, and its failure eventfd, which a
+fatal vsock backend failure (see below) and a failed DAX window remapping
+write (an exit without a guest status). After the vCPU threads are created and
 before any first runs, the thread receives a stop handle (command sender and
 thread ID) per vCPU; the owner keeps the join handles. An exit latches
 `exiting` and stops every vCPU. A frozen thread leaves the exit unread, so
@@ -732,7 +743,7 @@ pauses, exports and imports up to seven shares.
 The owner (step 3, `ram_snapshot/virtio_fs.rs`):
 
 - `attach_fs(FsShareConfig { tag, source, read_only, allow_root_dir_delete,
-  dax })` attaches a snapshot-mode share before vCPUs start. Share `i` sits
+  vm_owned, dax })` attaches a snapshot-mode share before vCPUs start. Share `i` sits
   at MMIO `0xd000d000 + i * 0x1000` with GSI `9 + i` (guest kernel:
   `virtio_mmio.device=4K@0xd000d000:9` for the first), so at most seven
   shares attach. The tag is 1–36 bytes without NUL and unique per owner;
@@ -789,10 +800,11 @@ The owner (step 3, `ram_snapshot/virtio_fs.rs`):
   image exists. An import starts declared, since only the owner uses its
   copies.
 - An export archives every share at once (`Fs::archive_source`, one
-  `ShareArchive::capture`). The capture needs CAP_SYS_ADMIN in the initial
-  user namespace (otherwise `trusted.*` xattrs would be hidden); without it
-  the export fails with the archive's `Unsupported` error and the owner
-  stays paused and retryable. The JSON section holds each device (slot,
+  `ShareArchive::capture`) in the owner's archive mode (see "Guest-visible
+  archive mode" below). The default full-attribute capture needs
+  CAP_SYS_ADMIN in the initial user namespace (otherwise `trusted.*` xattrs
+  would be hidden); without it the export fails with the archive's
+  `Unsupported` error and the owner stays paused and retryable. The JSON section holds each device (slot,
   tag, read-only and root-deletion flags, DAX range, transport and virtio
   state with the frozen worker's cursors) and the archive manifest
   (objects, share roots, each session with its DAX mappings); no host path
@@ -815,8 +827,9 @@ The owner (step 3, `ram_snapshot/virtio_fs.rs`):
   an activated share is restore-activated with a frozen worker, all before
   any vCPU thread exists. A successful import keeps the imported tree for
   good: unlike disk segments it is the guest's file system, so the owner
-  never removes it. `allow_root_dir_delete` removes the imported root
-  itself.
+  never removes it, except the copy of a VM-owned share (stage 13 batch 2),
+  which goes with the owner. `allow_root_dir_delete` removes the imported
+  root itself, unless the share is VM-owned.
 - Image layout and bounds: the 16-byte `KRUNVM\0\0` version-7 header, the
   JSON state (at most 16 MiB), RAM, the disk segments, then the share
   payloads in archive order: file bytes, the distinct init.krun bytes, the
@@ -827,8 +840,9 @@ The owner (step 3, `ram_snapshot/virtio_fs.rs`):
 
 Limits of the owner:
 
-- Capability: an export with shares needs CAP_SYS_ADMIN in the initial user
-  namespace, because only there does the kernel list `trusted.*` xattrs;
+- Capability: a full-attribute export with shares needs CAP_SYS_ADMIN in
+  the initial user namespace, because only there does the kernel list
+  `trusted.*` xattrs (a guest-visible export needs none);
   elsewhere it fails with `Unsupported` before reading the source, and the
   owner stays paused and retryable. An import that restores `trusted.*`
   xattrs needs CAP_SYS_ADMIN too.
@@ -996,8 +1010,8 @@ backend provides:
   overlay whiteouts are archived, with permission bits, owner, atime,
   mtime and exact xattrs (ACLs and `trusted.*` included). The kernel lists
   and reads `trusted.*` only for CAP_SYS_ADMIN in the initial user
-  namespace, so the capture refuses (`Unsupported`, before reading the
-  source) in any other process, such as an unprivileged one or one in a
+  namespace, so the full-attribute capture refuses (`Unsupported`, before
+  reading the source) in any other process, such as an unprivileged one or one in a
   user namespace; it adds no privilege itself. Reading `user.*` xattrs
   needs read permission on the object, and an import of `trusted.*` ones
   CAP_SYS_ADMIN too, else they fail. The capture refuses FIFOs, sockets and
@@ -1122,8 +1136,9 @@ with RAM, another device, the share's own slot, the local APIC, the
 IOAPIC, the identity map and TSS, another window, memslot capacity) each
 for its own reason; a ring in a DAX window; tags, sources, window shapes,
 slots and `fs_dir`; a window backing that never unmaps a range it may not
-own. `full/tests.rs` checks a version-7 image's share section and lengths
-through `read_metadata`, versions 1–6 refused, the `fs_dir` requirement,
+own. `full/tests.rs` checks a share section and lengths through
+`read_metadata`, version 7 read as full attributes, contract presence by
+version, a guest-visible contract's owner limit, versions 1–6 and 9 refused, the `fs_dir` requirement,
 and that the RAM regions are validated before any device section uses
 them. The `snapshot_fs_kvm` tests drive a real guest: share register and
 DAX accesses by the vCPU through the fixture's mailbox (`full/guest.S`
@@ -1376,9 +1391,9 @@ registers through its own MMIO exits after a restore, and, with IF clear
 across the cut, take exactly one pending GSI-23 interrupt after `sti` with
 no new traffic — once for an RX completion pending at the cut and once for
 the restore's TX discard. Real DNS/TCP acceptance is also **UNVERIFIED** and
-cannot run in this harness yet: `start_vcpus` starts real-mode fixtures, not a Linux guest. With a
-harness extension that boots a Linux guest, the procedure on a Linux x86_64
-KVM host is: start a UnixStream backend that speaks the same length-prefixed
+needs a Linux guest: `start_vcpus` starts real-mode fixtures; the
+production boot (stage 13 batch 2, below) boots one. On a Linux x86_64
+KVM host the procedure is: start a UnixStream backend that speaks the same length-prefixed
 framing (for example passt or gvproxy in their QEMU stream-socket mode);
 attach the NIC and boot the guest with
 `virtio_mmio.device=4K@0xd0008000:23`; configure the network, resolve a name
@@ -1387,6 +1402,188 @@ its backend; start a new backend at a new socket; `import` with that
 `nic_socket` and `resume`. Expected: the old TCP connection fails or times out, new name
 lookups and new TCP connections succeed, interface counters keep moving and
 the guest kernel logs no virtio-net ring errors.
+
+#### Guest-visible archive mode and image version 8 (stage 13 batch 1)
+
+A rootless shim (BoxLite's default jailer: bwrap with a user namespace that
+maps only the service's own IDs, no capability) cannot see `trusted.*`
+xattrs, so the full-attribute capture refuses it. `ArchiveMode` makes the
+choice explicit; `RamSnapshotVm::set_fs_archive_mode` sets it before the
+vCPUs start, full attributes being the default, and an imported owner keeps
+its image's mode.
+
+| | Full attributes (default; every version 7 image) | Guest-visible |
+| --- | --- | --- |
+| Captures | any owner, every xattr including `trusted.*` | what the capturing service, and so its guest, sees |
+| Export needs | CAP_SYS_ADMIN in the initial user namespace | no privilege |
+| Manifest `contract` | `full_attributes` | `guest_visible {uid, gid}`: the exporter's effective IDs in its own user namespace |
+| Owners | any | every object owned by exactly `uid`:`gid` |
+| Xattrs | all | `user.*` and POSIX ACLs whose named entries name only `uid`/`gid` |
+| Import needs | whatever setting them takes | exactly the recorded effective IDs, checked before anything exists (`ArchiveContract::check_importer`, also before `RamSnapshotVm::import` creates RAM) |
+
+A guest-visible capture fails, never drops: a regular file the service
+cannot open for reading, a directory it cannot list or search, an object
+with another owner, a `security.*`, `trusted.*` (visible to a privileged
+exporter) or other xattr, an ACL naming another user or group, and a FIFO,
+socket or device each fail it with `Unsupported` before any payload is
+written. `trusted.*` xattrs hidden from the service are hidden from its
+guest too and are outside the guarantee. Manifest validation enforces the
+same owner and xattr limits on import. Session, DAX window, hard links,
+symlinks, whiteouts, modes (set-ID and sticky bits) and nanosecond times
+are kept as in full-attribute mode. A guest-visible import keeps running
+unprivileged: it creates and chowns only to its own IDs.
+
+Rootless tests (names start with `rootless_fs`): `make snapshot-test`
+skips them; `make snapshot-rootless-test SNAPSHOT_SECCOMP_BPF=<raw BPF>
+SNAPSHOT_RUNNER=<runner>` runs them, each first checking it is a non-root
+user in a user namespace mapping only its own IDs with every capability set
+(bounding included) empty. Export and import also run on a thread under the
+filter `KRUN_TEST_SECCOMP_BPF` names, and a trapped syscall exits with its
+number. BoxLite's `make test:snapshot:rootless` supplies real bwrap with the
+shim's arguments as runner and its production x86_64 VMM filter. Covered:
+a full round trip (contents, holes, set-ID modes, hard links across
+directories, symlink, whiteout, `user.*` xattrs, access and default ACLs,
+a read-only directory, a non-UTF-8 name), a session with an unlinked open
+file and a writable DAX file mapping continuing on the copy, capture
+refusals (unreadable file, unlistable and unsearchable directories, FIFO,
+foreign owner, full attributes without privilege), a failed import that
+leaves nothing and an import under other IDs refused before the
+destination exists, plus (`krun-vmm`) the owner's guest-visible
+export/import continuing a pending request, a handle and the DAX window.
+The `snapshot_fs_archive_guest_visible_*` tests (root) check the manifest
+limits, the importer identity and a privileged guest-visible capture
+refusing visible `trusted.*` xattrs and foreign owners; the KVM test
+`snapshot_fs_kvm_archive_mode_is_set_before_start_and_kept_by_import`
+checks the owner setting (unverified here).
+
+#### Production Linux boot (stage 13 batch 2)
+
+`krun-vmm`'s public `snapshot_vm::SnapshotVm` is the checkpointing VM the
+C API drives (batch 3, below): `boot(&VmResources, SnapshotDevices)`
+cold-boots the configured Linux guest into the private owner;
+`import(path, RestoreEndpoints)` returns an image's guest paused;
+`pause`, `declare_host_writers_stopped`, `export`, `resume`, `state`,
+`exit_waiter` and `stop` follow the lifecycle above. No mapping,
+descriptor or vCPU handle escapes it.
+
+Disks, the NIC and the vsock come unopened in `SnapshotDevices`
+(`BlockDeviceConfig`s in guest order, a `NetworkInterfaceConfig`, a
+`VsockDeviceConfig`): a caller branches before the ordinary eager
+construction of these devices, and `VmResources` holding any of them
+built is refused. Everything else comes from `VmResources`: vCPUs,
+memory, payload, command line, shares and console.
+
+`BootImage::new` checks the whole configuration, then prepares guest RAM,
+before any VM, device, file or thread exists:
+
+| Refused (named in the error) | Why |
+| --- | --- |
+| nested virtualization, split irqchip, firmware payload, virtio-gpu/snd/input | no checkpoint contract |
+| legacy serial consoles, additional virtio consoles, the implicit console without a console output file | only the console with an output file (what BoxLite configures) is supported |
+| vsock TSI or TCP port maps; a NIC backend other than a UnixStream path (gvproxy, file descriptors); disks with direct I/O or without full sync | outside the internal devices' contracts |
+| more than seven shares, eight disks (seven with a NIC) or 128 vCPUs; a libkrunfw kernel that is empty, unaligned or does not fit; RAM reaching into the 32-bit device window | fixed slots and layout |
+
+| Item | Boot |
+| --- | --- |
+| Payload | libkrunfw's kernel is copied into owned anonymous RAM at its guest address (the hole the ordinary VMM fills with libkrunfw's own mapping), adjacent ranges merged: no host mapping outside the owner aliases guest RAM. An external kernel (ELF and compressed images, initramfs, own command line) loads as on the ordinary VMM |
+| Boot setup | the ordinary command line, MP table, zero page and E820 map (`arch::configure_system`); vCPUs set up by `configure_x86_64` at the kernel entry |
+| DAX windows | each share with an SHM size gets the ordinary VMM's guest address (above RAM: 4 GiB, or the next GiB above RAM beyond the device window), as the owner's own memslot, never guest RAM or E820 |
+| Devices | balloon, RNG, COM1–COM4 sinks, CMOS, i8042, the console, the vsock, every share, every disk, the NIC, at the fixed owner slots above |
+| Discovery | `virtio_mmio.device=4K@<slot>:<GSI>` in the ordinary VMM's order (balloon, RNG, console, shares, disks, vsock, NIC) between the krun environment and the init arguments, then `KRUN_DHCP=1` if configured, so guest device names and the boot disk (`vda` first) keep their order; the boot checks the attached devices took exactly these slots |
+| Archive mode | guest-visible: exports need no privilege |
+
+Guest exit: init reports its exit code through any virtio-fs share
+(`VIRTIO_IOC_EXIT_CODE`), and a reset, shutdown or vCPU exit ends the VM.
+`state` is `Running`, `Paused`, `Exited(code)` (init's code, else the
+exiting vCPU's, else 0, as the ordinary VMM reports it), `Failed` (a vsock
+backend that could not reopen or a failed DAX remapping) or `Stopped`
+(`stop`, or an uncertain control operation). `exit_waiter` waits for the
+end without holding the VM; `stop` stops and joins every thread. An
+imported guest reports through its own shares the same way, and continues
+from the exit code its image recorded: a guest exported after init set its
+code but before the VM ended still reports that code after the import.
+
+Import endpoints: `RestoreEndpoints::console_output` names a new file. The
+import creates it exclusively, as the first resource it creates and only
+after the image (metadata, RAM and rings) and every other endpoint passed
+their checks; an existing file is refused untouched, and a failed import
+removes the file it created, but only while that path still names it (a
+file that replaced it is left). A cold boot still truncates its console
+output file like the ordinary VMM. `RestoreEndpoints::disk_dir` gets
+`disk-<i>.raw` (raw, 0600) for the image's disk `i` in guest order; the
+import hands the directory and its files over to the caller once it
+succeeds, so they outlive the VM (the private owner alone still removes
+them with itself, as the stage 3 tests expect), while a failed import
+removes them, again only while each name still names what it created.
+`restored_shares` lists each imported share's tag and root copy, except
+the VM-owned boot root.
+
+VM-owned boot root: `krun_set_root_disk_remount` creates a temporary
+`/dev/root` directory from which init.krun starts before it switches to
+the disk root and asks for that directory's removal. `FsDeviceConfig`
+marks it `vm_owned` (only there; the ordinary VMM ignores the flag). The
+checkpointing VM acknowledges the guest's removal request without removing
+it, so exports keep capturing it, and removes it when the VM drops. Images
+record the flag per share (`vm_owned` in version 8): an imported VM-owned
+share keeps deferring, also when the image predates the request, and its
+VM removes only its own imported copy, never a source path. Every other
+share keeps removing its root at the guest's request.
+
+Tests without KVM (`snapshot_boot_*`, `snapshot_exit_wait_*`,
+`snapshot_import_*`, `snapshot_fs_vmm_vm_owned_root_*`,
+`snapshot_fs_vmm_exit_code_*`): kernel copy and E820/DAX layout, large RAM
+above 4 GiB, the command line and discovery order, every refusal, exit
+waits, a failed import leaving an existing or missing console output
+untouched, exclusive console output creation and its removal, a
+replacement at the console or disk segment path surviving cleanup
+(`snapshot_import_*_cleanup_*`), the VM-owned root across guest removal, export, import and teardown, and an
+exit code set before the cut surviving export and restore. KVM tests (`snapshot_boot_kvm_*`, need /dev/kvm and
+`KRUN_SNAPSHOT_TEST_LIBKRUNFW` naming libkrunfw's library) boot a real
+guest whose init cannot run its workload and exits 127: the cold guest
+reports it and its root goes with the VM; a guest paused early in boot,
+exported, its source and roots destroyed, continues the boot after import
+and reports 127; `stop` ends a running guest without a status.
+
+#### C API (stage 13 batch 3)
+
+`include/libkrun.h` declares the `krun_snapshot_*` functions, implemented
+for Linux x86_64 with KVM (without `tee` or `aws-nitro`); every other
+build exports them and returns `-ENOTSUP`. BoxLite's shim is the intended
+caller; the contract is in the header.
+
+| Call | Effect |
+| --- | --- |
+| `krun_snapshot_enable(ctx, 0)` | Opt in, before any `krun_add_net_*`: NICs are kept as unopened configuration. Creates the context's control entry |
+| `krun_snapshot_import(ctx, image, disk_dir, fs_dir)` | `krun_start_enter` imports instead of booting; NIC socket, vsock ports and a new console output come from the context, which configures no disks or shares |
+| `krun_start_enter(ctx)` | Branches before the ordinary disk/NIC/vsock construction: a cold boot loads the payload and command line and calls `SnapshotVm::boot`; an import calls only `SnapshotVm::import` (no payload, kernel or cold init) and stays paused. The calling thread then owns the VM and serves requests; it returns 0 once execution ended (state EXITED/FAILED/STOPPED), or a negative errno when the start failed |
+| `krun_snapshot_pause(ctx, flags)` / `resume` / `export(ctx, path)` / `stop` | Queued to the owner, run one at a time in order, answered once run and the new state published; no timeout, no retry. `KRUN_SNAPSHOT_PAUSE_HOST_WRITERS_STOPPED` is the caller's declaration that every share's host writers stopped until resume |
+| `krun_snapshot_get_state(ctx, &state, &exit_code)` | The owner's last published state, never waiting behind a request |
+| `krun_snapshot_get_restored_share(ctx, tag, buf, len)` | An imported share's root copy, for later cold starts |
+
+Request errors: `-EAGAIN` before `krun_start_enter`, `-EINVAL` when the
+state does not allow the request (nothing ran), `-ESRCH` when execution
+ended or the start failed before it ran (a stop then succeeds), `-EIO`
+when it ran and failed (state PAUSED after an ordinary export failure;
+STOPPED or FAILED when the failure ended execution). The control entry
+outlives `krun_start_enter`'s consumption of the context:
+`krun_free_ctx` removes it before the start or after `krun_start_enter`
+returned, and returns `-EBUSY` in between.
+
+The owner (`src/libkrun/src/snapshot/control.rs`) creates, drives and
+drops the VM on the `krun_start_enter` thread, so the VM never crosses
+threads; an exit-watch thread wakes it when the guest exits or fails
+while running. Tests without KVM (`make snapshot-capi-test`): the owner
+channel with a fake VM (startup queueing and failure, serialization of
+concurrent callers, state reads during a long export, refused requests,
+an export failure staying paused, an uncertain pause ending the VM, a
+guest exit, stop, closed queues and free) and the C API's argument,
+order and lifetime checks; `make snapshot-abi-check` compiles
+`tests/snapshot-abi/abi_check.c` against the header with the exact
+signatures and runs it on the built library; `make
+snapshot-feature-check` and `make snapshot-host-check` check the crate
+without and with each device feature and on an unsupported host. The KVM
+test `snapshot_boot_kvm_import_hands_its_disk_and_share_copies_over`
+checks the handover with a real guest.
 
 ## Status
 
