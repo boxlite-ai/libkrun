@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arch::x86_64::layout::{EBDA_START, HIMEM_START, ZERO_PAGE_START};
 use arch_gen::x86::bootparam::{boot_params, E820_RAM};
+use arch_gen::x86::mpspec;
 use devices::virtio::block::{ImageType, SyncMode};
 use devices::virtio::net::device::VirtioNetBackend;
 use devices::virtio::{CacheType, TsiFlags};
@@ -163,6 +164,59 @@ fn boot_params_of(memory: &GuestMemoryMmap) -> boot_params {
         .unwrap();
     // SAFETY: `boot_params` is plain old data of exactly this size.
     unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) }
+}
+
+fn read_pod<T>(memory: &GuestMemoryMmap, addr: u64) -> T {
+    let mut bytes = vec![0u8; std::mem::size_of::<T>()];
+    memory.read_slice(&mut bytes, GuestAddress(addr)).unwrap();
+    // SAFETY: only instantiated with plain old data of exactly this size.
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) }
+}
+
+/// The IOAPIC inputs the MP table gives a fixed interrupt source: the
+/// floating pointer at the start of the EBDA names the table, whose
+/// entries follow its header.
+fn mp_table_ioapic_inputs(memory: &GuestMemoryMmap) -> Vec<u32> {
+    let pointer: mpspec::mpf_intel = read_pod(memory, EBDA_START);
+    let table_addr = u64::from(pointer.physptr);
+    let table: mpspec::mpc_table = read_pod(memory, table_addr);
+    let end = table_addr + u64::from(table.length);
+    let mut addr = table_addr + std::mem::size_of::<mpspec::mpc_table>() as u64;
+    let mut inputs = Vec::new();
+    while addr < end {
+        let entry_type = u32::from(read_pod::<u8>(memory, addr));
+        addr += match entry_type {
+            mpspec::MP_PROCESSOR => std::mem::size_of::<mpspec::mpc_cpu>(),
+            mpspec::MP_BUS => std::mem::size_of::<mpspec::mpc_bus>(),
+            mpspec::MP_IOAPIC => std::mem::size_of::<mpspec::mpc_ioapic>(),
+            mpspec::MP_INTSRC => {
+                let source: mpspec::mpc_intsrc = read_pod(memory, addr);
+                if u32::from(source.irqtype) == mpspec::mp_irq_source_types_mp_INT {
+                    inputs.push(u32::from(source.dstirq));
+                }
+                std::mem::size_of::<mpspec::mpc_intsrc>()
+            }
+            mpspec::MP_LINTSRC => std::mem::size_of::<mpspec::mpc_lintsrc>(),
+            other => panic!("unknown MP table entry type {other}"),
+        } as u64;
+    }
+    inputs
+}
+
+/// Linux allocates no IRQ for an IOAPIC input the MP table leaves out,
+/// so a device announced on one fails `request_irq` with EINVAL and its
+/// driver does not probe: every announced GSI must be described.
+#[test]
+fn snapshot_boot_mp_table_describes_every_announced_gsi() {
+    let config = Config::new(64);
+    let image = BootImage::new(&config.resources, config.devices()).unwrap();
+    let inputs = mp_table_ioapic_inputs(&image.memory);
+    for (addr, gsi) in &image.slots {
+        assert!(
+            inputs.contains(gsi),
+            "GSI {gsi} of the device at {addr:#x} has no MP table interrupt source: {inputs:?}"
+        );
+    }
 }
 
 /// The kernel is copied into ordinary owned RAM (no raw libkrunfw alias),
