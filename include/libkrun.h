@@ -10,6 +10,22 @@ extern "C" {
 #include <stdbool.h>
 #include <unistd.h>
 
+/* Linux/KVM memory growth. Configure after krun_set_vm_config, before enter.
+ * Targets include boot RAM; growth is a multiple of 128 MiB. Calls to request
+ * and status are thread-safe after enter. An accepted request is asynchronous.
+ */
+struct krun_memory_status {
+    uint32_t max_mib;
+    uint32_t requested_mib;
+    uint32_t plugged_mib;
+    uint32_t mapped_mib;
+    int32_t error;
+    uint32_t active;
+};
+int32_t krun_set_memory_hotplug(uint32_t ctx_id, uint32_t max_mib);
+int32_t krun_request_memory(uint32_t ctx_id, uint32_t total_mib);
+int32_t krun_get_memory_status(uint32_t ctx_id, struct krun_memory_status *status);
+
 /**
  * Sets the log level for the library.
  *
