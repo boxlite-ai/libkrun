@@ -55,6 +55,28 @@ Each variant generates a dynamic library with a different name (and ```soname```
 * virtio-rng
 * virtio-snd
 
+### Online memory growth (Linux, generic variant)
+
+Call `krun_set_memory_hotplug` after `krun_set_vm_config` and before starting
+the VM. The initial memory size includes the bundled kernel mapping; it is the
+whole guest RAM budget. The requested ceiling is reduced to fit KVM memory
+slots and the guest physical address space. The reserved range starts after
+boot RAM and shared-memory regions. On x86 it also starts at or above 4 GiB,
+leaving the device MMIO gap untouched even when no shared-memory device is present.
+
+The guest needs `CONFIG_VIRTIO_MEM=y` and automatic memory onlining. Another
+host thread can call `krun_request_memory` and `krun_get_memory_status` while
+the VM runs. Targets are absolute, grow only, and differ from the initial size
+by a multiple of 128 MiB. Check the status for the effective ceiling, driver
+activation, mapped allocation, plugged allocation, and device errors: accepting
+a request does not mean the guest has finished plugging it.
+
+Unallocated slots have no KVM mapping and are protected with `PROT_NONE`.
+The driver plugs 2 MiB blocks; the host makes 128 MiB slots accessible as needed.
+A failed multi-slot request preserves and reports completed slots. Guest
+unplug requests release slots only after their last plugged block is removed;
+the host target never decreases.
+
 ## Networking
 
 In ```libkrun```, networking is provided by two different, mutually exclusive techniques: **virtio-vsock + TSI** and **virtio-net + passt/gvproxy**.

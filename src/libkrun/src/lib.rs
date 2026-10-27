@@ -1,6 +1,9 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+mod memory_hotplug;
+
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
@@ -549,7 +552,11 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 #[no_mangle]
 pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().remove(&ctx_id) {
-        Some(_) => KRUN_SUCCESS,
+        Some(_) => {
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            memory_hotplug::remove(ctx_id);
+            KRUN_SUCCESS
+        }
         None => -libc::ENOENT,
     }
 }
