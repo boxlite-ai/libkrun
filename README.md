@@ -19,7 +19,8 @@ virtio-mem reports the separate hotplug reservation and allocation.
 Pause closes memory-request admission before freezing CPUs/devices. Status
 queries remain available; growth requests return `-EBUSY` until resume completes.
 Import restores the exact reservation and mapped slots, rebinds the mailbox to
-the new context, and stays paused. Resume replays pending target/queue work, after
+the new context, and activates the retained memory queue on the frozen owner
+event thread. It stays paused. Resume replays pending target/queue work, after
 which the imported guest can grow again. Hotplug and DAX windows retain disjoint
 KVM slot ranges. Imports reject reservations beyond the target's physical address
 width; replaying pending work preserves a completed guest `UNPLUG_ALL` cut.

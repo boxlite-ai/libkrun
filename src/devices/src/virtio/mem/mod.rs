@@ -372,6 +372,16 @@ impl VirtioDevice for Mem {
     fn is_activated(&self) -> bool {
         self.state.is_activated()
     }
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        // The owner's restored event thread stays frozen until resume;
+        // activation only retains queues and posts its registration event.
+        self.activate(mem, interrupt, queues)
+    }
 }
 
 impl Subscriber for Mem {
