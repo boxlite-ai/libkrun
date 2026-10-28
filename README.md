@@ -31,8 +31,11 @@ before boot/import. Ordinary VMM device limits are unchanged.
 This directly extends the current snapshot schema; it does not
 provide an old-format conversion path.
 
-The resize/checkpoint merge has received source review only. Compilation, codec
-tests and real KVM continuation under the consumer's sandbox remain deferred.
+The consumer's focused Linux x86_64/KVM resize/checkpoint/restore/resize and
+independent-home REST continuation scenarios passed on 2026-10-28, including
+default bwrap and VMM seccomp checks. They required a privileged test runner on
+the AppArmor-restricted host. Unit/codec suites, other platforms, lint and
+formatting remain outside that functional validation.
 
 ```libkrun``` is a dynamic library that allows programs to easily acquire the ability to run processes in a partially isolated environment using [KVM](https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt) Virtualization on Linux and [HVF](https://developer.apple.com/documentation/hypervisor) on macOS/ARM64.
 
