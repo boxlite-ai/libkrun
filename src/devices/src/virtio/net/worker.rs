@@ -1,22 +1,100 @@
+use crate::virtio::control::{self, WorkerControlError, CONTROL_TIMEOUT};
 use crate::virtio::net::backend::ConnectError;
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
-use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
-use crate::virtio::{DeviceQueue, InterruptTransport};
+use crate::virtio::net::MAX_BUFFER_SIZE;
+use crate::virtio::persist::QueueState;
+use crate::virtio::{DescriptorChain, DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
-use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
+use super::device::{FrontendError, VirtioNetBackend};
 use super::VNET_HDR_LEN;
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::result;
 use std::thread;
-use std::{cmp, result};
+use std::time::Duration;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use utils::eventfd::EventFd;
+use vm_memory::{Bytes, GuestMemoryMmap};
+
+/// Frames moved per direction before the worker returns to its event loop;
+/// leftover work re-arms through the wake eventfd, so controls and stop
+/// requests are never starved by a busy guest or backend.
+const RX_BUDGET: usize = 64;
+const TX_BUDGET: usize = 64;
+
+/// Cut-time queue cursors of a frozen worker. Worker-private buffers
+/// (deferred RX frame, partial backend frames, unfinished TX writes) are not
+/// part of it: they stay with the live worker and its backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetQueueStates {
+    pub rx: QueueState,
+    pub tx: QueueState,
+}
+
+/// Snapshot control command for the net worker.
+pub(crate) enum NetWorkerCommand {
+    /// Stop at the current descriptor boundary — every popped chain is in
+    /// the used ring and its interrupt delivered — and report the cursors.
+    /// Once confirmed, the worker writes no guest RAM, ring or interrupt and
+    /// does no backend I/O until resumed or stopped.
+    Freeze {
+        reply: Sender<result::Result<NetQueueStates, String>>,
+    },
+    /// Resume and actively re-examine both queues and the backend, so
+    /// notifications and readiness edges drained while frozen cannot hang.
+    Resume {
+        reply: Sender<result::Result<(), String>>,
+    },
+}
+
+/// Controller side of the net worker snapshot control channel.
+pub struct NetWorkerHandle {
+    pub(crate) control_fd: EventFd,
+    pub(crate) commands: Sender<NetWorkerCommand>,
+}
+
+impl NetWorkerHandle {
+    /// Freeze the worker and return its queue cursors.
+    pub fn freeze(&self) -> result::Result<NetQueueStates, WorkerControlError> {
+        self.freeze_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    pub fn freeze_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> result::Result<NetQueueStates, WorkerControlError> {
+        control::request(&self.commands, &self.control_fd, timeout, |reply| {
+            NetWorkerCommand::Freeze { reply }
+        })
+    }
+
+    /// Resume the worker; the reply confirms the active re-examination ran.
+    pub fn resume(&self) -> result::Result<(), WorkerControlError> {
+        self.resume_with_timeout(CONTROL_TIMEOUT)
+    }
+
+    pub fn resume_with_timeout(&self, timeout: Duration) -> result::Result<(), WorkerControlError> {
+        control::request(&self.commands, &self.control_fd, timeout, |reply| {
+            NetWorkerCommand::Resume { reply }
+        })
+    }
+}
+
+/// Event-loop side of the control channel, handed to the worker.
+pub(crate) struct NetWorkerControl {
+    pub(crate) stop_fd: EventFd,
+    pub(crate) control_fd: EventFd,
+    /// Self-notification for work left over by a budget.
+    pub(crate) wake_fd: EventFd,
+    pub(crate) commands: Receiver<NetWorkerCommand>,
+}
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -26,24 +104,40 @@ pub struct NetWorker {
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
 
+    control: NetWorkerControl,
+    /// Single source of truth for the frozen state.
+    frozen: bool,
+    /// Resume replies answered after the active re-examination.
+    pending_resume_replies: Vec<Sender<result::Result<(), String>>>,
+    /// The backend may have readable frames nobody consumed yet.
+    rx_pending: bool,
+    /// The TX queue or an unfinished backend write may need attention.
+    tx_pending: bool,
+    /// RX chains were used since the last interrupt.
+    rx_used: bool,
+    /// TX chains were used since the last notification check.
+    tx_used: bool,
+    /// The backend failed or closed; guest TX frames are dropped.
+    backend_closed: bool,
+
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
 
-    tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
 }
 
 impl NetWorker {
-    pub fn new(
+    pub(crate) fn new(
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        control: NetWorkerControl,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -78,22 +172,33 @@ impl NetWorker {
             backend,
             interrupt,
 
+            control,
+            frozen: false,
+            pending_resume_replies: Vec::new(),
+            rx_pending: true,
+            tx_pending: true,
+            rx_used: false,
+            tx_used: false,
+            backend_closed: false,
+
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
 
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
-            tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
         })
     }
 
-    pub fn run(self) {
+    /// Spawn the worker thread. `start_frozen` begins suspended for devices
+    /// restored from a snapshot, before the owner resumes them.
+    pub fn run(mut self, start_frozen: bool) -> thread::JoinHandle<()> {
+        self.frozen = start_frozen;
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
     fn work(mut self) {
@@ -102,20 +207,27 @@ impl NetWorker {
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
+        let stop_ev_fd = self.control.stop_fd.as_raw_fd();
+        let control_ev_fd = self.control.control_fd.as_raw_fd();
+        let wake_ev_fd = self.control.wake_fd.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let mut backend_registered = true;
 
         let epoll = Epoll::new().unwrap();
 
-        let _ = epoll.ctl(
-            ControlOperation::Add,
+        for fd in [
             virtq_rx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_rx_ev_fd as u64),
-        );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
             virtq_tx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
-        );
+            stop_ev_fd,
+            control_ev_fd,
+            wake_ev_fd,
+        ] {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            );
+        }
         let _ = epoll.ctl(
             ControlOperation::Add,
             backend_socket,
@@ -124,6 +236,9 @@ impl NetWorker {
                 backend_socket as u64,
             ),
         );
+        // Work queued before the first event (a restored ring or frames the
+        // backend already sent) is examined without waiting for a kick.
+        let _ = self.control.wake_fd.write(1);
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -134,30 +249,46 @@ impl NetWorker {
                         let event_set = event.event_set();
                         match event_set {
                             EventSet::IN if source == virtq_rx_ev_fd => {
-                                self.process_rx_queue_event();
+                                // Frozen kicks are drained too: resume
+                                // re-examines the queue itself.
+                                let _ = self.rx_q.event.read();
+                                self.rx_pending = true;
                             }
                             EventSet::IN if source == virtq_tx_ev_fd => {
-                                self.process_tx_queue_event();
+                                let _ = self.tx_q.event.read();
+                                self.tx_pending = true;
+                            }
+                            EventSet::IN if source == control_ev_fd => {
+                                let _ = self.control.control_fd.read();
+                                self.handle_pending_commands();
+                            }
+                            EventSet::IN if source == stop_ev_fd => {
+                                debug!("stopping virtio-net worker thread");
+                                let _ = self.control.stop_fd.read();
+                                return;
+                            }
+                            EventSet::IN if source == wake_ev_fd => {
+                                let _ = self.control.wake_fd.read();
                             }
                             _ if source == backend_socket => {
-                                if event_set.contains(EventSet::HANG_UP)
-                                    || event_set.contains(EventSet::READ_HANG_UP)
-                                {
+                                let hang_up = event_set
+                                    .intersects(EventSet::HANG_UP | EventSet::READ_HANG_UP);
+                                if hang_up && !self.backend_closed {
                                     log::error!("Got {event_set:?} on backend fd, virtio-net will stop working");
                                     eprintln!("LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!");
-                                } else {
-                                    if event_set.contains(EventSet::IN) {
-                                        self.process_backend_socket_readable()
-                                    }
-
-                                    if event_set.contains(EventSet::OUT) {
-                                        self.process_backend_socket_writeable()
-                                    }
+                                }
+                                // Frames queued before a hang-up are still
+                                // delivered; reading reports the end itself.
+                                if hang_up || event_set.contains(EventSet::IN) {
+                                    self.rx_pending = true;
+                                }
+                                if event_set.contains(EventSet::OUT) {
+                                    self.tx_pending = true;
                                 }
                             }
                             #[cfg(target_os = "macos")]
                             _ if event_set.is_empty() && source == TX_TIMER_FD => {
-                                self.process_tx_loop();
+                                self.tx_pending = true;
                             }
                             _ => {
                                 log::warn!(
@@ -167,10 +298,26 @@ impl NetWorker {
                         }
                     }
 
+                    self.pump();
+                    self.finish_pending_resumes();
+
+                    if self.backend_closed && backend_registered {
+                        // Stop readiness reports from a dead peer.
+                        let _ = epoll.ctl(
+                            ControlOperation::Delete,
+                            backend_socket,
+                            &EpollEvent::new(EventSet::empty(), backend_socket as u64),
+                        );
+                        backend_registered = false;
+                    }
+                    if !self.frozen && (self.rx_pending || self.tx_pending) {
+                        let _ = self.control.wake_fd.write(1);
+                    }
+
                     // Arm the retry timer after processing all events, so it
                     // reflects the final state of tx_has_deferred_frame.
                     #[cfg(target_os = "macos")]
-                    if self.tx_has_deferred_frame {
+                    if !self.frozen && self.tx_has_deferred_frame {
                         let delay = self.backend.write_retry_delay_us();
                         if delay > 0 {
                             epoll.add_oneshot_timer(delay, TX_TIMER_FD as u64);
@@ -184,217 +331,225 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_rx_queue_event(&mut self) {
-        if let Err(e) = self.rx_q.event.read() {
-            log::error!("Failed to get rx event from queue: {e:?}");
+    /// Run one budgeted round of RX and TX work unless frozen.
+    fn pump(&mut self) {
+        if !self.frozen && std::mem::take(&mut self.rx_pending) {
+            self.process_rx();
         }
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by queue event)")
-        };
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        if !self.frozen && std::mem::take(&mut self.tx_pending) {
+            self.process_tx();
         }
     }
 
-    pub(crate) fn process_tx_queue_event(&mut self) {
-        match self.tx_q.event.read() {
-            Ok(_) => self.process_tx_loop(),
-            Err(e) => {
-                log::error!("Failed to get tx queue event from queue: {e:?}");
-            }
-        }
-    }
-
-    pub(crate) fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
-        };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-    }
-
-    pub(crate) fn process_backend_socket_writeable(&mut self) {
-        match self
-            .backend
-            .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
-        {
-            Ok(()) => self.process_tx_loop(),
-            Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
-            Err(e @ WriteError::Internal(_)) => {
-                log::error!("Failed to finish write: {e:?}");
-            }
-            Err(e @ WriteError::ProcessNotRunning) => {
-                log::debug!("Failed to finish write: {e:?}");
-            }
-        }
-    }
-
-    fn process_rx(&mut self) -> result::Result<(), RxError> {
-        // if we have a deferred frame we try to process it first,
-        // if that is not possible, we don't continue processing other frames
-        if self.rx_has_deferred_frame {
-            if self.write_frame_to_guest() {
-                self.rx_has_deferred_frame = false;
-            } else {
-                return Ok(());
-            }
-        }
-
-        let mut signal_queue = false;
-
-        // Read as many frames as possible.
-        let result = loop {
-            match self.read_into_rx_frame_buf_from_backend() {
-                Ok(()) => {
-                    if self.write_frame_to_guest() {
-                        signal_queue = true;
-                    } else {
-                        self.rx_has_deferred_frame = true;
-                        break Ok(());
-                    }
-                }
-                Err(ReadError::NothingRead) => break Ok(()),
-                Err(e @ ReadError::Internal(_)) => break Err(RxError::Backend(e)),
-            }
-        };
-
-        // At this point we processed as many Rx frames as possible.
-        // We have to wake the guest if at least one descriptor chain has been used.
-        if signal_queue {
-            self.interrupt
-                .try_signal_used_queue()
-                .map_err(RxError::DeviceError)?;
-        }
-
-        result
-    }
-
-    fn process_tx_loop(&mut self) {
+    /// Drain queued control commands. A Freeze lands only here, between
+    /// descriptor chains, after the used-ring interrupts were raised; a
+    /// Resume clears the frozen flag and defers its reply to the loop level.
+    fn handle_pending_commands(&mut self) {
         loop {
-            self.tx_q.queue.disable_notification(&self.mem).unwrap();
-
-            self.tx_has_deferred_frame = match self.process_tx() {
-                Err(TxError::Backend(WriteError::NothingWritten)) => true,
-                Err(e) => {
-                    log::error!("Failed to process tx: {e:?}");
-                    false
+            match self.control.commands.try_recv() {
+                Ok(NetWorkerCommand::Freeze { reply }) => {
+                    if !self.frozen {
+                        self.signal_used_queues();
+                        self.frozen = true;
+                    }
+                    let state = NetQueueStates {
+                        rx: QueueState::from_queue(&self.rx_q.queue),
+                        tx: QueueState::from_queue(&self.tx_q.queue),
+                    };
+                    // A dropped reply means the controller timed out; the
+                    // worker stays frozen and resumable.
+                    let _ = reply.try_send(Ok(state));
                 }
-                _ => false,
-            };
-
-            let has_new_entries = self.tx_q.queue.enable_notification(&self.mem).unwrap();
-            if self.tx_has_deferred_frame || !has_new_entries {
-                break;
+                Ok(NetWorkerCommand::Resume { reply }) => {
+                    self.frozen = false;
+                    self.pending_resume_replies.push(reply);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
     }
 
-    fn process_tx(&mut self) -> result::Result<(), TxError> {
-        let tx_queue = &mut self.tx_q.queue;
-
-        if self.backend.has_unfinished_write()
-            && self
-                .backend
-                .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
-                .is_err()
-        {
-            log::trace!("Cannot process tx because of unfinished partial write!");
-            return Ok(());
+    /// Answer deferred Resume replies after actively re-examining the
+    /// backend and both queues: kicks and readiness edges seen while frozen
+    /// were drained without processing.
+    fn finish_pending_resumes(&mut self) {
+        if self.pending_resume_replies.is_empty() {
+            return;
         }
+        if !self.frozen {
+            self.rx_pending = true;
+            self.tx_pending = true;
+            self.pump();
+        }
+        for reply in self.pending_resume_replies.drain(..) {
+            let _ = reply.try_send(Ok(()));
+        }
+    }
 
-        let mut raise_irq = false;
-        let mut result = Ok(());
+    /// Checked before each descriptor chain: handles pending commands and
+    /// reports whether the worker is now frozen.
+    fn frozen_by_controls(&mut self) -> bool {
+        if !self.control.commands.is_empty() {
+            self.handle_pending_commands();
+        }
+        self.frozen
+    }
 
-        while let Some(head) = tx_queue.pop(&self.mem) {
-            let head_index = head.index;
-            let mut next_desc = Some(head);
-
-            self.tx_iovec.clear();
-            while let Some(desc) = next_desc {
-                if desc.is_write_only() {
-                    self.tx_iovec.clear();
-                    break;
-                }
-                self.tx_iovec.push((desc.addr, desc.len as usize));
-                next_desc = desc.next_descriptor();
+    fn signal_used_queues(&mut self) {
+        if std::mem::take(&mut self.rx_used) {
+            if let Err(e) = self.interrupt.try_signal_used_queue() {
+                log::error!("Failed to signal rx queue: {e:?}");
             }
-
-            // Copy buffer from across multiple descriptors.
-            let mut read_count = 0;
-            for (desc_addr, desc_len) in self.tx_iovec.drain(..) {
-                let limit = cmp::min(read_count + desc_len, self.tx_frame_buf.len());
-
-                let read_result = self
-                    .mem
-                    .read_slice(&mut self.tx_frame_buf[read_count..limit], desc_addr);
-                match read_result {
-                    Ok(()) => {
-                        read_count += limit - read_count;
-                    }
-                    Err(e) => {
-                        log::error!("Failed to read slice: {e:?}");
-                        read_count = 0;
-                        break;
+        }
+        if std::mem::take(&mut self.tx_used) {
+            match self.tx_q.queue.needs_notification(&self.mem) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => {
+                    if let Err(e) = self.interrupt.try_signal_used_queue() {
+                        log::error!("Failed to signal tx queue: {e:?}");
                     }
                 }
             }
+        }
+    }
 
-            self.tx_frame_len = read_count;
+    /// Move up to RX_BUDGET frames from the backend into guest buffers.
+    fn process_rx(&mut self) {
+        for _ in 0..RX_BUDGET {
+            if self.frozen_by_controls() {
+                return;
+            }
+            if !self.rx_has_deferred_frame {
+                match self.backend.read_frame(&mut self.rx_frame_buf) {
+                    Ok(len) => {
+                        self.rx_frame_buf_len = len;
+                        self.rx_has_deferred_frame = true;
+                    }
+                    Err(ReadError::NothingRead) => return self.signal_used_queues(),
+                    Err(ReadError::Again) => continue,
+                    Err(ReadError::Disconnected) => {
+                        log::debug!("Network backend reached end of stream");
+                        self.backend_closed = true;
+                        return self.signal_used_queues();
+                    }
+                    Err(e @ ReadError::Internal(_)) => {
+                        log::error!("Failed to process rx: {e:?}");
+                        return self.signal_used_queues();
+                    }
+                }
+            }
+            if self.deliver_rx_frame() {
+                self.rx_has_deferred_frame = false;
+                continue;
+            }
+            // No guest buffer: keep the frame and ask for a kick; buffers
+            // added meanwhile are retried within the budget.
+            match self.rx_q.queue.enable_notification(&self.mem) {
+                Ok(true) => continue,
+                Ok(false) => return self.signal_used_queues(),
+                Err(e) => {
+                    log::error!("error enabling rx queue notifications: {e:?}");
+                    return self.signal_used_queues();
+                }
+            }
+        }
+        self.rx_pending = true;
+        self.signal_used_queues();
+    }
+
+    /// Move up to TX_BUDGET guest frames to the backend. Every chain popped
+    /// here is completed (sent, fully buffered for a partial write, or
+    /// dropped) before the next control check.
+    fn process_tx(&mut self) {
+        if self.frozen_by_controls() {
+            return;
+        }
+        if self.backend.has_unfinished_write() {
             match self
                 .backend
-                .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
+                .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
             {
-                Ok(()) => {
-                    self.tx_frame_len = 0;
-                    tx_queue
-                        .add_used(&self.mem, head_index, 0)
-                        .map_err(TxError::QueueError)?;
-                    raise_irq = true;
+                Ok(()) => {}
+                Err(WriteError::PartialWrite | WriteError::NothingWritten) => {
+                    self.tx_has_deferred_frame = true;
+                    return;
                 }
-                Err(WriteError::NothingWritten) => {
-                    tx_queue.undo_pop();
-                    result = Err(TxError::Backend(WriteError::NothingWritten));
-                    break;
-                }
-                Err(WriteError::PartialWrite) => {
-                    log::trace!("process_tx: partial write");
-                    /*
-                    This situation should be pretty rare, assuming reasonably sized socket buffers.
-                    We have written only a part of a frame to the backend socket (the socket is full).
-
-                    The frame we have read from the guest remains in tx_frame_buf, and will be sent
-                    later.
-
-                    Note that we cannot wait for the backend to process our sending frames, because
-                    the backend could be blocked on sending a remainder of a frame to us - us waiting
-                    for backend would cause a deadlock.
-                     */
-                    tx_queue
-                        .add_used(&self.mem, head_index, 0)
-                        .map_err(TxError::QueueError)?;
-                    raise_irq = true;
-                    break;
-                }
-                Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
-                    return Err(TxError::Backend(e))
-                }
+                Err(e) => self.close_backend_for_tx(e),
             }
         }
-
-        if raise_irq && tx_queue.needs_notification(&self.mem).unwrap() {
-            self.interrupt
-                .try_signal_used_queue()
-                .map_err(TxError::DeviceError)?;
+        self.tx_has_deferred_frame = false;
+        if let Err(e) = self.tx_q.queue.disable_notification(&self.mem) {
+            log::error!("error disabling tx queue notifications: {e:?}");
         }
 
-        result
+        for _ in 0..TX_BUDGET {
+            if self.frozen_by_controls() {
+                return;
+            }
+            let Some(head) = self.tx_q.queue.pop(&self.mem) else {
+                match self.tx_q.queue.enable_notification(&self.mem) {
+                    Ok(true) => {
+                        if let Err(e) = self.tx_q.queue.disable_notification(&self.mem) {
+                            log::error!("error disabling tx queue notifications: {e:?}");
+                        }
+                        continue;
+                    }
+                    Ok(false) => return self.signal_used_queues(),
+                    Err(e) => {
+                        log::error!("error enabling tx queue notifications: {e:?}");
+                        return self.signal_used_queues();
+                    }
+                }
+            };
+            let head_index = head.index;
+            let frame_len = read_tx_chain(&self.mem, head, &mut self.tx_frame_buf);
+
+            match frame_len {
+                Some(len) if len > VNET_HDR_LEN && !self.backend_closed => {
+                    match self
+                        .backend
+                        .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..len])
+                    {
+                        Ok(()) => {}
+                        Err(WriteError::NothingWritten) => {
+                            // Not consumed: the chain is popped again once
+                            // the backend is writable.
+                            self.tx_q.queue.undo_pop();
+                            self.tx_has_deferred_frame = true;
+                            return self.signal_used_queues();
+                        }
+                        Err(WriteError::PartialWrite) => {
+                            // The remainder lives in tx_frame_buf; the chain
+                            // is complete from the guest's point of view.
+                            log::trace!("process_tx: partial write");
+                            self.tx_frame_len = len;
+                            self.complete_tx(head_index);
+                            self.tx_has_deferred_frame = true;
+                            return self.signal_used_queues();
+                        }
+                        Err(e) => self.close_backend_for_tx(e),
+                    }
+                }
+                _ => log::debug!("Dropping guest TX frame"),
+            }
+            self.complete_tx(head_index);
+        }
+        self.tx_pending = true;
+        self.signal_used_queues();
+    }
+
+    fn complete_tx(&mut self, head_index: u16) {
+        if let Err(e) = self.tx_q.queue.add_used(&self.mem, head_index, 0) {
+            log::error!("failed to add used elements to the tx queue: {e:?}");
+        }
+        self.tx_used = true;
+    }
+
+    fn close_backend_for_tx(&mut self, e: WriteError) {
+        if !self.backend_closed {
+            log::error!("Failed to process tx: {e:?}; dropping further guest TX frames");
+        }
+        self.backend_closed = true;
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.
@@ -443,33 +598,55 @@ impl NetWorker {
         queue
             .add_used(&self.mem, head_index, used_len)
             .map_err(FrontendError::QueueError)?;
+        self.rx_used = true;
         result
     }
 
-    // Copies a single frame from `self.rx_frame_buf` into the guest. In case of an error retries
-    // the operation if possible. Returns true if the operation was successfull.
-    fn write_frame_to_guest(&mut self) -> bool {
+    // Copies a single frame from `self.rx_frame_buf` into the guest. Unusable
+    // chains are completed with length 0 and the next one is tried. Returns
+    // true if the frame was delivered.
+    fn deliver_rx_frame(&mut self) -> bool {
         let max_iterations = self.rx_q.queue.actual_size();
         for _ in 0..max_iterations {
             match self.write_frame_to_guest_impl() {
                 Ok(()) => return true,
-                Err(FrontendError::EmptyQueue) => {
-                    // retry
-                    continue;
-                }
-                Err(_) => {
-                    // retry
-                    continue;
-                }
+                Err(FrontendError::EmptyQueue) => return false,
+                Err(_) => continue,
             }
         }
 
         false
     }
-
-    /// Fills self.rx_frame_buf with an ethernet frame from backend and prepends virtio_net_hdr to it
-    fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
-        self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
-        Ok(())
-    }
 }
+
+/// Gather a driver-readable chain into `buf`. Returns `None` for chains the
+/// device cannot send: a device-writable descriptor, unreadable memory or a
+/// frame larger than the buffer.
+fn read_tx_chain(
+    mem: &GuestMemoryMmap,
+    head: DescriptorChain<'_>,
+    buf: &mut [u8; MAX_BUFFER_SIZE],
+) -> Option<usize> {
+    let mut len = 0usize;
+    let mut next = Some(head);
+    while let Some(desc) = next {
+        if desc.is_write_only() {
+            return None;
+        }
+        let end = len.checked_add(desc.len as usize)?;
+        if end > buf.len() {
+            log::warn!("Dropping oversized guest TX frame");
+            return None;
+        }
+        if let Err(e) = mem.read_slice(&mut buf[len..end], desc.addr) {
+            log::error!("Failed to read slice: {e:?}");
+            return None;
+        }
+        len = end;
+        next = desc.next_descriptor();
+    }
+    Some(len)
+}
+
+#[cfg(test)]
+mod tests;

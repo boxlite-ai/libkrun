@@ -1,18 +1,25 @@
 use rand::{rngs::OsRng, TryRngCore};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
 };
 use super::{defs, defs::uapi};
-use crate::virtio::InterruptTransport;
+use crate::virtio::persist::QueueState;
+use crate::virtio::{DescriptorChain, InterruptTransport};
 
 // Request queue.
 pub(crate) const REQ_INDEX: usize = 0;
 
 // Supported features.
-pub(crate) const AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
+pub const AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
+
+/// Complete descriptor chains handled per event callback.
+const MAX_CHAINS_PER_CALLBACK: usize = 64;
+/// Randomness returned for one request; larger buffers complete short.
+const MAX_CHAIN_BYTES: u32 = 64 * 1024;
+const FILL_CHUNK: usize = 4096;
 
 pub struct Rng {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
@@ -53,34 +60,102 @@ impl Rng {
             .queues
             .as_mut()
             .expect("queues should exist when activated");
+        let request = &mut queues[REQ_INDEX];
+        if !request.queue.ready {
+            return false;
+        }
         let mut have_used = false;
 
-        while let Some(head) = queues[REQ_INDEX].queue.pop(mem) {
+        for _ in 0..MAX_CHAINS_PER_CALLBACK {
+            let Some(head) = request.queue.pop(mem) else {
+                return have_used;
+            };
             let index = head.index;
-            let mut written = 0;
-            for desc in head.into_iter() {
-                let mut rand_bytes = vec![0u8; desc.len as usize];
-                if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
-                    error!("Failed to fill buffer with random data: {e:?}");
-                    queues[REQ_INDEX].queue.go_to_previous_position();
-                    break;
-                }
-                if let Err(e) = mem.write_slice(&rand_bytes[..], desc.addr) {
-                    error!("Failed to write slice: {e:?}");
-                    queues[REQ_INDEX].queue.go_to_previous_position();
-                    break;
-                }
-                written += desc.len;
-            }
-
+            let written = fill_chain(mem, head);
             have_used = true;
-            if let Err(e) = queues[REQ_INDEX].queue.add_used(mem, index, written) {
+            if let Err(e) = request.queue.add_used(mem, index, written) {
                 error!("failed to add used elements to the queue: {e:?}");
+            }
+        }
+        // Bounded callbacks keep a snapshot freeze prompt; the rest of the
+        // ring is handled from a later callback.
+        if !request.queue.is_empty(mem) {
+            if let Err(e) = request.event.write(1) {
+                error!("rng: failed to requeue the remaining requests: {e:?}");
             }
         }
 
         have_used
     }
+
+    /// Queue state for a snapshot of a device whose event thread is frozen;
+    /// `None` while inactive, when the transport still owns the queues.
+    pub fn snapshot_queue_states(&self) -> Option<Vec<QueueState>> {
+        let queues = self.queues.as_ref()?;
+        Some(
+            queues
+                .iter()
+                .map(|q| QueueState::from_queue(&q.queue))
+                .collect(),
+        )
+    }
+
+    /// Notify every ready queue, so a restored device examines its ring
+    /// without the source's notifications.
+    pub fn snapshot_kick(&self) {
+        for queue in self.queues.iter().flatten() {
+            queue.kick_if_ready();
+        }
+    }
+}
+
+/// Fill the device-writable buffers of one request with fresh randomness,
+/// at most `MAX_CHAIN_BYTES`, and return how many bytes were written. A
+/// failure ends the request early: it completes with the bytes actually
+/// written and is never rewound, so the same chain is not completed twice.
+fn fill_chain(mem: &GuestMemoryMmap, head: DescriptorChain) -> u32 {
+    let mut chunk = [0u8; FILL_CHUNK];
+    let mut written = 0u32;
+    for desc in head.into_iter() {
+        if written == MAX_CHAIN_BYTES {
+            break;
+        }
+        if !desc.is_write_only() {
+            error!("rng: request has a device-readable buffer");
+            break;
+        }
+        let mut offset = 0u32;
+        while offset < desc.len && written < MAX_CHAIN_BYTES {
+            let len = (desc.len - offset)
+                .min(MAX_CHAIN_BYTES - written)
+                .min(FILL_CHUNK as u32);
+            let bytes = &mut chunk[..len as usize];
+            if let Err(e) = OsRng.try_fill_bytes(bytes) {
+                error!("Failed to fill buffer with random data: {e:?}");
+                return written;
+            }
+            let Some(target) = desc.addr.checked_add(u64::from(offset)) else {
+                error!("rng: request buffer address overflows");
+                return written;
+            };
+            // A buffer crossing the end of guest RAM is written partially;
+            // only the bytes that reached the guest are reported.
+            let copied = match mem.write(bytes, target) {
+                Ok(copied) => copied as u32,
+                Err(e) => {
+                    error!("Failed to write slice: {e:?}");
+                    return written;
+                }
+            };
+            written += copied;
+            if copied < len {
+                error!("rng: request buffer ends outside guest RAM");
+                return written;
+            }
+            offset += len;
+        }
+    }
+    written
 }
 
 impl VirtioDevice for Rng {
@@ -146,6 +221,17 @@ impl VirtioDevice for Rng {
         Ok(())
     }
 
+    /// No worker exists: queue work runs on the owner's event thread, which
+    /// controls when a restored device resumes.
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate(mem, interrupt, queues)
+    }
+
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
@@ -156,3 +242,6 @@ impl VirtioDevice for Rng {
         true
     }
 }
+
+#[cfg(test)]
+mod tests;

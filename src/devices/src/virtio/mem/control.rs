@@ -10,7 +10,8 @@ pub const BLOCK_SIZE: u64 = 2 * MIB;
 
 /// Absolute sizes, including boot RAM. Published atomically under the control lock.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryStatus {
     pub max_mib: u32,
     pub requested_mib: u32,
@@ -26,6 +27,7 @@ pub struct MemoryControl {
     pub(crate) event: EventFd,
     pub initial_mib: u32,
     state: Mutex<MemoryStatus>,
+    frozen: Mutex<bool>,
 }
 
 impl MemoryControl {
@@ -36,6 +38,7 @@ impl MemoryControl {
         Ok(Self {
             event: EventFd::new(EFD_NONBLOCK)?,
             initial_mib,
+            frozen: Mutex::new(false),
             state: Mutex::new(MemoryStatus {
                 max_mib,
                 requested_mib: initial_mib,
@@ -51,6 +54,10 @@ impl MemoryControl {
     }
 
     pub fn request(&self, total_mib: u32) -> io::Result<()> {
+        let frozen = self.frozen.lock().unwrap();
+        if *frozen {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
         let mut state = self.state.lock().unwrap();
         if state.active == 0 {
             return Err(io::Error::from_raw_os_error(libc::EAGAIN));
@@ -65,6 +72,16 @@ impl MemoryControl {
         state.requested_mib = total_mib;
         state.error = 0;
         Ok(())
+    }
+
+    /// Serialize request admission with the owner's pause cut.
+    pub fn freeze(&self, frozen: bool) {
+        *self.frozen.lock().unwrap() = frozen;
+    }
+
+    pub(super) fn restore(&self, status: MemoryStatus) {
+        self.freeze(true);
+        *self.state.lock().unwrap() = status;
     }
 
     pub(crate) fn initialize(&self, region_size: u64) {

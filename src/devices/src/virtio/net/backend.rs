@@ -20,6 +20,11 @@ pub enum ConnectError {
 pub enum ReadError {
     /// Nothing was written
     NothingRead,
+    /// Progress was made but the per-call budget ran out; more data may
+    /// already be readable, so edge-triggered readiness will not report it.
+    Again,
+    /// The peer closed the connection; no further frames will arrive.
+    Disconnected,
     /// Another internal error occurred
     Internal(nix::Error),
 }

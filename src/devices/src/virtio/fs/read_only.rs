@@ -65,6 +65,17 @@ impl PassthroughFsRo {
             inner: PassthroughFs::new(cfg)?,
         })
     }
+
+    /// Wrap an existing (for example restored) share read-only.
+    #[cfg(target_os = "linux")]
+    pub fn from_inner(inner: PassthroughFs) -> Self {
+        Self { inner }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn inner(&self) -> &PassthroughFs {
+        &self.inner
+    }
 }
 
 impl FileSystem for PassthroughFsRo {

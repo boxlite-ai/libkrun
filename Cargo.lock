@@ -658,6 +658,7 @@ dependencies = [
  "nix 0.30.1",
  "pipewire",
  "rand",
+ "serde",
  "thiserror 2.0.18",
  "virtio-bindings",
  "vm-fdt",
@@ -780,6 +781,7 @@ dependencies = [
  "nix 0.30.1",
  "serde",
  "serde_json",
+ "sha2",
  "tdx",
  "vm-memory",
  "vmm-sys-util 0.14.0",
@@ -792,7 +794,9 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a537873e15e8daabb416667e606d9b0abc2a8fb9a45bd5853b888ae0ead82f9"
 dependencies = [
+ "serde",
  "vmm-sys-util 0.14.0",
+ "zerocopy",
 ]
 
 [[package]]
@@ -835,6 +839,7 @@ dependencies = [
  "nitro-enclaves 0.5.0",
  "once_cell",
  "rand",
+ "serde_json",
  "vm-memory",
 ]
 

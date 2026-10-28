@@ -90,6 +90,8 @@ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 // Path to the init binary to be executed inside the VM.
 const INIT_PATH: &str = "/init.krun";
 
+mod snapshot;
+
 static KRUNFW: LazyLock<Option<libloading::Library>> =
     LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
 
@@ -168,6 +170,8 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    /// Present once checkpoints are enabled (`krun_snapshot_enable`).
+    snapshot: Option<snapshot::Setup>,
 }
 
 impl ContextConfig {
@@ -551,6 +555,17 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
+    // A checkpointing context's control entry outlives `krun_start_enter`.
+    match snapshot::free(ctx_id) {
+        Some(busy) if busy < 0 => return busy,
+        Some(_) => {
+            CTX_MAP.lock().unwrap().remove(&ctx_id);
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            memory_hotplug::remove(ctx_id);
+            return KRUN_SUCCESS;
+        }
+        None => {}
+    }
     match CTX_MAP.lock().unwrap().remove(&ctx_id) {
         Some(_) => {
             #[cfg(all(target_os = "linux", not(feature = "tee")))]
@@ -612,6 +627,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: false,
                 read_only: false,
+                vm_owned: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -684,6 +700,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                 shm_size: shm,
                 allow_root_dir_delete: false,
                 read_only,
+                vm_owned: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2051,6 +2068,11 @@ fn create_virtio_net(
         features,
     };
     ctx_cfg.net_index += 1;
+    // A checkpointing VM opens its NIC itself.
+    if let Some(setup) = &mut ctx_cfg.snapshot {
+        setup.nics.push(network_interface_config);
+        return;
+    }
     ctx_cfg
         .vmr
         .add_network_interface(network_interface_config)
@@ -2370,6 +2392,9 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: true,
                 read_only: false,
+                // Created above for this VM alone: a checkpointing VM keeps
+                // it until the VM ends instead of at the guest's request.
+                vm_owned: true,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);
@@ -2599,6 +2624,103 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+/// Load libkrunfw's payload unless a kernel or firmware is configured.
+fn load_payload(ctx_cfg: &mut ContextConfig) -> Result<(), i32> {
+    if ctx_cfg.vmr.external_kernel.is_none()
+        && ctx_cfg.vmr.kernel_bundle.is_none()
+        && ctx_cfg.vmr.firmware_config.is_none()
+    {
+        if let Some(ref krunfw) = ctx_cfg.krunfw {
+            if let Err(err) = unsafe { load_krunfw_payload(krunfw, &mut ctx_cfg.vmr) } {
+                eprintln!("Can't load libkrunfw symbols: {err}");
+                return Err(-libc::ENOENT);
+            }
+        } else {
+            eprintln!("Couldn't find or load {KRUNFW_NAME}");
+            return Err(-libc::ENOENT);
+        }
+    }
+    Ok(())
+}
+
+fn set_kernel_cmdline(ctx_cfg: &mut ContextConfig) -> Result<(), i32> {
+    let kernel_cmdline = KernelCmdlineConfig {
+        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        krun_env: Some(format!(
+            " {} {} {} {} {} {}",
+            ctx_cfg.get_kernel_params(),
+            ctx_cfg.get_exec_path(),
+            ctx_cfg.get_workdir(),
+            ctx_cfg.get_block_root(),
+            ctx_cfg.get_rlimits(),
+            ctx_cfg.get_env(),
+        )),
+        epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+    };
+
+    ctx_cfg
+        .vmr
+        .set_kernel_cmdline(kernel_cmdline)
+        .map_err(|_| -libc::EINVAL)
+}
+
+/// The configured vsock, if any; `has_net` tells the implicit one's
+/// heuristics whether a NIC is configured.
+fn vsock_device_config(ctx_cfg: &ContextConfig, has_net: bool) -> Option<VsockDeviceConfig> {
+    match &ctx_cfg.vsock_config {
+        VsockConfig::Disabled => None,
+        VsockConfig::Explicit { tsi_flags } => Some(VsockDeviceConfig {
+            vsock_id: "vsock0".to_string(),
+            guest_cid: 3,
+            host_port_map: ctx_cfg.tsi_port_map.clone(),
+            unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+            tsi_flags: *tsi_flags,
+        }),
+        VsockConfig::Implicit => {
+            // Implicit vsock configuration - use heuristics
+            // Check if TSI should be enabled based on network configuration
+            let enable_tsi = !has_net;
+
+            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
+
+            if enable_tsi || has_ipc_map {
+                let (tsi_flags, host_port_map) = if enable_tsi {
+                    (TsiFlags::HIJACK_INET, ctx_cfg.tsi_port_map.clone())
+                } else {
+                    (TsiFlags::empty(), None)
+                };
+
+                Some(VsockDeviceConfig {
+                    vsock_id: "vsock0".to_string(),
+                    guest_cid: 3,
+                    host_port_map,
+                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                    tsi_flags,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn set_vmm_ids(ctx_cfg: &ContextConfig) -> Result<(), i32> {
+    if let Some(gid) = ctx_cfg.vmm_gid {
+        if unsafe { libc::setgid(gid) } != 0 {
+            error!("Failed to set gid {gid}");
+            return Err(-std::io::Error::last_os_error().raw_os_error().unwrap());
+        }
+    }
+
+    if let Some(uid) = ctx_cfg.vmm_uid {
+        if unsafe { libc::setuid(uid) } != 0 {
+            error!("Failed to set uid {uid}");
+            return Err(-std::io::Error::last_os_error().raw_os_error().unwrap());
+        }
+    }
+    Ok(())
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2627,19 +2749,14 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         None => return -libc::ENOENT,
     };
 
-    if ctx_cfg.vmr.external_kernel.is_none()
-        && ctx_cfg.vmr.kernel_bundle.is_none()
-        && ctx_cfg.vmr.firmware_config.is_none()
-    {
-        if let Some(ref krunfw) = ctx_cfg.krunfw {
-            if let Err(err) = unsafe { load_krunfw_payload(krunfw, &mut ctx_cfg.vmr) } {
-                eprintln!("Can't load libkrunfw symbols: {err}");
-                return -libc::ENOENT;
-            }
-        } else {
-            eprintln!("Couldn't find or load {KRUNFW_NAME}");
-            return -libc::ENOENT;
-        }
+    // Before any device, payload or kernel setup: the checkpointing VM
+    // does its own.
+    if ctx_cfg.snapshot.is_some() {
+        return snapshot::start_enter(ctx_id, ctx_cfg);
+    }
+
+    if let Err(e) = load_payload(&mut ctx_cfg) {
+        return e;
     }
 
     #[cfg(feature = "blk")]
@@ -2667,24 +2784,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    let kernel_cmdline = KernelCmdlineConfig {
-        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
-        // Kernel parameters ride in krun_env, which is appended for both the
-        // bundled and an external kernel; the prolog applies only to the first.
-        krun_env: Some(format!(
-            " {} {} {} {} {} {}",
-            ctx_cfg.get_kernel_params(),
-            ctx_cfg.get_exec_path(),
-            ctx_cfg.get_workdir(),
-            ctx_cfg.get_block_root(),
-            ctx_cfg.get_rlimits(),
-            ctx_cfg.get_env(),
-        )),
-        epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
-    };
-
-    if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
-        return -libc::EINVAL;
+    if let Err(e) = set_kernel_cmdline(&mut ctx_cfg) {
+        return e;
     }
 
     #[cfg(feature = "net")]
@@ -2703,45 +2804,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
-    match &ctx_cfg.vsock_config {
-        VsockConfig::Disabled => (),
-        VsockConfig::Explicit { tsi_flags } => {
-            let vsock_device_config = VsockDeviceConfig {
-                vsock_id: "vsock0".to_string(),
-                guest_cid: 3,
-                host_port_map: ctx_cfg.tsi_port_map,
-                unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                tsi_flags: *tsi_flags,
-            };
-            ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-        }
-        VsockConfig::Implicit => {
-            // Implicit vsock configuration - use heuristics
-            // Check if TSI should be enabled based on network configuration
-            #[cfg(feature = "net")]
-            let enable_tsi = ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
-            #[cfg(not(feature = "net"))]
-            let enable_tsi = true;
-
-            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
-
-            if enable_tsi || has_ipc_map {
-                let (tsi_flags, host_port_map) = if enable_tsi {
-                    (TsiFlags::HIJACK_INET, ctx_cfg.tsi_port_map)
-                } else {
-                    (TsiFlags::empty(), None)
-                };
-
-                let vsock_device_config = VsockDeviceConfig {
-                    vsock_id: "vsock0".to_string(),
-                    guest_cid: 3,
-                    host_port_map,
-                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                    tsi_flags,
-                };
-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-            }
-        }
+    #[cfg(feature = "net")]
+    let has_net = !ctx_cfg.vmr.net.list.is_empty() || ctx_cfg.legacy_net_cfg.is_some();
+    #[cfg(not(feature = "net"))]
+    let has_net = false;
+    if let Some(vsock_device_config) = vsock_device_config(&ctx_cfg, has_net) {
+        ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
     }
 
     if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
@@ -2754,22 +2822,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(feature = "snd")]
     ctx_cfg.vmr.set_snd_device(ctx_cfg.enable_snd);
 
-    if let Some(console_output) = ctx_cfg.console_output {
+    if let Some(console_output) = ctx_cfg.console_output.take() {
         ctx_cfg.vmr.set_console_output(console_output);
     }
 
-    if let Some(gid) = ctx_cfg.vmm_gid {
-        if unsafe { libc::setgid(gid) } != 0 {
-            error!("Failed to set gid {gid}");
-            return -std::io::Error::last_os_error().raw_os_error().unwrap();
-        }
-    }
-
-    if let Some(uid) = ctx_cfg.vmm_uid {
-        if unsafe { libc::setuid(uid) } != 0 {
-            error!("Failed to set uid {uid}");
-            return -std::io::Error::last_os_error().raw_os_error().unwrap();
-        }
+    if let Err(e) = set_vmm_ids(&ctx_cfg) {
+        return e;
     }
 
     let (sender, _receiver) = unbounded();
@@ -2809,6 +2867,100 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             }
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn krun_snapshot_enable(ctx_id: u32, flags: u32) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => snapshot::enable(ctx_id, ctx_cfg.get_mut(), flags),
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_import(
+    ctx_id: u32,
+    c_image_path: *const c_char,
+    c_disk_dir: *const c_char,
+    c_fs_dir: *const c_char,
+) -> i32 {
+    let _ = (ctx_id, c_image_path, c_disk_dir, c_fs_dir);
+    -libc::ENOTSUP
+}
+
+#[no_mangle]
+pub extern "C" fn krun_snapshot_pause(ctx_id: u32, flags: u32) -> i32 {
+    snapshot::pause(ctx_id, flags)
+}
+
+#[no_mangle]
+pub extern "C" fn krun_snapshot_resume(ctx_id: u32) -> i32 {
+    snapshot::resume(ctx_id)
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_export(ctx_id: u32, c_path: *const c_char) -> i32 {
+    let _ = (ctx_id, c_path);
+    -libc::ENOTSUP
+}
+
+#[no_mangle]
+pub extern "C" fn krun_snapshot_stop(ctx_id: u32) -> i32 {
+    snapshot::stop(ctx_id)
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_get_state(
+    ctx_id: u32,
+    state: *mut u32,
+    exit_code: *mut i32,
+) -> i32 {
+    match snapshot::state(ctx_id) {
+        Ok((current, code)) => {
+            if !state.is_null() {
+                *state = current;
+            }
+            if !exit_code.is_null() {
+                *exit_code = code;
+            }
+            KRUN_SUCCESS
+        }
+        Err(e) => e,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_get_restored_share(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *mut c_char,
+    path_len: size_t,
+) -> i32 {
+    if c_tag.is_null() || c_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let Ok(tag) = CStr::from_ptr(c_tag).to_str() else {
+        return -libc::EINVAL;
+    };
+    let root = match snapshot::restored_share(ctx_id, tag) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(root.as_os_str());
+    let Ok(len) = i32::try_from(bytes.len()) else {
+        return -libc::ERANGE;
+    };
+    if bytes.len() >= path_len {
+        return -libc::ERANGE;
+    }
+    let out = slice::from_raw_parts_mut(c_path as *mut u8, path_len);
+    out[..bytes.len()].copy_from_slice(bytes);
+    out[bytes.len()] = 0;
+    len
 }
 
 #[cfg(feature = "aws-nitro")]

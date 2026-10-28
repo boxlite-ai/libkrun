@@ -7,7 +7,7 @@ use virtio_bindings::virtio_net::virtio_net_hdr_v1;
 use super::QueueConfig;
 
 pub const MAX_BUFFER_SIZE: usize = 65562;
-const QUEUE_SIZE: u16 = 1024;
+pub const QUEUE_SIZE: u16 = 1024;
 pub const NUM_QUEUES: usize = 2;
 pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
 
@@ -29,6 +29,7 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
 }
 
 pub use self::device::Net;
+pub use self::worker::{NetQueueStates, NetWorkerHandle};
 #[derive(Debug)]
 pub enum Error {
     /// EventFd error.

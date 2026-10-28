@@ -6,6 +6,37 @@
 
 # libkrun
 
+### Checkpointing a resized guest
+
+The Linux x86_64 checkpoint owner supports the same live CPU and memory growth
+as the ordinary VMM. Version-9 images now carry the complete provisioned vCPU
+state, virtio-mem transport/queue state, plugged-block bitmap, pending target and
+reservation capacity. Only mapped 128 MiB hotplug slots contribute RAM payload;
+unmapped reservations remain inaccessible and consume no image payload.
+Legacy CMOS capacity describes only boot RAM, including after import;
+virtio-mem reports the separate hotplug reservation and allocation.
+
+Pause closes memory-request admission before freezing CPUs/devices. Status
+queries remain available; growth requests return `-EBUSY` until resume completes.
+Import restores the exact reservation and mapped slots, rebinds the mailbox to
+the new context, and activates the retained memory queue on the frozen owner
+event thread. It stays paused. Resume replays pending target/queue work, after
+which the imported guest can grow again. Hotplug and DAX windows retain disjoint
+KVM slot ranges. Imports reject reservations beyond the target's physical address
+width; replaying pending work preserves a completed guest `UNPLUG_ALL` cut.
+The checkpoint owner's virtio-mem device occupies MMIO `0xd0014000` / GSI 22,
+leaving six disk slots when hotplug is enabled; vsock keeps `0xd000b000` / GSI 7,
+and the NIC keeps GSI 23. Larger checkpoint disk layouts with hotplug are refused
+before boot/import. Ordinary VMM device limits are unchanged.
+This directly extends the current snapshot schema; it does not
+provide an old-format conversion path.
+
+The consumer's focused Linux x86_64/KVM resize/checkpoint/restore/resize and
+independent-home REST continuation scenarios passed on 2026-10-28, including
+default bwrap and VMM seccomp checks. They required a privileged test runner on
+the AppArmor-restricted host. Unit/codec suites, other platforms, lint and
+formatting remain outside that functional validation.
+
 ```libkrun``` is a dynamic library that allows programs to easily acquire the ability to run processes in a partially isolated environment using [KVM](https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt) Virtualization on Linux and [HVF](https://developer.apple.com/documentation/hypervisor) on macOS/ARM64.
 
 It integrates a VMM (Virtual Machine Monitor, the userspace side of an Hypervisor) with the minimum amount of emulated devices required to its purpose, abstracting most of the complexity that comes from Virtual Machine management, offering users a simple C API.
@@ -274,6 +305,192 @@ To avoid this problem, use the ```LD_LIBRARY_PATH``` environment variable to poi
 ```
 LD_LIBRARY_PATH=/usr/local/lib64 ./chroot_vm rootfs_fedora/ /bin/sh
 ```
+
+## Memory checkpoints (experimental, version 9)
+
+The Linux x86_64/KVM owner saves RAM, CPU/KVM/device state and FUSE sessions
+without archiving filesystem contents. A checkpoint pairs `snapshot.mem` with
+one standalone `snapshot.qcow2`; the caller retains external share recovery
+points, open/unlinked objects and the exact readonly boot disk. Version 7/8 full
+images are rejected, never upgraded. RAM-only `KRUNRAM` retains its separate
+version-1 meaning; disk-only BoxLite archives are outside this library contract.
+
+### Descriptor API
+
+The authoritative C signatures and JSON schemas are in
+[`include/libkrun.h`](include/libkrun.h), under “Version-9 descriptor API”. Rust
+embedders use `SnapshotVm` and `snapshot_vm::checkpoint` resource types.
+
+| Operation | Contract |
+| --- | --- |
+| `krun_snapshot_capabilities` | Memory-v9, capture-reservation and external-FD capability bits; zero on unsupported platforms |
+| `begin_capture(CHECKPOINT)` | Reserve an already confirmed Paused owner; never start or implicitly pause |
+| `begin_capture(DISK)` | Reserve Running, pause/drain/flush internally; state queries keep reporting Running |
+| `prepare_capture` | Return bounded session/object JSON and owned CLOEXEC duplicates of retained object FDs; no tree traversal |
+| `export_fd` | Write/seal/sync a new memory FD, binding its paired standalone QCOW2 digest and provider references |
+| `end_capture(COMPLETE)` | Retire token; resume an internal disk capture or retain checkpoint Paused |
+| `end_capture(CANCEL)` | Stop execution; use on cancellation or unknown outcome |
+| `inspect_fd` | Verify version, lengths, checksums and metadata extents without KVM or external-resource creation |
+| `import_fd`, then `start_enter` | Verify supplied disk/share dependencies, restore devices/FUSE/DAX, publish Paused; resume is explicit |
+
+Keep the dedicated connected Unix stream's peer open and silent through the
+caller’s durable pair publication. EOF or data cancels and stops the owner.
+Conflicting mutations return Busy; retired/wrong tokens return ESTALE. Stop
+signals cancellation before queueing so memory-copy loops can abort. Never retry
+an uncertain operation. The old path-based `krun_snapshot_import` and
+`krun_snapshot_export` return ENOTSUP: they cannot express the new dependency
+contract. Ordinary non-checkpoint VM starts retain their API.
+
+Prepare JSON describes ordered shares, saved sessions, guest inode/ctime
+projection, retained objects, handle flags and DAX mappings. A provider supplies
+`resource_id`, `recovery_point`, `object_key` references for external objects,
+with retention lasting beyond source destruction. Import JSON maps each required
+role to exactly one received descriptor index. O_PATH identity descriptors do not
+replace independent access descriptions. Identity descriptors may be reopened
+from a pinned handle through `/proc/self/fd` after unlink/forget; these carry
+O_PATH without O_NOFOLLOW. Path and boot-recipe lookup still uses O_NOFOLLOW.
+Supply each available saved handle and every
+(object,writable) file-DAX role. No privileged file-handle reopening is used.
+The embedding protocol owns SCM_RIGHTS framing, truncation detection, peer
+validation, FD limits and leases; the library checks indices, identities, flags,
+object types, roots and mount consistency. C binding roots are UTF-8 JSON paths;
+use a UTF-8 mount alias for a root whose host path is not UTF-8. Rust bindings
+retain native `PathBuf` roots.
+
+Cached readdir names, types, order and index cookies are independent metadata.
+Stale listing-only names and `.`/`..` need no object FD. Surviving saved names are
+resolved only relative to their retained directory to restore inode projection;
+retained entries also validate their object index.
+Capture records `unlinked: true` only for regular files already unlinked at the
+cut. Import permits a null object index or an omitted handle only for such files.
+An absent object removes its nodes/handles; an absent handle alone preserves the
+object and other handles. A supplied handle without its object identity binding
+is rejected, and aliases across shares must agree about presence. All other
+object/role validation remains strict.
+
+Restore compacts live object indices and remaps session/listing references while
+keeping saved node/handle allocation counters. Ordinary backend accesses to
+missing IDs return EBADF, including release; forget is harmless. Later captures
+contain the remaining backend records, so stale guest IDs stay below the counters.
+Cached guest reads/writeback may still succeed without a FUSE request. Missing
+objects with existing DAX mappings, and missing DAX roles, reject import before
+VM allocation. Direct mappings cannot safely be replaced with zero pages or a
+short host file to synthesize an IO error; KVM memory ownership barriers stay intact.
+
+Omitted unlink eligibility defaults to false: complete older v9 images work, but
+missing bindings remain strict for them. Older readers reject the new true-unlinked
+metadata and null indices. Rust ShareBinding.objects now holds Option<File> slots;
+the descriptor ABI consumes only real FD indices, exactly once each.
+File-backed DAX contains references/mapping metadata; only anonymous DAX pages and
+init.krun bytes belong in the memory payload. `BoxLiteShared` is external too.
+
+Runtime boot roots use only known directories (`.`, `dev`, `proc`, `sys`,
+`newroot`) and synthetic init.krun. Captured references outside that recipe fail.
+The caller prepares a private recipe root before sandbox installation and
+supplies required role FDs against it. Readonly boot disks are full-content
+hashed dependencies, not regenerated substitutes. Writable container disks open
+QCOW2 directly and restore saved capacity, identity, features and queues; the
+caller must pass a private box-owned copy, never the original checkpoint file.
+
+### Device continuation and compatibility
+
+Import preserves guest CPU registers, stack, SIMD, interrupt controllers and
+virtual clocks. It validates the target CPU/KVM capabilities before starting
+vCPUs. Offline storage time is excluded from guest timers; pending and one-shot
+interrupts continue from the captured cut. Imported vCPUs remain Paused until
+explicit resume.
+
+Console restores the control handshake, queued replies and partial TX offset.
+Bytes already accepted by the source output are never replayed to new endpoints;
+unread host input remains at the source. Resume checks saved queues without a
+new guest kick. An inactive console stays inactive until guest activation.
+
+NIC import connects an active device to the supplied new backend. Host partial
+RX remains source-local; cut-time TX chains complete once as dropped on import,
+with an owed interrupt injected after irqchip restoration. New traffic uses only
+the new backend. An inactive NIC connects on later guest activation.
+
+Vsock pause closes old connections. Resume delivers a transport reset before
+reopening the backend; without an event buffer, reopen waits while the guest
+continues. New paths are supplied at import. Failed backend restart stops guest
+execution, and teardown preserves foreign paths. RNG resumes pending requests
+without requiring a new kick; UART/CMOS/i8042 state persists, including guest reset.
+
+External roots and disk files remain caller-owned on failed import and teardown.
+Device continuation tests cross the full v9 descriptor export/import boundary;
+standalone device state tests alone do not establish owner ordering or cleanup.
+
+### Memory format and verification
+
+The 160-byte little-endian header contains `KRUNVM\0\0`, version 9, header length,
+exact total/metadata/payload lengths, paired QCOW2 length, SHA-256 hashes for
+metadata, payload and QCOW2, and sixteen reserved zero bytes. Metadata is bounded
+to 16 MiB and rejects unknown fields. Checked concatenated RAM/init/anonymous-DAX
+extents must cover the payload exactly. The valid header is written only after
+the payload is synced, then synced again. Hashes detect corruption; they are not
+authentication. The library does not publish directories or delete caller files.
+
+The embedder owns private pair staging, sync/no-overwrite publication, external
+storage consistency, cancellation cleanup after joining writers, persistent boot
+pins and bindings for cold starts. All required dependencies must be bound before vCPU
+creation/release. The default BoxLite Linux sandbox is bwrap plus production
+seccomp; an optional post-mount Landlock test is separate, never applied before
+bwrap mounts.
+
+### Development checks
+
+Use the existing Make targets from this directory:
+
+```sh
+make snapshot-fmt
+make snapshot-check
+make snapshot-test
+KRUN_SNAPSHOT_TEST_LIBKRUNFW=/path/to/libkrunfw.so.5 make snapshot-capi-test
+make snapshot-abi-check
+make snapshot-feature-check
+```
+
+Tests with `snapshot_v9` cover the memory envelope, external disk integrity and
+real KVM owner continuation through a private QCOW2 copy (requires `qemu-img`; the block-I/O fixture also uses `qemu-io`).
+Owner channel tests cover reservation, logical Running, Busy, stale token,
+cancellation and disconnect. The rootless `rootless_fs_external_received_*`
+tests exercise actual received orphan/handle/writable-DAX FDs under bwrap and
+the production seccomp filter through BoxLite's `make test:snapshot:rootless`.
+Low-level device/session validation tests remain separate from full-image tests.
+Device continuation assertions use shared external-QCOW2 fixtures instead of
+old RAW-segment/share-archive encodings. C API tests include real KVM capture,
+positive Paused import, descriptor borrowing/index checks and ENOBUFS transfer;
+the complete 16384-descriptor test temporarily raises its process soft limit,
+requiring hard RLIMIT_NOFILE >= 32768. Standalone passthrough archive utilities
+are not used by full checkpoints.
+
+The ignored `snapshot_fs_supplied_noatime_survives_capability_drop` regression
+needs CAP_FOWNER only for source capture, then drops its effective capability
+before opening provider roles and restoring. Run it separately with a test-only
+runner; an ordinary skipped/ignored result is not a pass. For example, create an
+executable `cap-fowner-test-runner` containing:
+
+```sh
+#!/bin/sh
+exec sudo -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups \
+  --inh-caps=-all,+fowner --ambient-caps=-all,+fowner \
+  --bounding-set=-all,+fowner --no-new-privs -- "$@" --include-ignored
+```
+
+Then run `make snapshot-test SNAPSHOT_PKGS='-p krun-devices --features blk,net'
+SNAPSHOT_FILTER=snapshot_fs_supplied_noatime_survives_capability_drop
+SNAPSHOT_RUNNER=/absolute/path/cap-fowner-test-runner`. This requires permission
+to run `sudo setpriv`; it changes only the test process, without changing host
+policy. A bwrap child with AppArmor capability masking does not qualify.
+
+These library checks do not establish BoxLite integration acceptance. Real
+container-process PID/heap marker/execution identity, storage recovery lifetime,
+cross-process operation framing, publication durability and ordinary/imported
+box capability alternation require the later runtime stage.
+
+Known adjacent issue: generic FUSE short reads may return more than the requested
+count (`descriptor_utils::DescriptorChainConsumer::consume` retains an unsliced
+buffer); the full-page continuation test does not validate short-read length.
 
 ## Status
 

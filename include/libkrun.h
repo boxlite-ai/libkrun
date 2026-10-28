@@ -90,13 +90,16 @@ int32_t krun_init_log(int target_fd, uint32_t level, uint32_t style, uint32_t op
 int32_t krun_create_ctx();
 
 /**
- * Frees an existing configuration context.
+ * Frees an existing configuration context. For a checkpointing context it
+ * also frees the control entry, which outlives krun_start_enter: allowed
+ * before krun_start_enter and after it returned.
  *
  * Arguments:
  *  "ctx_id" - the configuration context ID.
  *
  * Returns:
- *  Zero on success or a negative error number on failure.
+ *  Zero on success or a negative error number on failure (-EBUSY while a
+ *  checkpointing VM is starting or its execution has not ended).
  */
 int32_t krun_free_ctx(uint32_t ctx_id);
 
@@ -1254,6 +1257,220 @@ int32_t krun_add_console_port_inout(uint32_t ctx_id,
  */
 int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const char *fstype, const char *options);
 
+/*
+ * Checkpointing VMs (Linux x86_64 with KVM only; elsewhere every
+ * krun_snapshot_* function returns -ENOTSUP).
+ *
+ * A context opts in with krun_snapshot_enable before krun_start_enter, which
+ * then cold-boots the configured guest, or imports a paused one from a
+ * checkpoint (krun_snapshot_import_fd), and serves control requests on the
+ * calling thread until guest execution ends; it then RETURNS instead of
+ * exiting the process (see krun_start_enter). Other threads control the VM
+ * with the functions below. Each control request is run by that thread one
+ * at a time, in order, and the call returns once it ran, without a timeout
+ * (an export may write gigabytes); it is never retried.
+ *
+ * Common errors:
+ *  -ENOTSUP - unsupported platform or build.
+ *  -EINVAL  - invalid argument or call order, or a request the VM's current
+ *             state does not allow; nothing happened.
+ *  -ENOENT  - no checkpointing context with this ID (or already freed).
+ *  -EAGAIN  - krun_start_enter was not called yet; nothing happened.
+ *  -ESRCH   - guest execution already ended, or ended (or never started)
+ *             before the request ran; it did not run.
+ *  -EIO     - the request ran and failed; krun_snapshot_get_state tells the
+ *             outcome: PAUSED after a failed export (the VM stays paused),
+ *             STOPPED or FAILED when the failure ended guest execution.
+ */
+
+/* krun_snapshot_pause flags */
+/* Every host writer of every virtio-fs share (and of any alias of its files)
+ * is stopped until the next resume; exports of a VM with shares need it. */
+#define KRUN_SNAPSHOT_PAUSE_HOST_WRITERS_STOPPED (1u << 0)
+
+/* krun_snapshot_get_state states */
+#define KRUN_SNAPSHOT_STATE_CONFIGURED 0 /* krun_start_enter not called yet */
+#define KRUN_SNAPSHOT_STATE_STARTING   1 /* booting or importing */
+#define KRUN_SNAPSHOT_STATE_RUNNING    2
+#define KRUN_SNAPSHOT_STATE_PAUSED     3
+#define KRUN_SNAPSHOT_STATE_EXITED     4 /* the guest ended; see exit_code */
+#define KRUN_SNAPSHOT_STATE_FAILED     5 /* a host-side failure ended it, or it never started */
+#define KRUN_SNAPSHOT_STATE_STOPPED    6 /* krun_snapshot_stop or an uncertain control failure */
+
+/**
+ * Enables checkpoints for the context. Must precede every krun_add_net_*
+ * call: the NIC then stays an unopened configuration the VM opens itself.
+ * The context's control entry outlives krun_start_enter until krun_free_ctx.
+ *
+ * Supported cold-boot configuration: a UnixStream NIC given by path, disks
+ * without direct I/O that sync fully, up to seven virtio-fs shares, an
+ * explicit vsock without TSI (an empty port map at most) and a console
+ * output file. krun_start_enter refuses anything else (nested
+ * virtualization, split irqchip, firmware, GPU, sound, input, extra
+ * consoles, other NIC backends).
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "flags"  - reserved, must be 0.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure (-EINVAL when
+ *  already enabled, a NIC is configured or flags is not 0).
+ */
+int32_t krun_snapshot_enable(uint32_t ctx_id, uint32_t flags);
+
+/** Legacy archive/path API: always -ENOTSUP. Use krun_snapshot_import_fd. */
+int32_t krun_snapshot_import(uint32_t ctx_id, const char *image_path,
+                             const char *disk_dir, const char *fs_dir);
+
+/**
+ * Pauses every vCPU and device at one cut: RUNNING -> PAUSED. A pause that
+ * fails after taking effect ends guest execution (-EIO, STOPPED or FAILED).
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "flags"  - KRUN_SNAPSHOT_PAUSE_HOST_WRITERS_STOPPED or 0.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure (-EINVAL unless
+ *  RUNNING, or for an unknown flag).
+ */
+int32_t krun_snapshot_pause(uint32_t ctx_id, uint32_t flags);
+
+/**
+ * Resumes a paused VM, including the first run of an import: PAUSED ->
+ * RUNNING. A failure ends guest execution (-EIO, STOPPED or FAILED).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure (-EINVAL unless
+ *  PAUSED).
+ */
+int32_t krun_snapshot_resume(uint32_t ctx_id);
+
+/** Legacy archive/path API: always -ENOTSUP. Use krun_snapshot_export_fd. */
+int32_t krun_snapshot_export(uint32_t ctx_id, const char *path);
+
+/**
+ * Ends guest execution for good, running or paused: STOPPED, then
+ * krun_start_enter returns. Waits for a request already running (such as
+ * an export). Succeeds on a VM whose execution already ended.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure (-EAGAIN before
+ *  krun_start_enter).
+ */
+int32_t krun_snapshot_stop(uint32_t ctx_id);
+
+/**
+ * Reads the state the VM owner last published, without waiting for a
+ * running request. After a control request returned it reflects at least
+ * that request's result; a guest exit or failure is published as soon as
+ * the owner sees it.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "state"     - receives a KRUN_SNAPSHOT_STATE_* value (may be NULL).
+ *  "exit_code" - receives the guest's exit status when EXITED (the code
+ *                init set, else the exiting vCPU's, else 0), else 0
+ *                (may be NULL).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_snapshot_get_state(uint32_t ctx_id, uint32_t *state, int32_t *exit_code);
+
+/**
+ * Gets the externally bound root of an imported share by its virtio-fs
+ * tag, from the end of a successful import until krun_free_ctx.
+ *
+ * Arguments:
+ *  "ctx_id"   - the configuration context ID.
+ *  "tag"      - the share's virtio-fs tag.
+ *  "path"     - receives the absolute path, NUL-terminated.
+ *  "path_len" - the size of "path".
+ *
+ * Returns:
+ *  The path's length without the NUL on success, else a negative error
+ *  number: -ENOENT without such an imported share (also for the VM-owned
+ *  boot root), -ERANGE when "path_len" is too small.
+ */
+int32_t krun_snapshot_get_restored_share(uint32_t ctx_id, const char *tag,
+                                         char *path, size_t path_len);
+
+/* Version-9 capabilities (zero on unsupported platforms/builds without blk). */
+#define KRUN_SNAPSHOT_CAP_MEMORY_V9 (1ull << 0)
+#define KRUN_SNAPSHOT_CAP_CAPTURE_RESERVATION (1ull << 1)
+#define KRUN_SNAPSHOT_CAP_EXTERNAL_FDS (1ull << 2)
+#define KRUN_SNAPSHOT_CAPTURE_CHECKPOINT 0u
+#define KRUN_SNAPSHOT_CAPTURE_DISK 1u
+#define KRUN_SNAPSHOT_CAPTURE_COMPLETE 0u
+#define KRUN_SNAPSHOT_CAPTURE_CANCEL 1u
+uint64_t krun_snapshot_capabilities(void);
+
+/* All input FDs are borrowed and duplicated CLOEXEC. JSON is UTF-8, at most
+ * 16 MiB; output lengths exclude NUL. Inspection validates v9 header, full
+ * metadata/payload checksums and extents without KVM/resources. It returns
+ * metadata including application, disk dependencies and FUSE object references.
+ * -ENOBUFS sets required length without transferring any FDs. */
+int32_t krun_snapshot_inspect_fd(int32_t memory_fd, uint8_t *json, size_t *length);
+
+/* Atomically reserve owner state: CHECKPOINT requires confirmed PAUSED;
+ * DISK requires RUNNING and internally drains/pauses while queries still report
+ * RUNNING. Conflicting mutations return -EBUSY. session_fd must be a connected
+ * AF_UNIX SOCK_STREAM; keep the peer open and silent through publication.
+ * EOF, any data, CANCEL, or uncertain result stops execution. Never retry.
+ * COMPLETE resumes a disk capture, leaves a checkpoint PAUSED, and retires the
+ * token. Tokens are context-local; stale/missing tokens return -ESTALE. */
+int32_t krun_snapshot_begin_capture(uint32_t ctx_id, uint32_t kind,
+                                  int32_t session_fd, uint64_t *token);
+int32_t krun_snapshot_end_capture(uint32_t ctx_id, uint64_t token, uint32_t outcome);
+
+/* Prepare a reserved CHECKPOINT's sessions and retained objects. Output FDs are
+ * owned by caller on success, in JSON session/object order (boot recipe objects
+ * included); close them. On -ENOBUFS both required counts are set, no FD escapes;
+ * retrying preparation on the same frozen cut is safe. Cached directory names
+ * alone never require FDs. Caller associates external objects with durable
+ * resource_id/recovery_point/object_key triples; boot recipe objects take no
+ * external references. The output is not a filesystem-content archive. */
+int32_t krun_snapshot_prepare_capture(uint32_t ctx_id, uint64_t token,
+                                    uint8_t *json, size_t *length,
+                                    int32_t *fds, size_t *fd_count);
+
+/* memory_fd must be empty, seekable O_RDWR without O_APPEND; qcow2_fd identifies the caller's
+ * frozen standalone QCOW2 copy. Metadata JSON: {application_schema:1,
+ * application:<value>, objects:[[<external reference>,...],...]}, one vector per
+ * prepared share. Writes/seals/syncs memory only; caller owns pair publication,
+ * dependency retention, cleanup and COMPLETE after durable publication.
+ * Failure leaves memory invalid/partial and owner reserved PAUSED until caller
+ * completes a known failure or cancels an uncertain one. */
+int32_t krun_snapshot_export_fd(uint32_t ctx_id, uint64_t token,
+                               int32_t memory_fd, int32_t qcow2_fd,
+                               const uint8_t *json, size_t length);
+
+/* Configure a new enabled context before start_enter. Binding JSON:
+ * {disks:[fd_index,...], shares:[{root:"/prepared/root", objects:[fd_index,...],
+ * handles:{"saved_handle_id":fd_index,...},
+ * dax:[{object:<index>,writable:<bool>,fd:<index>},...]}]}.
+ * Every FD index is used exactly once, <=16384 total. Disk order is saved guest
+ * order; writable container is QCOW2, readonly boot must match full digest.
+ * Objects are pinned O_PATH descriptors in saved order; null marks an absent
+ * saved unlinked regular file. Its handle roles may be omitted. An absent handle
+ * role alone is allowed only for a saved unlinked regular file. Missing objects
+ * with existing DAX mappings, and missing DAX roles, are rejected. Missing backend
+ * node/handle requests fail with EBADF; saved ID counters prevent reuse.
+ * O_NOFOLLOW is not required for descriptors reopened through /proc/self/fd.
+ * Supply independent descriptions
+ * with exact saved flags for handles and O_RDONLY/O_RDWR for DAX. For vm_owned
+ * boot roots provide an empty private recipe root with dev/proc/sys/newroot
+ * directories, objects:[], and handle/DAX roles against those recipe objects.
+ * Prepare roots before sandbox installation, pass descriptors afterward; all
+ * bindings precede vCPU creation. start_enter verifies pair/dependencies, opens
+ * QCOW2 directly, restores FUSE/DAX/devices and publishes PAUSED. Caller retains
+ * disks/mounts/leases through VM lifetime and future cold starts. */
+int32_t krun_snapshot_import_fd(uint32_t ctx_id, int32_t memory_fd,
+                               const uint8_t *json, size_t length,
+                               const int32_t *fds, size_t fd_count);
+
 /**
  * Starts and enters the microVM with the configured parameters. The VMM will attempt to take over
  * stdin/stdout to manage them on behalf of the process running inside the isolated environment,
@@ -1274,6 +1491,15 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  *  125     - "init" cannot set up the environment inside the microVM.
  *  126     - "init" can find the executable to be run inside the microVM but cannot execute it.
  *  127     - "init" cannot find the executable to be run inside the microVM.
+ *
+ * Checkpointing contexts (krun_snapshot_enable):
+ *  The calling thread owns the VM and serves krun_snapshot_* requests until
+ *  guest execution ends; the process is never exited. Returns 0 once the
+ *  started VM ended, with every VM thread joined (krun_snapshot_get_state
+ *  then tells EXITED with the exit code, FAILED or STOPPED), or a negative
+ *  error number when the boot or import failed (state FAILED): -EINVAL for
+ *  a configuration libkrun refuses, -EIO when creating the VM failed (the
+ *  log names the reason).
  *
  * Returns:
  *  -EINVAL - The VMM has detected an error in the microVM configuration.

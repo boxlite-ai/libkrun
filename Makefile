@@ -87,6 +87,108 @@ endif
 
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 
+# Internal minimal-VM snapshot checks; callers supply cross C/linker settings.
+# The blk/net features enable the virtio-blk/net snapshot code and device tests;
+# the RNG/balloon and legacy UART/CMOS/i8042 snapshot code needs no feature.
+SNAPSHOT_TARGET ?= x86_64-unknown-linux-gnu
+SNAPSHOT_FILTER ?= snapshot
+SNAPSHOT_CARGO_FLAGS ?= --offline
+SNAPSHOT_AS ?= as
+SNAPSHOT_OBJCOPY ?= objcopy
+SNAPSHOT_GUEST = src/vmm/src/ram_snapshot/full/guest
+SNAPSHOT_PKGS = -p krun-vmm --features blk,net -p krun-devices --features blk,net
+# The C API crate too: it records the VM-owned boot root for snapshot boots.
+SNAPSHOT_BUILD_PKGS = -p krun-vmm -p libkrun --features blk,net
+# Optional cargo target runner for executing the cross-built tests, e.g. a
+# Linux container from macOS (no /dev/kvm: KVM tests fail) or one with
+# --device /dev/kvm on a Linux KVM host.
+SNAPSHOT_RUNNER ?=
+CARGO_TARGET_DIR_OR_DEFAULT = $(or $(CARGO_TARGET_DIR),target)
+SNAPSHOT_RUNNER_VAR = CARGO_TARGET_$(shell echo '$(SNAPSHOT_TARGET)' | tr 'a-z-' 'A-Z_')_RUNNER
+# Host-native virtio-net worker/backend tests (macOS or Linux, no KVM).
+SNAPSHOT_NET_FILTER ?= snapshot_net
+# Host-native vsock Unix IPC backend lifecycle tests (macOS or Linux, no KVM).
+SNAPSHOT_VSOCK_FILTER ?= snapshot_vsock
+# Host-native virtio-console port worker and state tests (macOS or Linux, no KVM).
+SNAPSHOT_CONSOLE_FILTER ?= snapshot_console
+# The virtio-fs worker and passthrough session tests (snapshot_fs) are
+# Linux-only and run with the krun-devices and krun-vmm tests of
+# `snapshot-test`; the share archive and owner tests need root with
+# CAP_SYS_ADMIN and CAP_MKNOD on a tmpfs /tmp (e.g. docker run --cap-add
+# SYS_ADMIN --tmpfs /tmp:rw,exec).
+# The guest-visible archive tests without privilege (rootless_fs) are
+# skipped there and run with `snapshot-rootless-test`: as a non-root user in
+# a user namespace mapping only its own IDs, without capabilities (the
+# SNAPSHOT_RUNNER provides that; every test checks it), with export and
+# import under the seccomp filter SNAPSHOT_SECCOMP_BPF names.
+SNAPSHOT_ROOTLESS_FILTER ?= rootless_fs
+SNAPSHOT_SECCOMP_BPF ?=
+# The checkpoint C API (`krun_snapshot_*`): `snapshot-capi-test` runs the
+# libkrun crate's tests (argument/order checks and the owner channel with a
+# fake VM; no KVM); `snapshot-abi-check` compiles tests/snapshot-abi against
+# include/libkrun.h with the exact signatures and runs it on the built
+# library; `snapshot-feature-check` checks the C API crate without and with
+# each device feature (they change the context's fields); and
+# `snapshot-host-check` builds and runs its tests natively on a host where
+# checkpoints are unsupported (e.g. macOS: every call returns -ENOTSUP),
+# with a placeholder guest init binary.
+# The header documents "/dev/input/*" inside comments, hence -Wno-comment.
+SNAPSHOT_CAPI_FILTER ?= snapshot
+SNAPSHOT_CC ?= cc
+SNAPSHOT_ABI_OUT = target/snapshot-abi
+.PHONY: snapshot-fmt snapshot-check snapshot-build snapshot-test snapshot-rootless-test snapshot-guest snapshot-net-host-test snapshot-vsock-host-test snapshot-console-host-test snapshot-capi-test snapshot-abi-check snapshot-feature-check snapshot-host-check
+snapshot-fmt:
+	rustfmt --edition 2021 src/vmm/src/ram_snapshot.rs src/vmm/src/linux/vstate.rs src/devices/src/virtio/persist.rs src/devices/src/virtio/mmio.rs src/devices/src/virtio/queue.rs src/devices/src/virtio/device.rs src/devices/src/virtio/block/device.rs src/devices/src/virtio/block/worker.rs src/devices/src/virtio/block/mod.rs src/vmm/src/ram_snapshot/full.rs src/vmm/src/ram_snapshot/blk/mod.rs src/vmm/src/ram_snapshot/blk/tests.rs src/devices/src/virtio/control.rs src/devices/src/virtio/net/backend.rs src/devices/src/virtio/net/device.rs src/devices/src/virtio/net/mod.rs src/devices/src/virtio/net/unixstream.rs src/devices/src/virtio/net/worker.rs src/devices/src/virtio/rng/mod.rs src/devices/src/virtio/rng/device.rs src/devices/src/virtio/balloon/mod.rs src/devices/src/virtio/balloon/device.rs src/devices/src/legacy/x86_64/serial.rs src/devices/src/legacy/x86_64/cmos.rs src/devices/src/legacy/i8042.rs src/devices/src/virtio/vsock/mod.rs src/vmm/src/ram_snapshot/vsock.rs src/devices/src/virtio/console/mod.rs src/vmm/src/ram_snapshot/console.rs src/devices/src/virtio/fs/mod.rs src/vmm/src/snapshot_vm.rs src/libkrun/src/snapshot.rs
+
+snapshot-check:
+	cargo check $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --tests --target $(SNAPSHOT_TARGET)
+	cargo check $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_BUILD_PKGS) --target $(SNAPSHOT_TARGET)
+
+snapshot-build:
+	cargo build $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_BUILD_PKGS) --target $(SNAPSHOT_TARGET)
+
+snapshot-test:
+	$(if $(SNAPSHOT_RUNNER),$(SNAPSHOT_RUNNER_VAR)='$(SNAPSHOT_RUNNER)') cargo test $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --target $(SNAPSHOT_TARGET) $(SNAPSHOT_FILTER) -- --test-threads=1 --skip $(SNAPSHOT_ROOTLESS_FILTER)
+
+snapshot-rootless-test:
+	$(if $(SNAPSHOT_SECCOMP_BPF),,$(error SNAPSHOT_SECCOMP_BPF must name the seccomp filter (raw sock_filter instructions) to run under))
+	$(if $(SNAPSHOT_RUNNER),$(SNAPSHOT_RUNNER_VAR)='$(SNAPSHOT_RUNNER)') KRUN_TEST_SECCOMP_BPF='$(SNAPSHOT_SECCOMP_BPF)' cargo test $(SNAPSHOT_CARGO_FLAGS) $(SNAPSHOT_PKGS) --target $(SNAPSHOT_TARGET) $(SNAPSHOT_ROOTLESS_FILTER) -- --test-threads=1
+
+snapshot-capi-test:
+	$(if $(SNAPSHOT_RUNNER),$(SNAPSHOT_RUNNER_VAR)='$(SNAPSHOT_RUNNER)') cargo test $(SNAPSHOT_CARGO_FLAGS) -p libkrun --features blk,net --lib --target $(SNAPSHOT_TARGET) $(SNAPSHOT_CAPI_FILTER) -- --test-threads=1
+
+snapshot-abi-check:
+	cargo build $(SNAPSHOT_CARGO_FLAGS) -p libkrun --features blk,net --target $(SNAPSHOT_TARGET)
+	mkdir -p $(SNAPSHOT_ABI_OUT)
+	$(SNAPSHOT_CC) -std=c11 -Wall -Wextra -Werror -Wno-comment -Iinclude tests/snapshot-abi/abi_check.c -L$(CARGO_TARGET_DIR_OR_DEFAULT)/$(SNAPSHOT_TARGET)/debug -lkrun -o $(SNAPSHOT_ABI_OUT)/abi_check
+	ln -sf $(abspath $(CARGO_TARGET_DIR_OR_DEFAULT))/$(SNAPSHOT_TARGET)/debug/libkrun.so $(SNAPSHOT_ABI_OUT)/libkrun.so.1
+	LD_LIBRARY_PATH=$(SNAPSHOT_ABI_OUT) $(SNAPSHOT_ABI_OUT)/abi_check
+
+snapshot-feature-check:
+	cargo check $(SNAPSHOT_CARGO_FLAGS) -p libkrun --lib --tests --target $(SNAPSHOT_TARGET)
+	cargo check $(SNAPSHOT_CARGO_FLAGS) -p libkrun --features blk --lib --tests --target $(SNAPSHOT_TARGET)
+	cargo check $(SNAPSHOT_CARGO_FLAGS) -p libkrun --features net --lib --tests --target $(SNAPSHOT_TARGET)
+	cargo check $(SNAPSHOT_CARGO_FLAGS) -p libkrun --features blk,net --lib --tests --target $(SNAPSHOT_TARGET)
+
+snapshot-host-check:
+	mkdir -p target/snapshot-host && : > target/snapshot-host/init
+	KRUN_INIT_BINARY_PATH=$(CURDIR)/target/snapshot-host/init cargo test $(SNAPSHOT_CARGO_FLAGS) -p libkrun --lib $(SNAPSHOT_CAPI_FILTER) -- --test-threads=1
+	KRUN_INIT_BINARY_PATH=$(CURDIR)/target/snapshot-host/init cargo test $(SNAPSHOT_CARGO_FLAGS) -p libkrun --features blk,net --lib $(SNAPSHOT_CAPI_FILTER) -- --test-threads=1
+
+snapshot-net-host-test:
+	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-devices --features net $(SNAPSHOT_NET_FILTER) -- --test-threads=1
+
+snapshot-vsock-host-test:
+	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-devices $(SNAPSHOT_VSOCK_FILTER) -- --test-threads=1
+
+snapshot-console-host-test:
+	cargo test $(SNAPSHOT_CARGO_FLAGS) -p krun-devices $(SNAPSHOT_CONSOLE_FILTER) -- --test-threads=1
+
+snapshot-guest:
+	$(SNAPSHOT_AS) --32 $(SNAPSHOT_GUEST).S -o $(SNAPSHOT_GUEST).o
+	$(SNAPSHOT_OBJCOPY) -O binary -j .text $(SNAPSHOT_GUEST).o $(SNAPSHOT_GUEST).bin
+	rm $(SNAPSHOT_GUEST).o
+
 debug: $(LIBRARY_DEBUG_$(OS)) libkrun.pc
 
 ifeq ($(OS),Darwin)

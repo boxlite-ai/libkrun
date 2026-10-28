@@ -5,6 +5,7 @@ pub mod device;
 mod worker;
 
 pub use self::device::{Block, CacheType};
+pub use self::worker::{BlockWorkerHandle, WorkerControlError};
 
 use vm_memory::GuestMemoryError;
 
@@ -29,6 +30,8 @@ pub enum Error {
     GuestMemory(GuestMemoryError),
     /// The requested operation would cause a seek beyond disk end.
     InvalidOffset,
+    /// Snapshot identity/config bytes have an unsupported length.
+    InvalidSnapshotIdentity,
     /// Guest gave us a read only descriptor that protocol says to write to.
     UnexpectedReadOnlyDescriptor,
     /// Guest gave us a write only descriptor that protocol says to read from.
@@ -81,4 +84,36 @@ impl TryFrom<u32> for SyncMode {
             }
         }
     }
+}
+
+/// Reconstruct the sync mode that offers the saved feature set: the FLUSH
+/// feature is only offered when the sync mode is not `None`.
+pub fn snapshot_sync_mode(avail_features: u64) -> SyncMode {
+    if avail_features & (1u64 << virtio_bindings::virtio_blk::VIRTIO_BLK_F_FLUSH) != 0 {
+        SyncMode::Full
+    } else {
+        SyncMode::None
+    }
+}
+
+/// The exact feature set `Block::new` offers for an internal snapshot disk
+/// (fixed `SyncMode::Full` at attach): single source of truth for save-side
+/// construction and restore-side validation.
+pub fn snapshot_offered_features(read_only: bool) -> u64 {
+    use virtio_bindings::virtio_blk::{
+        VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
+        VIRTIO_BLK_F_WRITE_ZEROES,
+    };
+    use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
+    use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+    let mut features = (1u64 << VIRTIO_F_VERSION_1)
+        | (1u64 << VIRTIO_BLK_F_SEG_MAX)
+        | (1u64 << VIRTIO_BLK_F_DISCARD)
+        | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
+        | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+        | (1u64 << VIRTIO_BLK_F_FLUSH);
+    if read_only {
+        features |= 1u64 << VIRTIO_BLK_F_RO;
+    }
+    features
 }

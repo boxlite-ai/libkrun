@@ -25,6 +25,56 @@ use super::{
     VirtioDevice,
 };
 use control::{BLOCK_SIZE, MIB};
+use super::persist::QueueState;
+
+/// Guest block ownership and the host target are distinct from mapped KVM slots.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemSnapshot {
+    pub addr: u64,
+    pub size: u64,
+    pub initial_mib: u32,
+    pub status: MemoryStatus,
+    pub requested_size: u64,
+    pub usable_region_size: u64,
+    pub plugged: Vec<bool>,
+}
+
+impl MemSnapshot {
+    pub fn validate(&self) -> std::io::Result<()> {
+        let invalid = || std::io::Error::from_raw_os_error(libc::EINVAL);
+        let s = &self.status;
+        if self.initial_mib == 0 || self.size == 0 || self.size % SLOT_SIZE != 0
+            || self.addr < (1 << 32) || self.addr % SLOT_SIZE != 0
+            || self.addr.checked_add(self.size).is_none_or(|end| end > (1 << 52))
+            || self.size / MIB + u64::from(self.initial_mib) != u64::from(s.max_mib)
+            || self.plugged.len() as u64 != self.size / BLOCK_SIZE
+            || s.active > 1 || s.error < 0
+            || s.requested_mib < self.initial_mib || s.requested_mib > s.max_mib
+            || (s.requested_mib - self.initial_mib) % SLOT_MIB != 0
+            || self.requested_size > u64::from(s.requested_mib - self.initial_mib) * MIB
+            || self.requested_size % SLOT_SIZE != 0
+            || self.usable_region_size > self.size
+            || self.usable_region_size % BLOCK_SIZE != 0
+            || self.usable_region_size < self.requested_size && self.usable_region_size != 0
+            || s.active == 0 && (s.requested_mib != self.initial_mib
+                || self.requested_size != 0 || self.usable_region_size != 0 || s.plugged_mib != self.initial_mib)
+        { return Err(invalid()); }
+        let plugged = self.plugged.iter().filter(|&&b| b).count() as u64 * BLOCK_SIZE;
+        let mapped = self.mapped_slots().count() as u64 * SLOT_SIZE;
+        if plugged > self.requested_size
+            || self.plugged.iter().enumerate().any(|(i, &b)| b && (i as u64 + 1) * BLOCK_SIZE > self.usable_region_size)
+            || plugged / MIB + u64::from(self.initial_mib) != u64::from(s.plugged_mib)
+            || mapped / MIB + u64::from(self.initial_mib) != u64::from(s.mapped_mib)
+        { return Err(invalid()); }
+        Ok(())
+    }
+
+    pub fn mapped_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.plugged.chunks((SLOT_SIZE / BLOCK_SIZE) as usize)
+            .enumerate().filter_map(|(i, blocks)| blocks.iter().any(|&b| b).then_some(i))
+    }
+}
 const QUEUES: [QueueConfig; 1] = [QueueConfig::new(128)];
 
 #[repr(C)]
@@ -54,6 +104,45 @@ pub struct Mem {
 }
 
 impl Mem {
+    pub fn control(&self) -> Arc<MemoryControl> { self.control.clone() }
+
+    pub fn snapshot(&self) -> MemSnapshot {
+        MemSnapshot {
+            addr: self.region.addr, size: self.region.size,
+            initial_mib: self.control.initial_mib, status: self.control.status(),
+            requested_size: self.config.requested_size,
+            usable_region_size: self.config.usable_region_size,
+            plugged: self.plugged.clone(),
+        }
+    }
+
+    pub fn restore_snapshot(&mut self, state: &MemSnapshot) -> std::io::Result<()> {
+        state.validate()?;
+        if self.region.addr != state.addr || self.region.size != state.size {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        for slot in state.mapped_slots() { self.region.update_slot(slot, true)?; }
+        self.config.plugged_size = u64::from(state.status.plugged_mib - state.initial_mib) * MIB;
+        self.config.requested_size = state.requested_size;
+        self.config.usable_region_size = state.usable_region_size;
+        self.plugged.clone_from(&state.plugged);
+        self.control.restore(state.status);
+        Ok(())
+    }
+
+    pub fn snapshot_queue_states(&self) -> Option<Vec<QueueState>> {
+        self.queue.as_ref().map(|q| vec![QueueState::from_queue(&q.queue)])
+    }
+
+    /// Reissue both target and queue notifications lost with source eventfds.
+    pub fn snapshot_kick(&self) {
+        // UNPLUG_ALL may intentionally leave usable size zero with an unchanged
+        // host target. Replay only a target not yet consumed at the saved cut.
+        let target = u64::from(self.control.status().requested_mib - self.control.initial_mib) * MIB;
+        if target != self.config.requested_size { let _ = self.control.event.write(1); }
+        if let Some(queue) = &self.queue { let _ = queue.event.write(1); }
+    }
+
     pub fn new(control: Arc<MemoryControl>, region: HotplugRegion) -> std::io::Result<Self> {
         control.initialize(region.size);
         Ok(Self {
@@ -214,10 +303,13 @@ impl Mem {
                 break;
             }
         }
-        let error = self.control.status().error;
-        self.control
-            .progress(self.config.plugged_size, self.region.mapped_size(), error);
+        self.publish_progress();
         self.state.signal_used_queue();
+    }
+
+    fn publish_progress(&self) {
+        let error = self.control.status().error;
+        self.control.progress(self.config.plugged_size, self.region.mapped_size(), error);
     }
 
     fn update_target(&mut self) {
@@ -280,6 +372,16 @@ impl VirtioDevice for Mem {
     fn is_activated(&self) -> bool {
         self.state.is_activated()
     }
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        // The owner's restored event thread stays frozen until resume;
+        // activation only retains queues and posts its registration event.
+        self.activate(mem, interrupt, queues)
+    }
 }
 
 impl Subscriber for Mem {
@@ -324,6 +426,40 @@ impl Subscriber for Mem {
 mod tests {
     use super::*;
     use kvm_ioctls::Kvm;
+
+    #[test]
+    fn checkpoint_kick_preserves_unplug_all_without_a_pending_target() {
+        let mut device = device(0, 1, 1);
+        assert_eq!(device.request(2, 0, 0).0, 0);
+        device.control.event.read().unwrap();
+        device.snapshot_kick();
+        assert!(device.control.event.read().is_err());
+        assert_eq!(device.config.usable_region_size, 0);
+    }
+
+    #[test]
+    fn checkpoint_restores_partial_slots_and_pending_target_then_accepts_growth() {
+        let mut source = device(0, 3, 2);
+        assert_eq!(source.request(0, source.config.addr, 1).0, 0);
+        assert_eq!(source.request(0, source.config.addr + SLOT_SIZE, 1).0, 0);
+        source.publish_progress();
+        // Freeze a target not yet consumed by the event thread.
+        source.control.request(256 + 3 * SLOT_MIB).unwrap();
+        source.control.freeze(true);
+        let saved = source.snapshot();
+        let mut target = device(0, 3, 1);
+        target.restore_snapshot(&saved).unwrap();
+        assert_eq!(target.region.mapped_size(), 2 * SLOT_SIZE);
+        assert_eq!(target.config.plugged_size, 2 * BLOCK_SIZE);
+        assert_eq!(target.config.requested_size, 2 * SLOT_SIZE);
+        assert_eq!(target.control.status().requested_mib, 256 + 3 * SLOT_MIB);
+        assert_eq!(target.control.request(256 + 3 * SLOT_MIB).unwrap_err().raw_os_error(), Some(libc::EBUSY));
+        target.update_target();
+        target.control.freeze(false);
+        target.control.request(256 + 3 * SLOT_MIB).unwrap();
+        assert_eq!(target.request(0, target.config.addr + 2 * SLOT_SIZE, 1).0, 0);
+        assert_eq!(target.region.mapped_size(), 3 * SLOT_SIZE);
+    }
 
     fn device(first_slot: u32, slots: u32, requested_slots: u32) -> Mem {
         let kvm = Kvm::new().unwrap();

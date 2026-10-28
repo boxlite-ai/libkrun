@@ -18,6 +18,7 @@ use std::result;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use imago::io_buffers::IoVectorMut;
 use imago::{
     file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
     PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
@@ -27,9 +28,9 @@ use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryMmap, VolatileSlice};
 
-use super::worker::BlockWorker;
+use super::worker::{BlockWorker, BlockWorkerHandle};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
@@ -138,6 +139,12 @@ impl DiskProperties {
     pub fn cache_type(&self) -> CacheType {
         self.cache_type
     }
+
+    /// Replace the GET_ID bytes reported to the guest when restoring a
+    /// snapshot identity built against another host file.
+    pub(crate) fn restore_image_id(&mut self, image_id: Vec<u8>) {
+        self.image_id = image_id;
+    }
 }
 
 impl Drop for DiskProperties {
@@ -200,6 +207,9 @@ struct VirtioBlkConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBlkConfig {}
 
+/// Byte length of the complete guest-visible block configuration.
+pub const VIRTIO_BLK_CONFIG_SIZE: usize = std::mem::size_of::<VirtioBlkConfig>();
+
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
     // Host file and properties.
@@ -207,8 +217,11 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    snapshot_source: Option<File>,
+    image_type: ImageType,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    worker_control: Option<BlockWorkerHandle>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -244,6 +257,13 @@ impl Block {
             .open(PathBuf::from(&disk_image_path))?;
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        // Keep the exact readonly file, including bytes beyond guest sectors.
+        let snapshot_source = if is_disk_read_only {
+            Some(disk_image.try_clone()?)
+        } else {
+            None
+        };
+        let image_type = disk_image_format.clone();
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
@@ -322,11 +342,14 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            snapshot_source,
+            image_type,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_control: None,
         })
     }
 
@@ -343,6 +366,84 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+
+    /// The GET_ID bytes the guest sees for this disk.
+    pub fn image_id(&self) -> &[u8] {
+        &self.disk_image_id
+    }
+
+    /// Host-side cache policy in use for this disk.
+    pub fn cache_type(&self) -> CacheType {
+        self.cache_type
+    }
+
+    /// The shared image handle; used to flush inactive devices during a
+    /// snapshot cut when no worker owns the disk.
+    pub fn shared_image(&self) -> &Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>> {
+        &self.disk_image
+    }
+
+    /// Snapshot control handle for the activated worker, if any.
+    pub fn worker_control(&self) -> Option<&BlockWorkerHandle> {
+        self.worker_control.as_ref()
+    }
+
+    /// The complete guest-visible device configuration, byte-exact.
+    pub fn config_bytes(&self) -> Vec<u8> {
+        self.config.as_slice().to_vec()
+    }
+
+    /// Logical capacity in 512-byte sectors exposed to the guest.
+    pub fn nsectors(&self) -> u64 {
+        self.config.capacity
+    }
+
+    /// Restore the guest-visible identity: exact config bytes (validated for
+    /// length) and the VIRTIO_BLK_T_GET_ID bytes, so a restored guest keeps
+    /// seeing the original device.
+    pub fn restore_snapshot_identity(
+        &mut self,
+        config: &[u8],
+        image_id: Vec<u8>,
+    ) -> result::Result<(), Error> {
+        if config.len() != std::mem::size_of::<VirtioBlkConfig>()
+            || image_id.len() != VIRTIO_BLK_ID_BYTES as usize
+        {
+            return Err(Error::InvalidSnapshotIdentity);
+        }
+        self.config
+            .as_mut_slice()
+            .clone_from_slice(&config[0..std::mem::size_of::<VirtioBlkConfig>()]);
+        self.disk_image_id = image_id.clone();
+        if let Some(disk) = self.disk.as_mut() {
+            disk.restore_image_id(image_id);
+        }
+        Ok(())
+    }
+
+    /// Exact external readonly dependency, never guest-visible sector truncation.
+    pub fn snapshot_readonly_source(&self) -> Option<&File> {
+        self.snapshot_source.as_ref()
+    }
+    pub fn snapshot_image_type(&self) -> &ImageType {
+        &self.image_type
+    }
+
+    /// Read guest-visible logical disk bytes through the shared image.
+    ///
+    /// The caller must hold a freeze confirmation first: the worker no
+    /// longer touches the disk, and this shares the same synced image.
+    pub fn read_snapshot_chunk(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        // Borrow the shared image the frozen worker was flushed through; no
+        // temporary DiskProperties whose Drop would flush/sync per chunk.
+        // The slice array is bound locally: the returned vector and guard
+        // borrow it (and `buffer`) for as long as they live.
+        let length = buffer.len();
+        let slices = [VolatileSlice::from(buffer)];
+        let (iovec, _guard) = IoVectorMut::from_volatile_slice(&slices);
+        self.disk_image.lock().unwrap().readv(iovec, offset)?;
+        Ok(length)
     }
 }
 
@@ -399,6 +500,39 @@ impl VirtioDevice for Block {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        self.activate_impl(mem, interrupt, queues, false)
+    }
+
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate_impl(mem, interrupt, queues, true)
+    }
+
+    fn reset(&mut self) -> bool {
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("error waiting for worker thread: {e:?}");
+            }
+        }
+        self.worker_control = None;
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+}
+
+impl Block {
+    fn activate_impl(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+        start_frozen: bool,
+    ) -> ActivateResult {
         if self.worker_thread.is_some() {
             panic!("virtio_blk: worker thread already exists");
         }
@@ -418,27 +552,24 @@ impl VirtioDevice for Block {
             .map_err(|_| ActivateError::BadActivate)?,
         };
 
+        let control_fd = EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?;
+        let (commands, command_receiver) = crossbeam_channel::bounded(16);
         let worker = BlockWorker::new(
             blk_q,
             interrupt.clone(),
             mem.clone(),
             disk,
             self.worker_stopfd.try_clone().unwrap(),
+            control_fd.try_clone().unwrap(),
+            command_receiver,
         );
-        self.worker_thread = Some(worker.run());
+        self.worker_thread = Some(worker.run(start_frozen));
+        self.worker_control = Some(BlockWorkerHandle {
+            control_fd,
+            commands,
+        });
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
-    }
-
-    fn reset(&mut self) -> bool {
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
-            if let Err(e) = worker.join() {
-                error!("error waiting for worker thread: {e:?}");
-            }
-        }
-        self.device_state = DeviceState::Inactive;
-        true
     }
 }

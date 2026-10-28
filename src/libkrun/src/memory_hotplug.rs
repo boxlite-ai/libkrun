@@ -58,3 +58,9 @@ pub unsafe extern "C" fn krun_get_memory_status(ctx_id: u32, output: *mut Memory
 pub fn remove(ctx_id: u32) {
     CONTROLS.lock().unwrap().remove(&ctx_id);
 }
+
+pub(crate) fn bind(ctx_id: u32, control: Option<Arc<MemoryControl>>) {
+    let mut controls = CONTROLS.lock().unwrap();
+    controls.remove(&ctx_id);
+    if let Some(control) = control { controls.insert(ctx_id, control); }
+}

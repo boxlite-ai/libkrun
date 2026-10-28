@@ -6,6 +6,8 @@ pub mod fuse;
 mod multikey;
 mod read_only;
 mod server;
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
 mod worker;
 
 #[cfg(target_os = "linux")]
@@ -25,8 +27,12 @@ use super::bindings;
 use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
-pub use self::device::Fs;
+pub use self::defs::{NUM_QUEUES as FS_NUM_QUEUES, QUEUE_SIZE as FS_QUEUE_SIZE};
+#[cfg(target_os = "linux")]
+pub use self::device::FsSessionCheckpoint;
+pub use self::device::{Fs, FS_FEATURES};
 pub use self::filesystem::ExportTable;
+pub use self::worker::{FsWorkerCut, FsWorkerHandle};
 
 mod defs {
     use super::super::QueueConfig;

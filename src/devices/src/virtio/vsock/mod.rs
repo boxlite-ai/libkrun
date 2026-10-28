@@ -7,6 +7,7 @@
 
 mod device;
 mod event_handler;
+mod gate;
 mod muxer;
 mod muxer_rxq;
 mod muxer_thread;
@@ -14,6 +15,8 @@ mod muxer_thread;
 mod packet;
 mod proxy;
 mod reaper;
+#[cfg(test)]
+mod tests;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;
@@ -22,7 +25,9 @@ mod unix;
 
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::defs::TsiFlags;
-pub use self::device::Vsock;
+pub use self::defs::{NUM_QUEUES as VSOCK_NUM_QUEUES, QUEUE_SIZE as VSOCK_QUEUE_SIZE};
+pub use self::device::{Vsock, VsockResetState, AVAIL_FEATURES as VSOCK_FEATURES};
+pub use self::gate::VsockGate;
 
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;
@@ -62,7 +67,7 @@ mod defs {
 
     /// Number of virtio queues.
     pub const NUM_QUEUES: usize = 3;
-    const QUEUE_SIZE: u16 = 256;
+    pub const QUEUE_SIZE: u16 = 256;
     /// Virtio queue config.
     /// There are 3 queues for a virtio device (in this order): RX, TX, Event
     pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
@@ -147,6 +152,10 @@ mod defs {
         pub const VSOCK_TYPE_DGRAM: u16 = 3;
 
         pub const VSOCK_HOST_CID: u64 = 2;
+
+        /// Event queue event: the device lost every connection (virtio 1.2
+        /// §5.10.6.7). Defined in `/include/uapi/linux/virtio_vsock.h`.
+        pub const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
     }
 }
 
@@ -174,6 +183,20 @@ pub enum VsockError {
     UnwritableDescriptor,
     /// EventFd error
     EventFd(std::io::Error),
+    /// Snapshots support only Unix IPC, but TSI is enabled.
+    TsiEnabled,
+    /// The backend cannot restart in the device's current state.
+    BackendState(&'static str),
+    /// Starting the backend failed.
+    Backend(std::io::Error),
+    /// A backend worker panicked or the backend failed to reopen on an
+    /// event-queue kick, so its state is unknown; the device keeps
+    /// reporting this and its backend never restarts.
+    BackendFailed,
+    /// Completing a reset event or stale TX on the guest's rings failed.
+    Queue(crate::virtio::queue::Error),
+    /// Raising the interrupt owed for such completions failed.
+    Interrupt(crate::Error),
 }
 
 type Result<T> = std::result::Result<T, VsockError>;
