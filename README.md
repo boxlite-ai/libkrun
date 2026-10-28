@@ -13,6 +13,8 @@ as the ordinary VMM. Version-9 images now carry the complete provisioned vCPU
 state, virtio-mem transport/queue state, plugged-block bitmap, pending target and
 reservation capacity. Only mapped 128 MiB hotplug slots contribute RAM payload;
 unmapped reservations remain inaccessible and consume no image payload.
+Legacy CMOS capacity describes only boot RAM, including after import;
+virtio-mem reports the separate hotplug reservation and allocation.
 
 Pause closes memory-request admission before freezing CPUs/devices. Status
 queries remain available; growth requests return `-EBUSY` until resume completes.

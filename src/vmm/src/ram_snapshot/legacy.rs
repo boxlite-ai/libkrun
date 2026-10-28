@@ -110,7 +110,7 @@ pub(super) fn attach(vm: &mut RamSnapshotVm, endpoints: SerialEndpoints) -> Resu
         return Err(Error::Invalid("legacy devices are already attached"));
     }
     check_endpoints(&endpoints)?;
-    let (below, above) = ram_split(memory_ranges(vm));
+    let (below, above) = ram_split(memory_ranges(vm)?);
     let result =
         build(vm, endpoints, Cmos::new(below, above)).and_then(|legacy| install(vm, legacy));
     if result.is_err() {
@@ -119,11 +119,12 @@ pub(super) fn attach(vm: &mut RamSnapshotVm, endpoints: SerialEndpoints) -> Resu
     result
 }
 
-fn memory_ranges(vm: &RamSnapshotVm) -> Vec<(u64, u64)> {
-    vm.memory
+fn memory_ranges(vm: &RamSnapshotVm) -> Result<Vec<(u64, u64)>> {
+    // CMOS describes boot RAM; virtio-mem advertises its own reservation.
+    Ok(vm.boot_memory()?
         .iter()
         .map(|region| (region.start_addr().raw_value(), region.len()))
-        .collect()
+        .collect())
 }
 
 /// RAM bytes below and above 4 GiB, as the CMOS reports them.
@@ -219,7 +220,7 @@ pub(super) fn restore(
     endpoints: SerialEndpoints,
 ) -> Result<()> {
     let invalid = |why: &str| Error::Full(format!("restore legacy devices: {why}"));
-    let (below, above) = ram_split(memory_ranges(vm));
+    let (below, above) = ram_split(memory_ranges(vm)?);
     let cmos = Cmos::from_snapshot_state(&meta.cmos, below, above).map_err(invalid)?;
     let legacy = build(vm, endpoints, cmos)?;
     for (serial, state) in legacy.serials.iter().zip(&meta.serial) {
