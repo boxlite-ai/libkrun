@@ -184,6 +184,7 @@ pub enum StartMicrovmError {
     RawOpenKernel(io::Error),
     /// Cannot initialize a MMIO Balloon device or add a device to the MMIO Bus.
     RegisterBalloonDevice(device_manager::mmio::Error),
+    RegisterMemoryDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Block Device or add a device to the MMIO Bus.
     RegisterBlockDevice(device_manager::mmio::Error),
     /// Cannot register an EventHandler.
@@ -371,6 +372,7 @@ impl Display for StartMicrovmError {
             RawOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
+            RegisterMemoryDevice(ref err) => write!(f, "Cannot register virtio-mem: {err}"),
             RegisterBalloonDevice(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -608,6 +610,12 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+
+    // RAM/shm were registered above. Keep hotplug out of the boot memory map
+    // and KVM until the driver plugs it, but expose its reservation to DMA.
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    let (guest_memory, memory_device) =
+        prepare_memory_hotplug(guest_memory, &mut vm, vm_resources.memory_hotplug.as_ref())?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -966,6 +974,15 @@ pub fn build_microvm(
 
     #[cfg(not(feature = "tee"))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    if let Some(device) = memory_device {
+        let device = Arc::new(Mutex::new(device));
+        event_manager
+            .add_subscriber(device.clone())
+            .map_err(StartMicrovmError::RegisterEvent)?;
+        attach_mmio_device(&mut vmm, "mem0".into(), intc.clone(), device)
+            .map_err(StartMicrovmError::RegisterMemoryDevice)?;
+    }
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
     let mut console_id = 0;
@@ -1420,6 +1437,47 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+fn prepare_memory_hotplug(
+    memory: GuestMemoryMmap,
+    vm: &mut Vm,
+    control: Option<&Arc<devices::virtio::mem::MemoryControl>>,
+) -> Result<(GuestMemoryMmap, Option<devices::virtio::mem::Mem>), StartMicrovmError> {
+    use devices::virtio::mem::{HotplugRegion, Mem, SLOT_SIZE};
+    let Some(control) = control else {
+        return Ok((memory, None));
+    };
+    let err = |e: String| StartMicrovmError::GuestMemoryMmap(e);
+    let addr = memory
+        .last_addr()
+        .raw_value()
+        .checked_add(SLOT_SIZE)
+        .ok_or_else(|| err("hotplug address overflow".into()))?
+        & !(SLOT_SIZE - 1);
+    // Direct boot may have no shared-memory window above the x86 MMIO gap.
+    #[cfg(target_arch = "x86_64")]
+    let addr = addr.max(arch::x86_64::layout::FIRST_ADDR_PAST_32BITS);
+    #[cfg(target_arch = "x86_64")]
+    let address_bits = unsafe { std::arch::x86_64::__cpuid(0x80000008).eax & 0xff }.min(52);
+    #[cfg(not(target_arch = "x86_64"))]
+    let address_bits = 40;
+    let address_slots = (1u64 << address_bits).saturating_sub(addr) / SLOT_SIZE;
+    let wanted = u64::from(control.status().max_mib - control.initial_mib) * (1 << 20) / SLOT_SIZE;
+    let (fd, first_slot, count) = vm.reserve_memory_slots(wanted.min(address_slots) as u32);
+    if count == 0 {
+        return Err(err(
+            "no address space or KVM slots for memory hotplug".into()
+        ));
+    }
+    let region = HotplugRegion::new(fd, first_slot, addr, u64::from(count) * SLOT_SIZE)
+        .map_err(|e| err(e.to_string()))?;
+    let memory = memory
+        .insert_region(region.memory.clone())
+        .map_err(|e| err(e.to_string()))?;
+    let device = Mem::new(control.clone(), region).map_err(|e| err(e.to_string()))?;
+    Ok((memory, Some(device)))
 }
 
 pub fn create_guest_memory(
@@ -2338,6 +2396,27 @@ fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), St
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    fn memory_hotplug_without_shm_avoids_mmio() {
+        use vm_memory::GuestMemoryRegion;
+
+        let (memory, _, _, _) = default_guest_memory(128).unwrap();
+        let mut vm = setup_vm(&memory, false).unwrap();
+        let control = Arc::new(devices::virtio::mem::MemoryControl::new(128, 4096).unwrap());
+        let (memory, _) = prepare_memory_hotplug(memory, &mut vm, Some(&control)).unwrap();
+
+        for region in memory.iter() {
+            let start = region.start_addr().raw_value();
+            let end = region.last_addr().raw_value();
+            assert!(
+                end < arch::x86_64::layout::MMIO_MEM_START
+                    || start >= arch::x86_64::layout::FIRST_ADDR_PAST_32BITS,
+                "RAM reservation {start:#x}..={end:#x} overlaps x86 MMIO"
+            );
+        }
+    }
 
     #[allow(unused)]
     fn default_guest_memory(
