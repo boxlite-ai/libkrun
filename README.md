@@ -296,7 +296,7 @@ role to exactly one received descriptor index. O_PATH identity descriptors do no
 replace independent access descriptions. Identity descriptors may be reopened
 from a pinned handle through `/proc/self/fd` after unlink/forget; these carry
 O_PATH without O_NOFOLLOW. Path and boot-recipe lookup still uses O_NOFOLLOW.
-Supply each saved handle and every
+Supply each available saved handle and every
 (object,writable) file-DAX role. No privileged file-handle reopening is used.
 The embedding protocol owns SCM_RIGHTS framing, truncation detection, peer
 validation, FD limits and leases; the library checks indices, identities, flags,
@@ -307,7 +307,27 @@ retain native `PathBuf` roots.
 Cached readdir names, types, order and index cookies are independent metadata.
 Stale listing-only names and `.`/`..` need no object FD. Surviving saved names are
 resolved only relative to their retained directory to restore inode projection;
-retained entries also validate their object index. Missing retained orphans fail.
+retained entries also validate their object index.
+Capture records `unlinked: true` only for regular files already unlinked at the
+cut. Import permits a null object index or an omitted handle only for such files.
+An absent object removes its nodes/handles; an absent handle alone preserves the
+object and other handles. A supplied handle without its object identity binding
+is rejected, and aliases across shares must agree about presence. All other
+object/role validation remains strict.
+
+Restore compacts live object indices and remaps session/listing references while
+keeping saved node/handle allocation counters. Ordinary backend accesses to
+missing IDs return EBADF, including release; forget is harmless. Later captures
+contain the remaining backend records, so stale guest IDs stay below the counters.
+Cached guest reads/writeback may still succeed without a FUSE request. Missing
+objects with existing DAX mappings, and missing DAX roles, reject import before
+VM allocation. Direct mappings cannot safely be replaced with zero pages or a
+short host file to synthesize an IO error; KVM memory ownership barriers stay intact.
+
+Omitted unlink eligibility defaults to false: complete older v9 images work, but
+missing bindings remain strict for them. Older readers reject the new true-unlinked
+metadata and null indices. Rust ShareBinding.objects now holds Option<File> slots;
+the descriptor ABI consumes only real FD indices, exactly once each.
 File-backed DAX contains references/mapping metadata; only anonymous DAX pages and
 init.krun bytes belong in the memory payload. `BoxLiteShared` is external too.
 
@@ -359,7 +379,7 @@ authentication. The library does not publish directories or delete caller files.
 
 The embedder owns private pair staging, sync/no-overwrite publication, external
 storage consistency, cancellation cleanup after joining writers, persistent boot
-pins and bindings for cold starts. All dependencies must be bound before vCPU
+pins and bindings for cold starts. All required dependencies must be bound before vCPU
 creation/release. The default BoxLite Linux sandbox is bwrap plus production
 seccomp; an optional post-mount Landlock test is separate, never applied before
 bwrap mounts.

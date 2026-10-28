@@ -465,7 +465,7 @@ fn snapshot_fs_kvm_v9_external_orphan_session_and_dax_continue() {
             .unwrap()],
         shares: vec![ShareBinding {
             root: recovered.clone(),
-            objects,
+            objects: objects.into_iter().map(Some).collect(),
             roles,
         }],
     };

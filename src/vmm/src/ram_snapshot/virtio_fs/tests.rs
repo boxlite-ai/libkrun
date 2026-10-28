@@ -812,11 +812,13 @@ fn snapshot_fs_v9_bindings_check_alias_root_kind_and_counts() {
     let mut meta: FsMeta = serde_json::from_value(json).unwrap();
     let binding = |root: &Path, object: &Path| ShareBinding {
         root: root.to_owned(),
-        objects: vec![std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-            .open(object)
-            .unwrap()],
+        objects: vec![Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                .open(object)
+                .unwrap(),
+        )],
         roles: RestoredRoles::default(),
     };
     validate_bindings(&meta, &[binding(&dir.0, &dir.0), binding(&dir.0, &dir.0)]).unwrap();
@@ -869,7 +871,9 @@ fn snapshot_fs_v9_bindings_check_alias_root_kind_and_counts() {
     )
     .is_err());
     let mut extra = binding(&dir.0, &dir.0);
-    extra.objects.push(extra.objects[0].try_clone().unwrap());
+    extra
+        .objects
+        .push(Some(extra.objects[0].as_ref().unwrap().try_clone().unwrap()));
     assert!(validate_bindings(
         &meta,
         &[extra, binding(&dir.path("other"), &dir.path("other"))]

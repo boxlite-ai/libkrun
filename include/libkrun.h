@@ -1422,8 +1422,13 @@ int32_t krun_snapshot_export_fd(uint32_t ctx_id, uint64_t token,
  * dax:[{object:<index>,writable:<bool>,fd:<index>},...]}]}.
  * Every FD index is used exactly once, <=16384 total. Disk order is saved guest
  * order; writable container is QCOW2, readonly boot must match full digest.
- * Objects are pinned O_PATH descriptors in saved order; O_NOFOLLOW is not required
- * for descriptors reopened through /proc/self/fd. Supply independent descriptions
+ * Objects are pinned O_PATH descriptors in saved order; null marks an absent
+ * saved unlinked regular file. Its handle roles may be omitted. An absent handle
+ * role alone is allowed only for a saved unlinked regular file. Missing objects
+ * with existing DAX mappings, and missing DAX roles, are rejected. Missing backend
+ * node/handle requests fail with EBADF; saved ID counters prevent reuse.
+ * O_NOFOLLOW is not required for descriptors reopened through /proc/self/fd.
+ * Supply independent descriptions
  * with exact saved flags for handles and O_RDONLY/O_RDWR for DAX. For vm_owned
  * boot roots provide an empty private recipe root with dev/proc/sys/newroot
  * directories, objects:[], and handle/DAX roles against those recipe objects.

@@ -263,7 +263,7 @@ fn snapshot_boot_kvm_v9_linux_continues_after_source_destruction_on_recipe_root(
                     .collect();
                 ShareBinding {
                     root,
-                    objects,
+                    objects: objects.into_iter().map(Some).collect(),
                     roles: RestoredRoles {
                         handles,
                         dax: Default::default(),

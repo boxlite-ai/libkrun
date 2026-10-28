@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use devices::virtio::fs::passthrough::{
-    DaxMappingKind, DaxPages, PassthroughCheckpoint, PassthroughState, RestoredObject,
+    DaxMappingKind, DaxPages, PassthroughCheckpoint, PassthroughState, RestoredObject, RestoredRoles,
 };
 use devices::virtio::persist::{MmioTransportState, QueueState, VirtioDeviceState};
 use devices::virtio::{
@@ -222,6 +222,8 @@ struct ObjectMeta {
     guest_ino: u64,
     ctime: (i64, i64),
     kind: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unlinked: bool,
     reference: Option<crate::snapshot_vm::checkpoint::ExternalReference>,
     recipe: Option<String>,
 }
@@ -630,7 +632,8 @@ pub(super) fn capture(
             .map_err(|e| Error::Full(format!("capture external share {}: {e}", share.index)))?;
         let mut objects = Vec::new();
         for object in &checkpoint.passthrough.objects {
-            let kind = object.file.metadata()?.mode() & libc::S_IFMT;
+            let metadata = object.file.metadata()?;
+            let kind = metadata.mode() & libc::S_IFMT;
             let recipe = share
                 .recipe_root
                 .as_ref()
@@ -643,6 +646,7 @@ pub(super) fn capture(
                 guest_ino: object.guest_ino,
                 ctime: object.ctime,
                 kind,
+                unlinked: kind == libc::S_IFREG && metadata.nlink() == 0,
                 reference: None,
                 recipe,
             });
@@ -840,7 +844,14 @@ pub(super) fn validate_metadata(
                 "share {index} DAX window differs from its session's"
             )));
         }
+        let mut guest_inodes = HashSet::new();
         for object in &session.objects {
+            if object.guest_ino == session.state.init_inode || !guest_inodes.insert(object.guest_ino) {
+                return Err(invalid("invalid or duplicate saved guest inode".into()));
+            }
+            if object.unlinked && (device.vm_owned || object.kind != libc::S_IFREG) {
+                return Err(invalid("invalid unlinked object kind or ownership".into()));
+            }
             if device.vm_owned {
                 if object.reference.is_some()
                     || !object
@@ -934,14 +945,161 @@ pub(super) fn write_payloads(file: &mut File, capture: &CapturedShares) -> Resul
     Ok(())
 }
 
+/// Drop only explicitly absent orphans; saved allocation counters prevent ID reuse.
+fn bound_session(
+    session: &SessionMeta,
+    binding: &crate::snapshot_vm::checkpoint::ShareBinding,
+    vm_owned: bool,
+) -> Result<(PassthroughState, Vec<RestoredObject>, RestoredRoles)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    session
+        .state
+        .validate(session.objects.len())
+        .map_err(|e| Error::Full(e.to_string()))?;
+    if (vm_owned && !binding.objects.is_empty())
+        || (!vm_owned && binding.objects.len() != session.objects.len())
+    {
+        return Err(Error::Invalid("retained object binding count differs"));
+    }
+    let mut remap = Vec::new();
+    let mut objects = Vec::new();
+    let mut identities = HashSet::new();
+    for (index, saved) in session.objects.iter().enumerate() {
+        let file = if vm_owned {
+            let recipe = saved
+                .recipe
+                .as_deref()
+                .ok_or(Error::Invalid("missing boot recipe"))?;
+            if !BOOT_DIRS.contains(&recipe) {
+                return Err(Error::Invalid("unknown boot recipe"));
+            }
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                    .open(binding.root.join(recipe))?,
+            )
+        } else {
+            binding.objects[index]
+                .as_ref()
+                .map(File::try_clone)
+                .transpose()?
+        };
+        let Some(file) = file else {
+            if !saved.unlinked
+                || saved.kind != libc::S_IFREG
+                || saved.recipe.is_some()
+                || saved.reference.is_none()
+                || session
+                    .state
+                    .nodes
+                    .iter()
+                    .any(|node| node.inode == 1 && node.object == index as u64)
+            {
+                return Err(Error::Invalid(
+                    "missing object was not a saved unlinked regular file",
+                ));
+            }
+            remap.push(None);
+            continue;
+        };
+        let st = file.metadata()?;
+        // SAFETY: file owns a live descriptor; fcntl only reads status flags.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || flags & libc::O_PATH == 0
+            || st.mode() & libc::S_IFMT != saved.kind
+            || !identities.insert((st.dev(), st.ino()))
+        {
+            return Err(Error::Invalid(
+                "retained object descriptor type or access differs, or identity repeats",
+            ));
+        }
+        remap.push(Some(objects.len() as u64));
+        objects.push(RestoredObject {
+            file,
+            guest_ino: saved.guest_ino,
+            ctime: saved.ctime,
+        });
+    }
+    if let Some(node) = session.state.nodes.iter().find(|node| node.inode == 1) {
+        let index = remap[node.object as usize].ok_or(Error::Invalid("root object absent"))?;
+        let supplied = objects[index as usize].file.metadata()?;
+        let root = std::fs::metadata(&binding.root)?;
+        if (supplied.dev(), supplied.ino()) != (root.dev(), root.ino()) {
+            return Err(Error::Invalid("bound root identity differs"));
+        }
+    }
+    let mut state = session.state.clone();
+    state
+        .nodes
+        .retain_mut(|node| match remap[node.object as usize] {
+            Some(object) => {
+                node.object = object;
+                true
+            }
+            None => false,
+        });
+    for handle in &session.state.handles {
+        if !binding.roles.handles.contains_key(&handle.handle) {
+            let object = &session.objects[handle.object as usize];
+            if vm_owned || !object.unlinked || object.kind != libc::S_IFREG {
+                return Err(Error::Invalid("missing independent handle FD"));
+            }
+        } else if remap[handle.object as usize].is_none() {
+            return Err(Error::Invalid("supplied handle has no object identity binding"));
+        }
+    }
+    state
+        .handles
+        .retain(|handle| binding.roles.handles.contains_key(&handle.handle));
+    for handle in &mut state.handles {
+        handle.object = remap[handle.object as usize]
+            .ok_or(Error::Invalid("supplied handle object absent"))?;
+        for entry in handle.listing.iter_mut().flatten() {
+            if let Some(index) = entry.object {
+                entry.object = *remap
+                    .get(index as usize)
+                    .ok_or(Error::Invalid("cached entry object out of range"))?;
+                if entry.object.is_none() {
+                    entry.projected = false;
+                }
+            }
+        }
+    }
+    if let Some(dax) = &mut state.dax {
+        for mapping in &mut dax.mappings {
+            if let DaxMappingKind::File { object, .. } = &mut mapping.kind {
+                *object = remap[*object as usize]
+                    .ok_or(Error::Invalid("missing object has an existing DAX mapping"))?;
+            }
+        }
+    }
+    let mut roles = RestoredRoles::default();
+    for (&id, file) in &binding.roles.handles {
+        roles.handles.insert(id, file.try_clone()?);
+    }
+    for (&(index, writable), file) in &binding.roles.dax {
+        let index = remap
+            .get(index as usize)
+            .copied()
+            .flatten()
+            .ok_or(Error::Invalid("DAX role object absent"))?;
+        roles.dax.insert((index, writable), file.try_clone()?);
+    }
+    roles
+        .validate(&state, &objects)
+        .map_err(|e| Error::Full(e.to_string()))?;
+    Ok((state, objects, roles))
+}
+
 /// Validate external identities, aliases and role access before VM allocation.
 pub(super) fn validate_bindings(
     meta: &FsMeta,
     bindings: &[crate::snapshot_vm::checkpoint::ShareBinding],
 ) -> Result<()> {
     use std::collections::HashMap;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
     if bindings.len() != meta.devices.len() {
         return Err(Error::Invalid("share binding count differs"));
     }
@@ -949,72 +1107,29 @@ pub(super) fn validate_bindings(
     let mut identities = HashMap::new();
     for ((device, session), binding) in meta.devices.iter().zip(&meta.sessions).zip(bindings) {
         check_source(&binding.root)?;
-        let mut objects = Vec::new();
+        bound_session(session, binding, device.vm_owned)?;
         if device.vm_owned {
-            if !binding.objects.is_empty() {
-                return Err(Error::Invalid("boot recipe cannot take external objects"));
-            }
-            for saved in &session.objects {
-                let name = saved
-                    .recipe
-                    .as_deref()
-                    .ok_or(Error::Invalid("missing boot recipe"))?;
-                if !BOOT_DIRS.contains(&name) {
-                    return Err(Error::Invalid("unknown boot recipe"));
-                }
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-                    .open(binding.root.join(name))?;
-                objects.push(RestoredObject {
-                    file,
-                    guest_ino: saved.guest_ino,
-                    ctime: saved.ctime,
-                });
-            }
-        } else {
-            if binding.objects.len() != session.objects.len() {
-                return Err(Error::Invalid("missing retained object FD"));
-            }
-            for (file, saved) in binding.objects.iter().zip(&session.objects) {
-                let st = file.metadata()?;
-                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-                if flags < 0 || flags & libc::O_PATH == 0 || st.mode() & libc::S_IFMT != saved.kind
-                {
-                    return Err(Error::Invalid(
-                        "retained object descriptor type or access differs",
-                    ));
-                }
-                let identity = (st.dev(), st.ino());
-                if references
-                    .insert(saved.alias, identity)
-                    .is_some_and(|old| old != identity)
-                    || identities
+            continue;
+        }
+        for (file, saved) in binding.objects.iter().zip(&session.objects) {
+            let identity = file
+                .as_ref()
+                .map(|file| file.metadata().map(|st| (st.dev(), st.ino())))
+                .transpose()?;
+            if references
+                .insert(saved.alias, identity)
+                .is_some_and(|old| old != identity)
+                || identity.is_some_and(|identity| {
+                    identities
                         .insert(identity, saved.alias)
                         .is_some_and(|old| old != saved.alias)
-                {
-                    return Err(Error::Invalid(
-                        "external object aliases disagree across shares",
-                    ));
-                }
-                objects.push(RestoredObject {
-                    file: file.try_clone()?,
-                    guest_ino: saved.guest_ino,
-                    ctime: saved.ctime,
-                });
+                })
+            {
+                return Err(Error::Invalid(
+                    "external object aliases disagree across shares (identity or presence)",
+                ));
             }
         }
-        let root = std::fs::metadata(&binding.root)?;
-        if let Some(node) = session.state.nodes.iter().find(|n| n.inode == 1) {
-            let object = objects[node.object as usize].file.metadata()?;
-            if (root.dev(), root.ino()) != (object.dev(), object.ino()) {
-                return Err(Error::Invalid("bound root identity differs"));
-            }
-        }
-        binding
-            .roles
-            .validate(&session.state, &objects)
-            .map_err(|e| Error::Full(e.to_string()))?;
     }
     Ok(())
 }
@@ -1029,7 +1144,7 @@ pub(super) fn restore_external(
         return Err(Error::Invalid("share binding count differs"));
     }
     vm.exit_code.store(meta.exit_code, Ordering::SeqCst);
-    for (index, ((device_meta, session), mut binding)) in meta
+    for (index, ((device_meta, session), binding)) in meta
         .devices
         .iter()
         .zip(&meta.sessions)
@@ -1048,72 +1163,19 @@ pub(super) fn restore_external(
                 .validate(dax)
                 .map_err(|e| Error::Full(e.to_string()))?;
         }
-        if device_meta.vm_owned {
-            if !binding.objects.is_empty() {
-                return Err(Error::Invalid("boot recipe cannot take external objects"));
-            }
-            // Caller creates this private empty root before sandboxing, with these known directories.
-            for object in &session.objects {
-                let name = object
-                    .recipe
-                    .as_deref()
-                    .ok_or(Error::Invalid("missing boot object recipe"))?;
-                if !BOOT_DIRS.contains(&name) {
-                    return Err(Error::Invalid("unknown boot object recipe"));
-                }
-                use std::os::unix::fs::OpenOptionsExt;
-                binding.objects.push(
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-                        .open(binding.root.join(name))?,
-                );
-            }
-        }
-        if binding.objects.len() != session.objects.len() {
-            return Err(Error::Invalid("missing retained object FD"));
-        }
-        let mut objects = Vec::new();
-        let mut identities = HashSet::new();
-        for (file, saved) in binding.objects.into_iter().zip(&session.objects) {
-            let st = file.metadata()?;
-            use std::os::fd::AsRawFd;
-            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-            if flags < 0
-                || flags & libc::O_PATH == 0
-                || st.mode() & libc::S_IFMT != saved.kind
-                || !identities.insert((st.dev(), st.ino()))
-            {
-                return Err(Error::Invalid(
-                    "retained object FD type, alias or access mismatch",
-                ));
-            }
-            objects.push(RestoredObject {
-                file,
-                guest_ino: saved.guest_ino,
-                ctime: saved.ctime,
-            });
-        }
-        if let Some(root) = session.state.nodes.iter().find(|n| n.inode == 1) {
-            let supplied = objects[root.object as usize].file.metadata()?;
-            let expected = std::fs::metadata(&binding.root)?;
-            if (supplied.dev(), supplied.ino()) != (expected.dev(), expected.ino()) {
-                return Err(Error::Invalid(
-                    "supplied root object differs from bound share",
-                ));
-            }
-        }
+        let (state, objects, roles) = bound_session(session, &binding, device_meta.vm_owned)?;
+        let root = binding.root.clone();
+        drop(binding);
         let dax = device_meta
             .dax
             .map(|range| -> Result<_> { Ok((range, add_window(vm, range)?)) })
             .transpose()?;
         let window = dax.map(|(range, backing)| vm.dax[backing].region(range.gpa));
-        let root = binding.root.clone();
         let (device, transport) = new_device(
             vm,
             Share {
                 tag: &device_meta.tag,
-                root,
+                root: root.clone(),
                 read_only: device_meta.read_only,
                 allow_root_dir_delete: device_meta.allow_root_dir_delete,
                 vm_owned: device_meta.vm_owned,
@@ -1127,11 +1189,11 @@ pub(super) fn restore_external(
             locked
                 .restore_session_with_roles(
                     session.options,
-                    &session.state,
+                    &state,
                     objects,
                     Arc::from(init),
                     &pages,
-                    binding.roles,
+                    roles,
                 )
                 .map_err(|e| Error::Full(e.to_string()))?;
             drop(locked);
@@ -1159,7 +1221,7 @@ pub(super) fn restore_external(
         }
         if !device_meta.vm_owned {
             vm.restored_shares
-                .push((device_meta.tag.clone(), binding.root.clone()));
+                .push((device_meta.tag.clone(), root.clone()));
         }
         vm.fs.push(FsDevice {
             device,
@@ -1168,7 +1230,7 @@ pub(super) fn restore_external(
             tag: device_meta.tag.clone(),
             read_only: device_meta.read_only,
             allow_root_dir_delete: device_meta.allow_root_dir_delete,
-            recipe_root: device_meta.vm_owned.then_some(binding.root.clone()),
+            recipe_root: device_meta.vm_owned.then_some(root),
             vm_owned_root: None,
             dax,
         });

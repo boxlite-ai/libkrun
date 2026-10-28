@@ -32,8 +32,8 @@ pub struct PreparedResources {
 
 pub struct ShareBinding {
     pub root: PathBuf,
-    /// Pinned O_PATH descriptors in saved object order (O_NOFOLLOW is optional).
-    pub objects: Vec<File>,
+    /// Pinned O_PATH descriptors in saved object order; None marks a missing orphan.
+    pub objects: Vec<Option<File>>,
     pub roles: RestoredRoles,
 }
 
@@ -55,7 +55,7 @@ pub struct BindingIndices {
 #[serde(deny_unknown_fields)]
 pub struct ShareIndices {
     pub root: PathBuf,
-    pub objects: Vec<usize>,
+    pub objects: Vec<Option<usize>>,
     pub handles: BTreeMap<u64, usize>,
     pub dax: Vec<DaxIndex>,
 }
@@ -88,7 +88,7 @@ impl BindingIndices {
             let objects = share
                 .objects
                 .into_iter()
-                .map(&mut take)
+                .map(|index| index.map(&mut take).transpose())
                 .collect::<Result<_, _>>()?;
             let handles = share
                 .handles
