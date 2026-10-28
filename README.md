@@ -19,7 +19,9 @@ queries remain available; growth requests return `-EBUSY` until resume completes
 Import restores the exact reservation and mapped slots, rebinds the mailbox to
 the new context, and stays paused. Resume replays pending target/queue work, after
 which the imported guest can grow again. Hotplug and DAX windows retain disjoint
-KVM slot ranges. This directly extends the current snapshot schema; it does not
+KVM slot ranges. Imports reject reservations beyond the target's physical address
+width; replaying pending work preserves a completed guest `UNPLUG_ALL` cut.
+This directly extends the current snapshot schema; it does not
 provide an old-format conversion path.
 
 The resize/checkpoint merge has received source review only. Compilation, codec

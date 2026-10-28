@@ -57,6 +57,8 @@ impl MemSnapshot {
             || self.usable_region_size > self.size
             || self.usable_region_size % BLOCK_SIZE != 0
             || self.usable_region_size < self.requested_size && self.usable_region_size != 0
+            || s.active == 0 && (s.requested_mib != self.initial_mib
+                || self.requested_size != 0 || self.usable_region_size != 0 || s.plugged_mib != self.initial_mib)
         { return Err(invalid()); }
         let plugged = self.plugged.iter().filter(|&&b| b).count() as u64 * BLOCK_SIZE;
         let mapped = self.mapped_slots().count() as u64 * SLOT_SIZE;
@@ -134,7 +136,10 @@ impl Mem {
 
     /// Reissue both target and queue notifications lost with source eventfds.
     pub fn snapshot_kick(&self) {
-        let _ = self.control.event.write(1);
+        // UNPLUG_ALL may intentionally leave usable size zero with an unchanged
+        // host target. Replay only a target not yet consumed at the saved cut.
+        let target = u64::from(self.control.status().requested_mib - self.control.initial_mib) * MIB;
+        if target != self.config.requested_size { let _ = self.control.event.write(1); }
         if let Some(queue) = &self.queue { let _ = queue.event.write(1); }
     }
 
@@ -408,6 +413,16 @@ impl Subscriber for Mem {
 mod tests {
     use super::*;
     use kvm_ioctls::Kvm;
+
+    #[test]
+    fn checkpoint_kick_preserves_unplug_all_without_a_pending_target() {
+        let mut device = device(0, 1, 1);
+        assert_eq!(device.request(2, 0, 0).0, 0);
+        device.control.event.read().unwrap();
+        device.snapshot_kick();
+        assert!(device.control.event.read().is_err());
+        assert_eq!(device.config.usable_region_size, 0);
+    }
 
     #[test]
     fn checkpoint_restores_partial_slots_and_pending_target_then_accepts_growth() {

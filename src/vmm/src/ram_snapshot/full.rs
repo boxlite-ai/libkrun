@@ -653,6 +653,12 @@ impl RamSnapshotVm {
         let kvm = KvmContext::new().map_err(Error::State)?;
         validate_regions(&metadata.regions, kvm.max_memslots())?;
         validate_devices(&metadata, kvm.max_memslots())?;
+        if let Some(meta) = &metadata.memory {
+            let bits = unsafe { std::arch::x86_64::__cpuid(0x80000008).eax & 0xff }.min(52);
+            if meta.state.addr + meta.state.size > 1u64 << bits {
+                return Err(Error::Invalid("target physical address width cannot hold hotplug reservation"));
+            }
+        }
         if metadata.cpus.len() > kvm.fd().get_max_vcpus() {
             return Err(Error::Invalid("target vCPU capacity exceeded"));
         }
