@@ -708,6 +708,7 @@ impl RamSnapshotVm {
     /// Disk slots left by the internal NIC, which takes the last GSI.
     #[cfg(feature = "blk")]
     pub(super) fn disk_capacity(&self) -> usize {
+        if self.memory_device.is_some() { return event_devices::MEMORY_DISK_CAPACITY; }
         #[cfg(feature = "net")]
         if self.nic.is_some() {
             return nic::MAX_DISKS_WITH_NIC;

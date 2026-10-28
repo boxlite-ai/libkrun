@@ -52,6 +52,7 @@ struct Metadata {
     nic: Option<NicSection>,
     rng: Option<DeviceMeta>,
     balloon: Option<BalloonMeta>,
+    #[serde(deserialize_with = "required_memory")]
     memory: Option<event_devices::MemoryMeta>,
     vsock: Option<VsockMeta>,
     console: Option<ConsoleMeta>,
@@ -60,6 +61,10 @@ struct Metadata {
     application_schema: u32,
     application: serde_json::Value,
     disk_dependencies: Vec<DiskDependency>,
+}
+
+fn required_memory<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<event_devices::MemoryMeta>, D::Error> {
+    Option::deserialize(deserializer)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -243,6 +248,10 @@ fn validate_devices(metadata: &Metadata, max_slots: usize) -> Result<u64> {
     let mut ranges: Vec<Region> = metadata.regions.iter().map(|r| Region { gpa: r.gpa, len: r.len, attributes: r.attributes }).collect();
     let mut reserved_slots = 0;
     if let Some(meta) = &metadata.memory {
+        #[cfg(feature = "blk")]
+        if metadata.disks.len() > event_devices::MEMORY_DISK_CAPACITY {
+            return Err(Error::Invalid("checkpoint disks conflict with virtio-mem IRQ"));
+        }
         event_devices::validate_memory(meta, &metadata.regions)?;
         let state = &meta.state;
         if metadata.regions.iter().try_fold(0u64, |n, r| n.checked_add(r.len)) != Some(u64::from(state.initial_mib) << 20) {

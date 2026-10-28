@@ -303,10 +303,13 @@ impl Mem {
                 break;
             }
         }
-        let error = self.control.status().error;
-        self.control
-            .progress(self.config.plugged_size, self.region.mapped_size(), error);
+        self.publish_progress();
         self.state.signal_used_queue();
+    }
+
+    fn publish_progress(&self) {
+        let error = self.control.status().error;
+        self.control.progress(self.config.plugged_size, self.region.mapped_size(), error);
     }
 
     fn update_target(&mut self) {
@@ -429,6 +432,7 @@ mod tests {
         let mut source = device(0, 3, 2);
         assert_eq!(source.request(0, source.config.addr, 1).0, 0);
         assert_eq!(source.request(0, source.config.addr + SLOT_SIZE, 1).0, 0);
+        source.publish_progress();
         // Freeze a target not yet consumed by the event thread.
         source.control.request(256 + 3 * SLOT_MIB).unwrap();
         source.control.freeze(true);

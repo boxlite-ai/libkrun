@@ -126,6 +126,10 @@ impl BootImage {
         let shares = shares(resources)?;
         #[cfg(feature = "blk")]
         let disks = devices.disks.iter().map(disk).collect::<Result<Vec<_>>>()?;
+        #[cfg(feature = "blk")]
+        if resources.memory_hotplug.is_some() && disks.len() > event_devices::MEMORY_DISK_CAPACITY {
+            return Err(unsupported("virtio-mem reserves a disk IRQ: at most six checkpoint disks"));
+        }
         #[cfg(all(feature = "blk", feature = "net"))]
         let nic = devices.nic.as_ref().map(nic).transpose()?;
         #[cfg(feature = "blk")]
@@ -431,7 +435,7 @@ struct Present {
 }
 
 /// (MMIO address, GSI) of every device, in the ordinary VMM's probe order:
-/// balloon, RNG, console, shares, disks, vsock, NIC.
+/// balloon, RNG, memory, console, shares, disks, vsock, NIC.
 fn discovery_slots(present: Present) -> Vec<(u64, u32)> {
     let mut slots = vec![event_devices::BALLOON_SLOT, event_devices::RNG_SLOT];
     if present.memory { slots.push(event_devices::MEMORY_SLOT); }

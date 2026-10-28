@@ -26,6 +26,23 @@ const KERNEL_GPA: u64 = 0x100_0000;
 const KERNEL_LEN: usize = 0x2000;
 const MIB: u64 = 1 << 20;
 
+#[test]
+#[cfg(all(feature = "blk", feature = "net"))]
+fn memory_and_vsock_discovery_use_disjoint_mmio_and_irqs() {
+    let slots = discovery_slots(Present {
+        memory: true, console: true, shares: virtio_fs::MAX_SHARES,
+        disks: event_devices::MEMORY_DISK_CAPACITY, vsock: true, nic: true,
+    });
+    assert!(slots.contains(&event_devices::MEMORY_SLOT));
+    assert!(slots.contains(&(VSOCK_MMIO_ADDR, VSOCK_IRQ)));
+    let mut addresses = std::collections::HashSet::new();
+    let mut irqs = std::collections::HashSet::new();
+    for (addr, irq) in slots {
+        assert!(addresses.insert(addr), "duplicate MMIO {addr:#x}");
+        assert!(irqs.insert(irq), "duplicate GSI {irq}");
+    }
+}
+
 pub(super) struct TempDir(pub(super) PathBuf);
 
 impl TempDir {

@@ -21,6 +21,10 @@ the new context, and stays paused. Resume replays pending target/queue work, aft
 which the imported guest can grow again. Hotplug and DAX windows retain disjoint
 KVM slot ranges. Imports reject reservations beyond the target's physical address
 width; replaying pending work preserves a completed guest `UNPLUG_ALL` cut.
+The checkpoint owner's virtio-mem device occupies MMIO `0xd0014000` / GSI 22,
+leaving six disk slots when hotplug is enabled; vsock keeps `0xd000b000` / GSI 7,
+and the NIC keeps GSI 23. Larger checkpoint disk layouts with hotplug are refused
+before boot/import. Ordinary VMM device limits are unchanged.
 This directly extends the current snapshot schema; it does not
 provide an old-format conversion path.
 

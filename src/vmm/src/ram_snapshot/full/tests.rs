@@ -145,6 +145,10 @@ fn snapshot_v9_kvm_memory_external_pair_continues_and_reexports() {
         .unwrap()
         .contains("execution"));
     let dependencies: serde_json::Value = serde_json::from_slice(&inspected).unwrap();
+    let mut missing_memory = dependencies.clone();
+    missing_memory.as_object_mut().unwrap().remove("memory");
+    let error = serde_json::from_value::<Metadata>(missing_memory).err().expect("required nullable memory section");
+    assert!(error.to_string().contains("missing field `memory`"));
     assert_eq!(
         dependencies["disk_dependencies"][1]["external_readonly_boot"]["length"],
         65537

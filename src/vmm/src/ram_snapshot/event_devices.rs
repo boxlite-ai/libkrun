@@ -58,10 +58,13 @@ const BALLOON: Kind = Kind {
 };
 
 const MEMORY: Kind = Kind {
-    name: "virtio-mem", mmio_addr: 0xd000_b000, irq: 7,
+    // After all seven FS windows; GSI 22 is reserved from the disk window.
+    name: "virtio-mem", mmio_addr: 0xd001_4000, irq: 22,
     device_type: 24, features: (1 << 32) | (1 << 1), queues: 1, queue_size: 128,
 };
 pub(super) const MEMORY_SLOT: (u64, u32) = (MEMORY.mmio_addr, MEMORY.irq);
+#[cfg(feature = "blk")]
+pub(super) const MEMORY_DISK_CAPACITY: usize = 6;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
