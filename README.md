@@ -6,6 +6,25 @@
 
 # libkrun
 
+### Checkpointing a resized guest
+
+The Linux x86_64 checkpoint owner supports the same live CPU and memory growth
+as the ordinary VMM. Version-9 images now carry the complete provisioned vCPU
+state, virtio-mem transport/queue state, plugged-block bitmap, pending target and
+reservation capacity. Only mapped 128 MiB hotplug slots contribute RAM payload;
+unmapped reservations remain inaccessible and consume no image payload.
+
+Pause closes memory-request admission before freezing CPUs/devices. Status
+queries remain available; growth requests return `-EBUSY` until resume completes.
+Import restores the exact reservation and mapped slots, rebinds the mailbox to
+the new context, and stays paused. Resume replays pending target/queue work, after
+which the imported guest can grow again. Hotplug and DAX windows retain disjoint
+KVM slot ranges. This directly extends the current snapshot schema; it does not
+provide an old-format conversion path.
+
+The resize/checkpoint merge has received source review only. Compilation, codec
+tests and real KVM continuation under the consumer's sandbox remain deferred.
+
 ```libkrun``` is a dynamic library that allows programs to easily acquire the ability to run processes in a partially isolated environment using [KVM](https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt) Virtualization on Linux and [HVF](https://developer.apple.com/documentation/hypervisor) on macOS/ARM64.
 
 It integrates a VMM (Virtual Machine Monitor, the userspace side of an Hypervisor) with the minimum amount of emulated devices required to its purpose, abstracting most of the complexity that comes from Virtual Machine management, offering users a simple C API.
@@ -54,6 +73,28 @@ Each variant generates a dynamic library with a different name (and ```soname```
 * virtio-balloon (only free-page reporting)
 * virtio-rng
 * virtio-snd
+
+### Online memory growth (Linux, generic variant)
+
+Call `krun_set_memory_hotplug` after `krun_set_vm_config` and before starting
+the VM. The initial memory size includes the bundled kernel mapping; it is the
+whole guest RAM budget. The requested ceiling is reduced to fit KVM memory
+slots and the guest physical address space. The reserved range starts after
+boot RAM and shared-memory regions. On x86 it also starts at or above 4 GiB,
+leaving the device MMIO gap untouched even when no shared-memory device is present.
+
+The guest needs `CONFIG_VIRTIO_MEM=y` and automatic memory onlining. Another
+host thread can call `krun_request_memory` and `krun_get_memory_status` while
+the VM runs. Targets are absolute, grow only, and differ from the initial size
+by a multiple of 128 MiB. Check the status for the effective ceiling, driver
+activation, mapped allocation, plugged allocation, and device errors: accepting
+a request does not mean the guest has finished plugging it.
+
+Unallocated slots have no KVM mapping and are protected with `PROT_NONE`.
+The driver plugs 2 MiB blocks; the host makes 128 MiB slots accessible as needed.
+A failed multi-slot request preserves and reports completed slots. Guest
+unplug requests release slots only after their last plugged block is removed;
+the host target never decreases.
 
 ## Networking
 

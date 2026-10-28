@@ -120,6 +120,7 @@ impl RamSnapshotVm {
         if self.exit.requested() {
             return Err(Error::Invalid("the VM is exiting"));
         }
+        if let Some(control) = self.memory_control() { control.freeze(true); }
         let paused = if self
             .handles
             .iter()
@@ -172,6 +173,7 @@ impl RamSnapshotVm {
             return Err(error);
         }
         self.pause = None;
+        if let Some(control) = self.memory_control() { control.freeze(false); }
         Ok(())
     }
 
@@ -276,6 +278,7 @@ impl RamSnapshotVm {
     /// workers and control queues, then the event thread); one failure does
     /// not skip the rest.
     fn resume_devices(&self) -> Result<()> {
+        if let Some(memory) = &self.memory_device { memory.device.lock().unwrap().snapshot_kick(); }
         let mut results = Vec::new();
         #[cfg(feature = "blk")]
         results.push(blk::resume_devices(self));

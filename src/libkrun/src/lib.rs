@@ -1,6 +1,9 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+mod memory_hotplug;
+
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
@@ -141,6 +144,7 @@ struct ContextConfig {
     env: Option<String>,
     args: Option<String>,
     rlimits: Option<String>,
+    kernel_params: Vec<String>,
     #[cfg(feature = "net")]
     legacy_net_cfg: Option<LegacyNetworkConfig>,
     #[cfg(feature = "net")]
@@ -180,6 +184,14 @@ impl ContextConfig {
             Some(workdir) => format!("KRUN_WORKDIR={workdir}"),
             None => "".to_string(),
         }
+    }
+
+    fn add_kernel_param(&mut self, param: String) {
+        self.kernel_params.push(param);
+    }
+
+    fn get_kernel_params(&self) -> String {
+        self.kernel_params.join(" ")
     }
 
     fn set_exec_path(&mut self, exec_path: String) {
@@ -548,12 +560,18 @@ pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
         Some(busy) if busy < 0 => return busy,
         Some(_) => {
             CTX_MAP.lock().unwrap().remove(&ctx_id);
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            memory_hotplug::remove(ctx_id);
             return KRUN_SUCCESS;
         }
         None => {}
     }
     match CTX_MAP.lock().unwrap().remove(&ctx_id) {
-        Some(_) => KRUN_SUCCESS,
+        Some(_) => {
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            memory_hotplug::remove(ctx_id);
+            KRUN_SUCCESS
+        }
         None => -libc::ENOENT,
     }
 }
@@ -1311,6 +1329,33 @@ pub unsafe extern "C" fn krun_set_workdir(ctx_id: u32, c_workdir_path: *const c_
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             ctx_cfg.get_mut().set_workdir(workdir_path.to_string());
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// A kernel parameter must be one non-empty, printable ASCII token that cannot
+/// end the kernel's option list or open a quoted span.
+fn is_valid_kernel_param(param: &str) -> bool {
+    !param.is_empty() && param != "--" && param.bytes().all(|b| b.is_ascii_graphic() && b != b'"')
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_add_kernel_cmdline(ctx_id: u32, c_param: *const c_char) -> i32 {
+    if c_param.is_null() {
+        return -libc::EINVAL;
+    }
+    let param = match CStr::from_ptr(c_param).to_str() {
+        Ok(param) if is_valid_kernel_param(param) => param,
+        _ => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().add_kernel_param(param.to_string());
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -2602,7 +2647,8 @@ fn set_kernel_cmdline(ctx_cfg: &mut ContextConfig) -> Result<(), i32> {
     let kernel_cmdline = KernelCmdlineConfig {
         prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
         krun_env: Some(format!(
-            " {} {} {} {} {}",
+            " {} {} {} {} {} {}",
+            ctx_cfg.get_kernel_params(),
             ctx_cfg.get_exec_path(),
             ctx_cfg.get_workdir(),
             ctx_cfg.get_block_root(),
@@ -2935,6 +2981,24 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
             error!("Error running nitro enclave: {e}");
 
             -libc::EINVAL
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_param_tests {
+    use super::is_valid_kernel_param;
+
+    #[test]
+    fn accepts_single_tokens() {
+        assert!(is_valid_kernel_param("maxcpus=2"));
+        assert!(is_valid_kernel_param("memhp_default_state=online_movable"));
+    }
+
+    #[test]
+    fn rejects_tokens_that_could_split_or_end_the_cmdline() {
+        for param in ["", "--", "a b", "a\tb", "x=\"y\"", "caf\u{e9}"] {
+            assert!(!is_valid_kernel_param(param), "{param:?}");
         }
     }
 }

@@ -57,6 +57,57 @@ const BALLOON: Kind = Kind {
     queue_size: BALLOON_QUEUE_SIZE,
 };
 
+const MEMORY: Kind = Kind {
+    name: "virtio-mem", mmio_addr: 0xd000_b000, irq: 7,
+    device_type: 24, features: (1 << 32) | (1 << 1), queues: 1, queue_size: 128,
+};
+pub(super) const MEMORY_SLOT: (u64, u32) = (MEMORY.mmio_addr, MEMORY.irq);
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MemoryMeta {
+    slot: DeviceMeta,
+    pub(super) state: devices::virtio::mem::MemSnapshot,
+}
+
+pub(super) fn attach_memory(vm: &mut RamSnapshotVm, device: devices::virtio::mem::Mem) -> Result<()> {
+    // The reservation is already appended; this device owns its one extra Arc.
+    let device = Arc::new(Mutex::new(device));
+    let transport = new_transport(vm, &device)?;
+    wiring::register_device(vm, &transport, MEMORY.mmio_addr, MEMORY.irq)?;
+    vm.memory_device = Some(EventDevice { device, transport, mmio_addr: MEMORY.mmio_addr, irq: MEMORY.irq });
+    Ok(())
+}
+
+pub(super) fn capture_memory(vm: &RamSnapshotVm, regions: &[Region]) -> Result<Option<MemoryMeta>> {
+    vm.memory_device.as_ref().map(|attached| {
+        let meta = MemoryMeta {
+            slot: capture_slot(&MEMORY, attached, |d| d.snapshot_queue_states()),
+            state: attached.device.lock().unwrap().snapshot(),
+        };
+        validate_memory(&meta, regions)?;
+        Ok(meta)
+    }).transpose()
+}
+
+pub(super) fn validate_memory(meta: &MemoryMeta, regions: &[Region]) -> Result<()> {
+    meta.state.validate()?;
+    if (meta.state.status.active != 0) != meta.slot.device.activated {
+        return Err(Error::Invalid("virtio-mem control activation mismatch"));
+    }
+    validate_slot(&MEMORY, &meta.slot, regions)
+}
+
+pub(super) fn validate_memory_rings(meta: &MemoryMeta, memory: &GuestMemoryMmap) -> Result<()> {
+    meta.slot.device.validate_ready_queues(memory, 24, 1, 128)
+        .map_err(|e| Error::Full(format!("virtio-mem rings: {e}")))
+}
+
+pub(super) fn restore_memory(vm: &mut RamSnapshotVm, meta: &MemoryMeta, device: devices::virtio::mem::Mem) -> Result<()> {
+    vm.memory_device = Some(restore_slot(vm, &MEMORY, &meta.slot, device)?);
+    Ok(())
+}
+
 /// The RNG's and the balloon's fixed (MMIO address, GSI).
 pub(super) const RNG_SLOT: (u64, u32) = (RNG.mmio_addr, RNG.irq);
 pub(super) const BALLOON_SLOT: (u64, u32) = (BALLOON.mmio_addr, BALLOON.irq);
@@ -161,7 +212,7 @@ pub(super) fn expected_alias_clones(vm: &RamSnapshotVm) -> usize {
             1 + usize::from(attached.device.lock().unwrap().is_activated())
         })
     }
-    holders(&vm.rng) + holders(&vm.balloon)
+    holders(&vm.rng) + holders(&vm.balloon) + holders(&vm.memory_device)
 }
 
 /// Metadata-only validation, before guest RAM or any target resource exists.
@@ -250,7 +301,7 @@ pub(super) fn capture(
         config: balloon.device.lock().unwrap().snapshot_config(),
     });
     validate_metadata(rng.as_ref(), balloon.as_ref(), regions)?;
-    validate_rings(rng.as_ref(), balloon.as_ref(), &vm.memory)?;
+    validate_rings(rng.as_ref(), balloon.as_ref(), &vm.accessible_memory()?)?;
     Ok((rng, balloon))
 }
 

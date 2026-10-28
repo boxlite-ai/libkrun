@@ -333,7 +333,7 @@ pub(super) fn capture_disks(
         });
     }
     validate_disk_metadata(&metas, regions)?;
-    validate_disk_rings(&metas, &vm.memory)?;
+    validate_disk_rings(&metas, &vm.accessible_memory()?)?;
     Ok(metas)
 }
 

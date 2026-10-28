@@ -29,6 +29,8 @@ pub mod gpu;
 pub mod input;
 pub mod linux_errno;
 pub mod control;
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub mod mem;
 mod mmio;
 pub mod persist;
 #[cfg(feature = "net")]

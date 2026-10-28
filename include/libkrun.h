@@ -10,6 +10,22 @@ extern "C" {
 #include <stdbool.h>
 #include <unistd.h>
 
+/* Linux/KVM memory growth. Configure after krun_set_vm_config, before enter.
+ * Targets include boot RAM; growth is a multiple of 128 MiB. Calls to request
+ * and status are thread-safe after enter. An accepted request is asynchronous.
+ */
+struct krun_memory_status {
+    uint32_t max_mib;
+    uint32_t requested_mib;
+    uint32_t plugged_mib;
+    uint32_t mapped_mib;
+    int32_t error;
+    uint32_t active;
+};
+int32_t krun_set_memory_hotplug(uint32_t ctx_id, uint32_t max_mib);
+int32_t krun_request_memory(uint32_t ctx_id, uint32_t total_mib);
+int32_t krun_get_memory_status(uint32_t ctx_id, struct krun_memory_status *status);
+
 /**
  * Sets the log level for the library.
  *
@@ -773,6 +789,21 @@ int32_t krun_set_rlimits(uint32_t ctx_id, const char *const rlimits[]);
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_smbios_oem_strings(uint32_t ctx_id, const char *const oem_strings[]);
+
+/**
+ * Appends one parameter to the guest kernel command line, for example
+ * "maxcpus=2". Parameters are kept in call order and apply to both the bundled
+ * libkrunfw kernel and a kernel set with "krun_set_kernel".
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "param"  - a single non-empty token of printable ASCII, without spaces or
+ *             double quotes, and not "--".
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_kernel_cmdline(uint32_t ctx_id, const char *param);
 
 /**
  * Sets the working directory for the executable to be run inside the microVM.

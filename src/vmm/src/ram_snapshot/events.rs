@@ -181,6 +181,7 @@ pub(super) struct Devices {
     pub(super) exit: Arc<Exit>,
     pub(super) rng: Option<Arc<Mutex<Rng>>>,
     pub(super) balloon: Option<Arc<Mutex<Balloon>>>,
+    pub(super) memory: Option<Arc<Mutex<devices::virtio::mem::Mem>>>,
     /// Its queue callbacks only; the owner restarts its backend, which
     /// notifies the queues itself.
     pub(super) vsock: Option<Arc<Mutex<Vsock>>>,
@@ -193,6 +194,7 @@ pub(super) struct Devices {
 
 impl Devices {
     fn kick(&self) {
+        if let Some(memory) = &self.memory { memory.lock().unwrap().snapshot_kick(); }
         if let Some(rng) = &self.rng {
             rng.lock().unwrap().snapshot_kick();
         }
@@ -371,6 +373,7 @@ fn event_manager(wake: EventFd, devices: &Devices) -> std::result::Result<EventM
     if let Some(balloon) = &devices.balloon {
         subscribers.push(balloon.clone());
     }
+    if let Some(memory) = &devices.memory { subscribers.push(memory.clone()); }
     if let Some(vsock) = &devices.vsock {
         subscribers.push(vsock.clone());
     }

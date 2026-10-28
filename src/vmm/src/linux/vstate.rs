@@ -20,7 +20,6 @@ use std::os::unix::io::RawFd;
 use std::env;
 use std::result;
 use std::sync::atomic::{fence, Ordering};
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use std::sync::Arc;
 use std::thread;
 #[cfg(target_arch = "x86_64")]
@@ -502,8 +501,9 @@ impl KvmContext {
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
-    fd: VmFd,
+    fd: Arc<VmFd>,
     next_mem_slot: u32,
+    max_mem_slots: u32,
 
     // X86 specific fields.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -539,8 +539,9 @@ impl Vm {
             arch::x86_64::msr::supported_guest_msrs(kvm).map_err(Error::GuestMSRs)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
+            max_mem_slots: 0,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
@@ -578,8 +579,9 @@ impl Vm {
         };
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
+            max_mem_slots: 0,
             supported_cpuid,
             supported_msrs,
             tee,
@@ -623,8 +625,9 @@ impl Vm {
         vm_fd.enable_cap(&cap).map_err(Error::VmApicBusClockRate)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
+            max_mem_slots: 0,
             supported_cpuid,
             supported_msrs,
             tdx: Some(IntelTdx::new()),
@@ -654,6 +657,7 @@ impl Vm {
         if guest_mem.num_regions() > kvm_max_memslots {
             return Err(Error::NotEnoughMemorySlots);
         }
+        self.max_mem_slots = kvm_max_memslots as u32;
 
         for region in guest_mem.iter() {
             self.memory_region_set(guest_mem, region)?;
@@ -674,6 +678,14 @@ impl Vm {
             }
         }
         None
+    }
+
+    /// Reserve disjoint slot IDs for a device that manages their registration.
+    pub fn reserve_memory_slots(&mut self, wanted: u32) -> (Arc<VmFd>, u32, u32) {
+        let count = wanted.min(self.max_mem_slots - self.next_mem_slot);
+        let first = self.next_mem_slot;
+        self.next_mem_slot += count;
+        (self.fd.clone(), first, count)
     }
 
     #[allow(unused_mut)]

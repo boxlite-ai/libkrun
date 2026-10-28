@@ -291,7 +291,7 @@ pub(super) fn capture(
         config: net.config_bytes(),
     };
     validate_nic_metadata(&meta, disks, regions)?;
-    validate_nic_rings(&meta, &vm.memory)?;
+    validate_nic_rings(&meta, &vm.accessible_memory()?)?;
     Ok(Some(meta))
 }
 

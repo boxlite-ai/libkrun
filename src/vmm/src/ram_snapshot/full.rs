@@ -52,6 +52,7 @@ struct Metadata {
     nic: Option<NicSection>,
     rng: Option<DeviceMeta>,
     balloon: Option<BalloonMeta>,
+    memory: Option<event_devices::MemoryMeta>,
     vsock: Option<VsockMeta>,
     console: Option<ConsoleMeta>,
     legacy: Option<LegacyMeta>,
@@ -144,6 +145,7 @@ fn device_slots(metadata: &Metadata) -> Vec<u64> {
         metadata.balloon.as_ref(),
     ));
     slots.extend(metadata.vsock.as_ref().map(|_| vsock::VSOCK_MMIO_ADDR));
+    slots.extend(metadata.memory.as_ref().map(|_| event_devices::MEMORY_SLOT.0));
     slots.extend(
         metadata
             .console
@@ -238,6 +240,22 @@ pub(super) fn verify_qcow2(file: &File) -> Result<()> {
 /// regions, and the virtio-fs shares' DAX windows against everything else;
 /// returns the length of the share payloads.
 fn validate_devices(metadata: &Metadata, max_slots: usize) -> Result<u64> {
+    let mut ranges: Vec<Region> = metadata.regions.iter().map(|r| Region { gpa: r.gpa, len: r.len, attributes: r.attributes }).collect();
+    let mut reserved_slots = 0;
+    if let Some(meta) = &metadata.memory {
+        event_devices::validate_memory(meta, &metadata.regions)?;
+        let state = &meta.state;
+        if metadata.regions.iter().try_fold(0u64, |n, r| n.checked_add(r.len)) != Some(u64::from(state.initial_mib) << 20) {
+            return Err(Error::Invalid("virtio-mem boot allocation differs from RAM"));
+        }
+        reserved_slots = (state.size / devices::virtio::mem::SLOT_SIZE) as usize;
+        wiring::check_disjoint(state.addr, state.size, ranges.iter().map(|r| (r.gpa, r.len))
+            .chain(virtio_fs::ARCH_WINDOWS), "hotplug reservation overlaps RAM or architecture")?;
+        ranges.push(Region { gpa: state.addr, len: state.size, attributes: 0 });
+    }
+    if metadata.regions.len().saturating_add(reserved_slots) > max_slots {
+        return Err(Error::Invalid("hotplug reservation exceeds target memslots"));
+    }
     #[cfg(feature = "blk")]
     blk::validate_disk_metadata(&metadata.disks, &metadata.regions)?;
     #[cfg(all(feature = "blk", feature = "net"))]
@@ -258,15 +276,17 @@ fn validate_devices(metadata: &Metadata, max_slots: usize) -> Result<u64> {
     if let Some(legacy) = &metadata.legacy {
         legacy::validate_metadata(legacy, &metadata.regions)?;
     }
-    match &metadata.fs {
+    let shares = match &metadata.fs {
         Some(meta) => virtio_fs::validate_metadata(
             meta,
-            &metadata.regions,
+            &ranges,
             &device_slots(metadata),
-            max_slots,
+            max_slots.saturating_sub(reserved_slots.saturating_sub(1)),
         ),
         None => Ok(0),
-    }
+    }?;
+    shares.checked_add(super::hotplug::payload_len(metadata.memory.as_ref()))
+        .ok_or(Error::Invalid("hotplug payload overflow"))
 }
 
 fn read_ram(file: &mut File, regions: &[Region]) -> Result<GuestMemoryMmap> {
@@ -293,6 +313,7 @@ fn read_ram(file: &mut File, regions: &[Region]) -> Result<GuestMemoryMmap> {
 /// Validate every active ring against the loaded guest RAM, before any
 /// directory, socket or thread exists.
 fn validate_rings(metadata: &Metadata, memory: &GuestMemoryMmap) -> Result<()> {
+    if let Some(meta) = &metadata.memory { event_devices::validate_memory_rings(meta, memory)?; }
     #[cfg(feature = "blk")]
     blk::validate_disk_rings(&metadata.disks, memory)?;
     #[cfg(all(feature = "blk", feature = "net"))]
@@ -372,15 +393,16 @@ fn write_memory(
     file.write_all(&[0; format::HEADER as usize])?;
     file.write_all(&encoded.0)?;
     let mut buffer = [0; CHUNK_SIZE];
-    for region in &metadata.regions {
+    let dynamic = metadata.memory.iter().flat_map(|m| super::hotplug::extents(&m.state));
+    for (gpa, length) in metadata.regions.iter().map(|r| (r.gpa, r.len)).chain(dynamic) {
         let mut offset = 0;
-        while offset < region.len {
+        while offset < length {
             if abort.load(Ordering::SeqCst) {
                 return Err(Error::Invalid("checkpoint cancelled"));
             }
-            let len = (region.len - offset).min(CHUNK_SIZE as u64) as usize;
+            let len = (length - offset).min(CHUNK_SIZE as u64) as usize;
             memory
-                .read_slice(&mut buffer[..len], GuestAddress(region.gpa + offset))
+                .read_slice(&mut buffer[..len], GuestAddress(gpa + offset))
                 .map_err(Error::Memory)?;
             #[cfg(not(test))]
             file.write_all(&buffer[..len])?;
@@ -479,7 +501,7 @@ impl RamSnapshotVm {
             return Err(Error::Invalid("the VM is exiting"));
         }
         virtio_fs::require_declared(self.fs.len(), self.host_writers_stopped)?;
-        let regions = self.topology.regions(&self.memory)?;
+        let regions = self.topology.regions(&self.boot_memory()?)?;
         payload_len(&regions, self.max_slots)?;
         let kvm = KvmContext::new().map_err(Error::State)?;
         let compatibility = Compatibility::capture(kvm.fd()).map_err(Error::Full)?;
@@ -493,6 +515,7 @@ impl RamSnapshotVm {
         #[cfg(not(all(feature = "blk", feature = "net")))]
         let nic = None;
         let (rng, balloon) = event_devices::capture(self, &regions)?;
+        let memory = event_devices::capture_memory(self, &regions)?;
         let vsock = vsock::capture(self, &regions)?;
         let console = console::capture(self, &regions)?;
         let legacy = legacy::capture(self, &regions)?;
@@ -535,6 +558,7 @@ impl RamSnapshotVm {
             nic,
             rng,
             balloon,
+            memory,
             vsock,
             console,
             legacy,
@@ -547,6 +571,7 @@ impl RamSnapshotVm {
         if let Some(shares) = &shares {
             metadata.fs = Some(shares.meta.clone());
         }
+        validate_rings(&metadata, &self.accessible_memory()?)?;
         write_memory(
             &mut file,
             &self.capture_abort,
@@ -649,7 +674,6 @@ impl RamSnapshotVm {
         let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
         // RAM first (file order), then every ring against the loaded memory.
         let memory = read_ram(&mut file, &metadata.regions)?;
-        validate_rings(&metadata, &memory)?;
         // The first resource the import creates: a new console output file,
         // checked like given ports and removed again unless the import
         // succeeds (declared before the owner, so it outlives the owner's
@@ -666,6 +690,8 @@ impl RamSnapshotVm {
             None => (None, None),
         };
         let mut owner = Self::restore_scaffold(&kvm, memory)?;
+        if let Some(meta) = &metadata.memory { super::hotplug::restore(&mut owner, &mut file, meta)?; }
+        validate_rings(&metadata, &owner.accessible_memory()?)?;
         #[cfg(feature = "blk")]
         {
             let paths: Vec<_> = bindings

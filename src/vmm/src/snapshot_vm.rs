@@ -121,6 +121,10 @@ impl SnapshotExitWaiter {
 pub struct SnapshotVm(RamSnapshotVm);
 
 impl SnapshotVm {
+    /// The restored mailbox is rebound to the importing C context before readiness.
+    pub fn memory_control(&self) -> Option<Arc<devices::virtio::mem::MemoryControl>> {
+        self.0.memory_control()
+    }
     /// Cold-boot the configured Linux guest. Every unsupported feature or
     /// device is refused before anything is created.
     pub fn boot(resources: &VmResources, devices: SnapshotDevices) -> Result<Self> {

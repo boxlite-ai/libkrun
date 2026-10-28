@@ -136,7 +136,11 @@ mod supported {
         let Some(setup) = cfg.snapshot.take() else {
             return -libc::EINVAL;
         };
-        control::serve(ctx_id, || start(&mut cfg, setup))
+        control::serve(ctx_id, || {
+            let vm = start(&mut cfg, setup)?;
+            crate::memory_hotplug::bind(ctx_id, vm.memory_control());
+            Ok(vm)
+        })
     }
 
     fn refused(why: &str) -> i32 {

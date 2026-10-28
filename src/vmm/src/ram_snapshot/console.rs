@@ -257,7 +257,7 @@ pub(super) fn capture(vm: &RamSnapshotVm, regions: &[Region]) -> Result<Option<C
     };
     let transport = console.transport.lock().unwrap();
     let device = console.device.lock().unwrap();
-    capture_device(&transport, &device, &vm.memory, regions).map(Some)
+    capture_device(&transport, &device, &vm.accessible_memory()?, regions).map(Some)
 }
 
 fn capture_device(

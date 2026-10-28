@@ -89,6 +89,7 @@ struct Nic {
 /// yet.
 pub(crate) struct BootImage {
     memory: GuestMemoryMmap,
+    memory_hotplug: Option<std::sync::Arc<devices::virtio::mem::MemoryControl>>,
     entry: GuestAddress,
     vcpus: VcpuConfig,
     console: Option<PathBuf>,
@@ -149,6 +150,7 @@ impl BootImage {
         let memory = GuestMemoryMmap::from_ranges(&ranges).map_err(Error::Mapping)?;
         let (entry, initrd, payload_cmdline) = load_payload(resources, &payload, &memory, &info)?;
         let slots = discovery_slots(Present {
+            memory: resources.memory_hotplug.is_some(),
             console: console.is_some(),
             shares: shares.len(),
             #[cfg(feature = "blk")]
@@ -161,6 +163,7 @@ impl BootImage {
         configure_guest(&memory, &info, &cmdline, &initrd, vcpus.vcpu_count)?;
         Ok(Self {
             memory,
+            memory_hotplug: resources.memory_hotplug.clone(),
             entry,
             vcpus,
             console,
@@ -417,6 +420,7 @@ fn load_payload(
 
 /// Which devices a boot attaches.
 struct Present {
+    memory: bool,
     console: bool,
     shares: usize,
     #[cfg(feature = "blk")]
@@ -430,6 +434,7 @@ struct Present {
 /// balloon, RNG, console, shares, disks, vsock, NIC.
 fn discovery_slots(present: Present) -> Vec<(u64, u32)> {
     let mut slots = vec![event_devices::BALLOON_SLOT, event_devices::RNG_SLOT];
+    if present.memory { slots.push(event_devices::MEMORY_SLOT); }
     if present.console {
         slots.push((console::CONSOLE_MMIO_ADDR, console::CONSOLE_IRQ));
     }
@@ -566,6 +571,7 @@ impl RamSnapshotVm {
         snapshot::Compatibility::capture(kvm.fd()).map_err(|e| unsupported(&e))?;
         let BootImage {
             memory,
+            memory_hotplug,
             entry,
             vcpus,
             console,
@@ -578,6 +584,19 @@ impl RamSnapshotVm {
             slots,
         } = image;
         let mut owner = Self::register(memory, Topology::default(), &kvm)?;
+        if let Some(control) = memory_hotplug {
+            use devices::virtio::mem::SLOT_SIZE;
+            use vm_memory::{Address, GuestMemory};
+            let end = shares.iter().filter_map(|s| s.dax.map(|d| d.gpa + d.len))
+                .max().unwrap_or(0).max(owner.memory.last_addr().raw_value() + 1).max(FIRST_ADDR_PAST_32BITS);
+            let addr = end.checked_add(SLOT_SIZE - 1).ok_or(Error::Invalid("hotplug address overflow"))? & !(SLOT_SIZE - 1);
+            let bits = unsafe { std::arch::x86_64::__cpuid(0x80000008).eax & 0xff }.min(52);
+            let available = kvm.max_memslots().saturating_sub(owner.memory.num_regions() + shares.iter().filter(|s| s.dax.is_some()).count());
+            let slots = (u64::from(control.status().max_mib - control.initial_mib) * (1 << 20) / SLOT_SIZE)
+                .min(available as u64).min((1u64 << bits).saturating_sub(addr) / SLOT_SIZE);
+            let device = owner.create_memory_device(control, addr, slots * SLOT_SIZE)?;
+            event_devices::attach_memory(&mut owner, device)?;
+        }
         owner.attach_legacy([None, None, None, None])?;
         owner.attach_balloon()?;
         owner.attach_rng()?;
@@ -622,6 +641,7 @@ impl RamSnapshotVm {
         let mut slots = Vec::new();
         slots.extend(self.balloon.iter().map(|d| (d.mmio_addr, d.irq)));
         slots.extend(self.rng.iter().map(|d| (d.mmio_addr, d.irq)));
+        slots.extend(self.memory_device.iter().map(|d| (d.mmio_addr, d.irq)));
         slots.extend(
             self.console
                 .iter()

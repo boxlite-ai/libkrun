@@ -363,7 +363,7 @@ pub(super) fn capture(vm: &RamSnapshotVm, regions: &[Region]) -> Result<Option<V
         interrupt_owed,
     };
     validate_metadata(&meta, regions)?;
-    validate_rings(&meta, &vm.memory)?;
+    validate_rings(&meta, &vm.accessible_memory()?)?;
     Ok(Some(meta))
 }
 

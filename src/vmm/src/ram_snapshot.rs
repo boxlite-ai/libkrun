@@ -42,6 +42,7 @@ pub(crate) mod execution;
 pub(crate) mod full;
 mod legacy;
 mod lifecycle;
+mod hotplug;
 mod virtio_fs;
 mod vsock;
 mod wiring;
@@ -463,6 +464,7 @@ pub(crate) struct RamSnapshotVm {
     nic: Option<nic::NicDevice>,
     rng: Option<events::EventDevice<devices::virtio::Rng>>,
     balloon: Option<events::EventDevice<devices::virtio::Balloon>>,
+    memory_device: Option<events::EventDevice<devices::virtio::mem::Mem>>,
     vsock: Option<vsock::VsockDevice>,
     console: Option<console::ConsoleDevice>,
     events: Option<events::EventThread>,
@@ -525,6 +527,7 @@ impl RamSnapshotVm {
             nic: None,
             rng: None,
             balloon: None,
+            memory_device: None,
             vsock: None,
             console: None,
             events: None,
@@ -696,6 +699,7 @@ impl RamSnapshotVm {
                 .map(|balloon| (&balloon.transport, balloon.mmio_addr, balloon.irq)),
         );
         devices.extend(self.vsock.iter().map(vsock::slot));
+        devices.extend(self.memory_device.iter().map(|d| (&d.transport, d.mmio_addr, d.irq)));
         devices.extend(self.console.iter().map(console::slot));
         devices.extend(self.fs.iter().map(virtio_fs::slot));
         devices
@@ -736,6 +740,7 @@ impl RamSnapshotVm {
             exit: self.exit.clone(),
             rng: self.rng.as_ref().map(|rng| rng.device.clone()),
             balloon: self.balloon.as_ref().map(|balloon| balloon.device.clone()),
+            memory: self.memory_device.as_ref().map(|d| d.device.clone()),
             vsock: vsock::event_device(self),
             console: console::event_device(self),
             serials: self
@@ -795,6 +800,7 @@ impl RamSnapshotVm {
     /// shares (a retired share leaves its DAX window alone). Every startup,
     /// import, pause and resume failure ends here.
     fn stop_threads(&mut self) {
+        if let Some(control) = self.memory_control() { control.freeze(true); }
         vsock::quiesce_gate(self);
         if let Some(events) = &mut self.events {
             events.stop();
@@ -825,7 +831,8 @@ impl RamSnapshotVm {
                 .memory
                 .remove_region(region.start_addr(), region.len())
                 .map_err(|e| Error::Full(format!("inspect RAM ownership: {e}")))?;
-            if std::sync::Arc::strong_count(&mapping) != 2 + expected_device_clones {
+            let reservation_owner = usize::from(self.memory_control().is_some() && region.prot() == libc::PROT_NONE);
+            if std::sync::Arc::strong_count(&mapping) != 2 + expected_device_clones + reservation_owner {
                 return Err(Error::Invalid(
                     "full snapshot RAM has external aliases/writers",
                 ));

@@ -325,7 +325,7 @@ pub(super) fn next_slot(ram_regions: usize, windows: usize, max_slots: usize) ->
 /// backing joins `vm.dax` before the registration, so it outlives the
 /// memslot even when this or a later attach step fails.
 fn add_window(vm: &mut RamSnapshotVm, range: DaxRange) -> Result<usize> {
-    let slot = next_slot(vm.memory.num_regions(), vm.dax.len(), vm.max_slots)?;
+    let slot = next_slot(vm.memory_slot_count(), vm.dax.len(), vm.max_slots)?;
     vm.dax.push(DaxBacking::new(range.len)?);
     let backing = vm.dax.len() - 1;
     let region = kvm_bindings::kvm_userspace_memory_region {
@@ -432,7 +432,7 @@ pub(super) fn attach(vm: &mut RamSnapshotVm, config: FsShareConfig) -> Result<()
             taken,
             "DAX window overlaps RAM, a device or another window",
         )?;
-        next_slot(vm.memory.num_regions(), vm.dax.len(), vm.max_slots)?;
+        next_slot(vm.memory_slot_count(), vm.dax.len(), vm.max_slots)?;
     }
     let attached = (|| {
         vm.probe_ram_aliases(vm.expected_device_clones())?;

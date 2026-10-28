@@ -128,6 +128,8 @@ pub enum VsockConfig {
 /// held in the Vmm.
 #[derive(Default)]
 pub struct VmResources {
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    pub memory_hotplug: Option<std::sync::Arc<devices::virtio::mem::MemoryControl>>,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// The firmware to be loaded into the microVM.
@@ -408,6 +410,8 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            memory_hotplug: None,
             vm_config: VmConfig::default(),
             firmware_config: None,
             kernel_cmdline: default_kernel_cmdline(),
