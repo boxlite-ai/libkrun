@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use devices::virtio::{port_io, PortDescription};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::virtio_fs::{self, ArchiveMode, DaxRange, FsShareConfig};
+use super::virtio_fs::{self, DaxRange, FsShareConfig};
 use super::vsock::{VsockPorts, VSOCK_IRQ, VSOCK_MMIO_ADDR};
 use super::wiring::MMIO_LEN;
 use super::{console, event_devices, CreatedName, Error, RamSnapshotVm, Result, Topology};
@@ -556,7 +556,7 @@ impl Drop for NewConsoleOutput {
 impl RamSnapshotVm {
     /// Cold-boot `image`: check that the host can checkpoint it, create the
     /// VM, attach every device at its announced slot, then start the vCPUs
-    /// at the kernel entry. Exports archive the shares guest-visibly (no
+    /// at the kernel entry. Checkpoints retain external share references (no
     /// privilege needed). A failure leaves no thread running.
     pub(crate) fn boot(image: BootImage) -> Result<Self> {
         let kvm = KvmContext::new().map_err(Error::State)?;
@@ -578,7 +578,6 @@ impl RamSnapshotVm {
             slots,
         } = image;
         let mut owner = Self::register(memory, Topology::default(), &kvm)?;
-        owner.set_fs_archive_mode(ArchiveMode::GuestVisible)?;
         owner.attach_legacy([None, None, None, None])?;
         owner.attach_balloon()?;
         owner.attach_rng()?;

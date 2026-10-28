@@ -9,8 +9,9 @@
 //! sockets are the host endpoints. Every test name contains "snapshot" for
 //! `make snapshot-test`.
 //!
-//! Their execution is unverified until run on a Linux KVM host (see the
-//! README's stage-8 validation status).
+//! These tests require a Linux KVM host and the external-QCOW2 fixture.
+
+#![cfg(feature = "blk")]
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -27,6 +28,7 @@ use super::tests::{
     PORT_OPEN, PORT_READY, QUIET, WAIT,
 };
 use super::*;
+use crate::ram_snapshot::test_fixture::{attach_disk, DescriptorFixture};
 use crate::ram_snapshot::{ConsoleEndpoints, RestoreResources, VsockPorts};
 
 const RAM_MIB: usize = 2;
@@ -77,7 +79,7 @@ impl Guest<'_> {
 
     /// A 32-bit read of guest RAM by the guest itself.
     fn read_ram(&self, addr: u64) -> u32 {
-        self.request(OP_READ, addr - CONSOLE_MMIO_ADDR, 0)
+        self.request(OP_READ, addr.wrapping_sub(CONSOLE_MMIO_ADDR), 0)
     }
 
     fn request(&self, op: u32, offset: u64, value: u32) -> u32 {
@@ -85,7 +87,7 @@ impl Guest<'_> {
         let at = |field: u64| GuestAddress(MAILBOX + field);
         let seq = mem.read_obj::<u32>(at(0)).unwrap().wrapping_add(1);
         mem.write_obj(op, at(4)).unwrap();
-        mem.write_obj((CONSOLE_MMIO_ADDR + offset) as u32, at(8))
+        mem.write_obj(CONSOLE_MMIO_ADDR.wrapping_add(offset) as u32, at(8))
             .unwrap();
         mem.write_obj(value, at(0xc)).unwrap();
         fence(Ordering::SeqCst);
@@ -133,7 +135,7 @@ fn assert_paused(vm: &RamSnapshotVm) {
 }
 
 fn fixture() -> RamSnapshotVm {
-    let vm = crate::builder::build_ram_snapshot_vm(
+    let mut vm = crate::builder::build_ram_snapshot_vm(
         RAM_MIB,
         &Default::default(),
         &crate::builder::Payload::Empty,
@@ -142,6 +144,7 @@ fn fixture() -> RamSnapshotVm {
     vm.memory
         .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
         .unwrap();
+    attach_disk(&mut vm);
     vm
 }
 
@@ -163,13 +166,8 @@ fn resources(ports: Vec<PortDescription>) -> RestoreResources {
 
 /// The image's console section, for comparing exports.
 fn console_section(path: &Path) -> serde_json::Value {
-    let mut file = File::open(path).unwrap();
-    let mut header = [0u8; 16];
-    file.read_exact(&mut header).unwrap();
-    let len = u32::from_le_bytes(header[12..].try_into().unwrap()) as usize;
-    let mut json = vec![0; len];
-    file.read_exact(&mut json).unwrap();
-    let metadata: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let bytes = crate::ram_snapshot::full::inspect(&File::open(path).unwrap()).unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     metadata["console"].clone()
 }
 
@@ -216,7 +214,7 @@ fn snapshot_console_kvm_restored_guest_continues_io_on_new_endpoints() {
 
     vm.pause().unwrap();
     assert_paused(&vm);
-    vm.export(&image).unwrap();
+    vm.export_test(&image).unwrap();
     let section = console_section(&image);
     let delivered = section["console"]["ports"][0]["tx_in_flight"]["delivered"]
         .as_u64()
@@ -229,7 +227,7 @@ fn snapshot_console_kvm_restored_guest_continues_io_on_new_endpoints() {
 
     let (fresh_in, mut fresh_out) = (Pipe::new(), Pipe::new());
     let mut target =
-        RamSnapshotVm::import(&image, resources(ports(&fresh_in, &fresh_out))).unwrap();
+        RamSnapshotVm::import_test(&image, resources(ports(&fresh_in, &fresh_out))).unwrap();
     assert_eq!(counter(&target), paused_at);
     std::thread::sleep(QUIET);
     assert!(
@@ -292,11 +290,12 @@ fn snapshot_console_kvm_pending_irq_is_delivered_once_after_restore() {
     assert_eq!(counter_at(&vm, IRQ_COUNT), 0);
 
     vm.pause().unwrap();
-    vm.export(&dir.path("image")).unwrap();
+    vm.export_test(&dir.path("image")).unwrap();
     drop(vm);
     let (fresh_in, fresh_out) = (Pipe::new(), Pipe::new());
     let mut target =
-        RamSnapshotVm::import(&dir.path("image"), resources(ports(&fresh_in, &fresh_out))).unwrap();
+        RamSnapshotVm::import_test(&dir.path("image"), resources(ports(&fresh_in, &fresh_out)))
+            .unwrap();
     target.resume().unwrap();
     let guest = Guest(&target);
     assert_eq!(guest.read_ram(buf), u32::from_le_bytes(*b"ping"));
@@ -333,8 +332,8 @@ fn snapshot_console_kvm_repeated_exports_source_resume_and_reexport() {
     output.host.read_exact(&mut first).unwrap();
 
     vm.pause().unwrap();
-    vm.export(&dir.path("a")).unwrap();
-    vm.export(&dir.path("b")).unwrap();
+    vm.export_test(&dir.path("a")).unwrap();
+    vm.export_test(&dir.path("b")).unwrap();
     let section = console_section(&dir.path("a"));
     assert_eq!(section, console_section(&dir.path("b")));
     let delivered = section["console"]["ports"][0]["tx_in_flight"]["delivered"]
@@ -352,8 +351,9 @@ fn snapshot_console_kvm_repeated_exports_source_resume_and_reexport() {
 
     let (fresh_in, fresh_out) = (Pipe::new(), Pipe::new());
     let mut target =
-        RamSnapshotVm::import(&dir.path("a"), resources(ports(&fresh_in, &fresh_out))).unwrap();
-    target.export(&dir.path("c")).unwrap();
+        RamSnapshotVm::import_test(&dir.path("a"), resources(ports(&fresh_in, &fresh_out)))
+            .unwrap();
+    target.export_test(&dir.path("c")).unwrap();
     assert_eq!(console_section(&dir.path("c")), section);
     target.resume().unwrap();
     wait_counter(&target, counter(&target));
@@ -377,10 +377,10 @@ fn snapshot_console_kvm_multi_round_resume_needs_no_kick() {
         vm.pause().unwrap();
         driver.post_tx(&vm.memory, tx(0), &[&[b'x' + round]]);
         let image = dir.path(&format!("round{round}"));
-        vm.export(&image).unwrap();
+        vm.export_test(&image).unwrap();
         drop(vm);
         let (fresh_in, fresh_out) = (Pipe::new(), Pipe::new());
-        vm = RamSnapshotVm::import(&image, resources(ports(&fresh_in, &fresh_out))).unwrap();
+        vm = RamSnapshotVm::import_test(&image, resources(ports(&fresh_in, &fresh_out))).unwrap();
         vm.resume().unwrap();
         output = fresh_out;
         assert_eq!(output.read_exact(1), [b'x' + round]);
@@ -395,7 +395,7 @@ fn snapshot_console_kvm_inactive_console_activates_after_restore() {
     let (input, output) = (Pipe::new(), Pipe::new());
     let mut vm = source(ports(&input, &output));
     vm.pause().unwrap();
-    vm.export(&dir.path("image")).unwrap();
+    vm.export_test(&dir.path("image")).unwrap();
     assert_eq!(
         console_section(&dir.path("image"))["device"]["activated"],
         false
@@ -403,7 +403,8 @@ fn snapshot_console_kvm_inactive_console_activates_after_restore() {
     drop(vm);
     let (fresh_in, mut fresh_out) = (Pipe::new(), Pipe::new());
     let mut target =
-        RamSnapshotVm::import(&dir.path("image"), resources(ports(&fresh_in, &fresh_out))).unwrap();
+        RamSnapshotVm::import_test(&dir.path("image"), resources(ports(&fresh_in, &fresh_out)))
+            .unwrap();
     target.resume().unwrap();
     assert_eq!(
         Guest(&target).read(0x70),
@@ -442,7 +443,7 @@ fn snapshot_console_kvm_combined_with_every_device() {
     assert_eq!(output.read_exact(3), b"one");
 
     vm.pause().unwrap();
-    vm.export(&dir.path("image")).unwrap();
+    vm.export_test(&dir.path("image")).unwrap();
     drop(vm);
     let (fresh_in, mut fresh_out) = (Pipe::new(), Pipe::new());
     let (com1, _com1_peer) = serial();
@@ -456,7 +457,7 @@ fn snapshot_console_kvm_combined_with_every_device() {
         console_ports: Some(ConsoleEndpoints::Ports(ports(&fresh_in, &fresh_out))),
         ..Default::default()
     };
-    let mut target = RamSnapshotVm::import(&dir.path("image"), resources).unwrap();
+    let mut target = RamSnapshotVm::import_test(&dir.path("image"), resources).unwrap();
     target.resume().unwrap();
     driver.post_tx(&target.memory, tx(0), &[b"two"]);
     kick(&target, tx(0));
@@ -490,17 +491,17 @@ fn snapshot_console_kvm_failures_clean_up() {
     let mut driver = bring_up(&vm);
     vm.pause().unwrap();
     let dir = TempDir::new();
-    vm.export(&dir.path("image")).unwrap();
+    vm.export_test(&dir.path("image")).unwrap();
 
     // Missing or mismatched console resources fail before RAM, devices or
     // threads exist.
     let fds = open_fds();
-    assert!(RamSnapshotVm::import(&dir.path("image"), RestoreResources::default()).is_err());
+    assert!(RamSnapshotVm::import_test(&dir.path("image"), RestoreResources::default()).is_err());
     let one = vec![PortDescription::output_pipe(
         "krun-log",
         port_io::output_to_log_as_err(),
     )];
-    assert!(RamSnapshotVm::import(&dir.path("image"), resources(one)).is_err());
+    assert!(RamSnapshotVm::import_test(&dir.path("image"), resources(one)).is_err());
     assert_eq!(open_fds(), fds, "a rejected import kept descriptors");
 
     // A TX blocked on a full output does not hold up teardown.
@@ -517,7 +518,7 @@ fn snapshot_console_kvm_failures_clean_up() {
     );
 }
 
-/// A failed export (an injected mid-copy write error) leaves the source
+/// A failed export (an injected mid-payload write error) leaves the source
 /// paused with its console frozen: nothing more reaches the output, a
 /// retried export captures the same console state, and the source resumes
 /// the in-flight chain exactly from its delivered offset.
@@ -536,7 +537,7 @@ fn snapshot_console_kvm_failed_export_keeps_source_paused_and_retryable() {
 
     vm.pause().unwrap();
     let failed = dir.path("failed");
-    let result = crate::ram_snapshot::tests::with_failed_payload_write(17, || vm.export(&failed));
+    let result = vm.export_test_write_failure();
     assert!(result.is_err());
     assert!(!failed.exists(), "a failed export left a file");
     assert!(vm.is_paused() && !vm.control.unusable);
@@ -549,8 +550,8 @@ fn snapshot_console_kvm_failed_export_keeps_source_paused_and_retryable() {
         "a failed export resumed the console"
     );
 
-    vm.export(&dir.path("a")).unwrap();
-    vm.export(&dir.path("b")).unwrap();
+    vm.export_test(&dir.path("a")).unwrap();
+    vm.export_test(&dir.path("b")).unwrap();
     let section = console_section(&dir.path("a"));
     assert_eq!(section, console_section(&dir.path("b")));
     let delivered = section["console"]["ports"][0]["tx_in_flight"]["delivered"]
@@ -579,7 +580,7 @@ fn snapshot_console_kvm_midway_handshake_continues_after_restore() {
         Driver::used(&vm.memory, CONTROL_TX).len() == 3
     });
     vm.pause().unwrap();
-    vm.export(&dir.path("image")).unwrap();
+    vm.export_test(&dir.path("image")).unwrap();
     let section = console_section(&dir.path("image"));
     assert_eq!(section["console"]["ports"][0]["ready"], true);
     assert_eq!(section["console"]["ports"][0]["started"], false);
@@ -591,7 +592,8 @@ fn snapshot_console_kvm_midway_handshake_continues_after_restore() {
 
     let (fresh_in, mut fresh_out) = (Pipe::new(), Pipe::new());
     let mut target =
-        RamSnapshotVm::import(&dir.path("image"), resources(ports(&fresh_in, &fresh_out))).unwrap();
+        RamSnapshotVm::import_test(&dir.path("image"), resources(ports(&fresh_in, &fresh_out)))
+            .unwrap();
     target.resume().unwrap();
     for _ in 0..=pending {
         driver.post_rx(&target.memory, CONTROL_RX, 64);
@@ -659,7 +661,7 @@ fn snapshot_console_kvm_gone_worker_disables_owner_and_stops_threads() {
     assert!(vm.pause().is_err());
     assert!(vm.control.unusable);
     assert_paused(&vm);
-    assert!(vm.export(&dir.path("image")).is_err());
+    assert!(vm.export_test(&dir.path("image")).is_err());
     assert!(vm.resume().is_err());
     assert!(vm.pause().is_err());
     assert_eq!(
@@ -680,36 +682,31 @@ fn snapshot_console_kvm_gone_worker_disables_owner_and_stops_threads() {
 #[cfg(all(feature = "blk", feature = "net"))]
 #[test]
 fn snapshot_console_kvm_combined_with_disk_and_nic() {
-    use devices::virtio::block::ImageType;
     use std::os::unix::net::UnixListener;
 
     let dir = TempDir::new();
-    let disk = dir.path("disk.raw");
-    fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
     let socket = dir.path("nic.sock");
     let _backend = UnixListener::bind(&socket).unwrap();
     let (input, output) = (Pipe::new(), Pipe::new());
     let mut vm = fixture();
-    vm.attach_disk(&disk, ImageType::Raw, false, false).unwrap();
     vm.attach_net(&socket, [2, 0, 0, 0, 0, 1], 0).unwrap();
     vm.attach_console(ports(&input, &output)).unwrap();
     vm.start_vcpus(1, MMIO_ENTRY).unwrap();
     wait_counter(&vm, 0);
     let mut driver = bring_up(&vm);
     vm.pause().unwrap();
-    vm.export(&dir.path("image")).unwrap();
+    vm.export_test(&dir.path("image")).unwrap();
     drop(vm);
 
     let target_socket = dir.path("nic2.sock");
     let _target_backend = UnixListener::bind(&target_socket).unwrap();
     let (fresh_in, mut fresh_out) = (Pipe::new(), Pipe::new());
     let resources = RestoreResources {
-        disk_dir: Some(dir.path("imported")),
         nic_socket: Some(target_socket),
         console_ports: Some(ConsoleEndpoints::Ports(ports(&fresh_in, &fresh_out))),
         ..Default::default()
     };
-    let mut target = RamSnapshotVm::import(&dir.path("image"), resources).unwrap();
+    let mut target = RamSnapshotVm::import_test(&dir.path("image"), resources).unwrap();
     target.resume().unwrap();
     wait_counter(&target, counter(&target));
     driver.post_tx(&target.memory, tx(0), &[b"disk+nic"]);

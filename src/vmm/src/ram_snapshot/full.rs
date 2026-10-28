@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Full checkpoints for the private minimal owner, independent of KRUNRAM.
-//!
-//! Every full image is written in one format, version 8 (`KRUNVM\0\0`),
-//! with or without devices: header, bounded JSON state, RAM payload, one
-//! raw segment per disk, then the virtio-fs file, init.krun and DAX page
-//! payloads. The JSON holds CPU, KVM and RAM state, the ordered disk table
-//! and the optional NIC, RNG, balloon, vsock, console, legacy-device
-//! (UARTs, CMOS, i8042) and virtio-fs sections; the virtio-fs archive
-//! manifest records its contract (archive mode and restore identity), and
-//! the section the guest's exit code. Version 7 is the same format without
-//! that contract or exit code: every version 7 archive was captured with
-//! full attributes, so it is read as one, with the exit code unset.
-//! Versions 1–6 are rejected explicitly.
+//! Version-9 memory-only images with external disk and FUSE dependencies.
 
 use super::*;
 use crate::ram_snapshot::boot::NewConsoleOutput;
@@ -27,10 +15,10 @@ use crate::vstate::VmState;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 
+mod format;
+
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const FULL_VERSION: u32 = 8;
-/// The last version without a virtio-fs archive contract.
-const CONTRACTLESS_VERSION: u32 = 7;
+const FULL_VERSION: u32 = 9;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
@@ -68,37 +56,38 @@ struct Metadata {
     console: Option<ConsoleMeta>,
     legacy: Option<LegacyMeta>,
     fs: Option<FsMeta>,
+    application_schema: u32,
+    application: serde_json::Value,
+    disk_dependencies: Vec<DiskDependency>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum DiskDependency {
+    ContainerQcow2,
+    ExternalReadonlyBoot { length: u64, sha256: [u8; 32] },
 }
 
 /// Which target resources an image needs; each must be supplied exactly
 /// when its device is present.
 struct Requirements {
-    disks: bool,
     nic: bool,
     vsock: bool,
     console: bool,
     legacy: bool,
-    fs: bool,
 }
 
 impl Requirements {
     fn of(metadata: &Metadata) -> Self {
         Self {
-            disks: !metadata.disks.is_empty(),
             nic: metadata.nic.is_some(),
             vsock: metadata.vsock.is_some(),
             console: metadata.console.is_some(),
             legacy: metadata.legacy.is_some(),
-            fs: metadata.fs.is_some(),
         }
     }
 
     fn check(&self, resources: &RestoreResources) -> Result<()> {
-        if self.disks != resources.disk_dir.is_some() {
-            return Err(Error::Invalid(
-                "restore resources: a disk directory is required exactly when the image has disks",
-            ));
-        }
         if self.nic != resources.nic_socket.is_some() {
             return Err(Error::Invalid(
                 "restore resources: a NIC socket is required exactly when the image has a NIC",
@@ -117,11 +106,6 @@ impl Requirements {
         if self.legacy != resources.serial.is_some() {
             return Err(Error::Invalid(
                 "restore resources: serial endpoints are required exactly when the image has legacy devices",
-            ));
-        }
-        if self.fs != resources.fs_dir.is_some() {
-            return Err(Error::Invalid(
-                "restore resources: a virtio-fs directory is required exactly when the image has shares",
             ));
         }
         Ok(())
@@ -144,21 +128,6 @@ impl Write for BoundedMetadata {
 
 fn payload_len(regions: &[Region], max_slots: usize) -> Result<u64> {
     Ok(validate_regions(regions, max_slots)? - HEADER_LEN - REGION_LEN * regions.len() as u64)
-}
-
-/// Total length of the raw disk segments after the RAM payload.
-#[cfg(feature = "blk")]
-fn disk_segments_len(disks: &DiskTable) -> Result<u64> {
-    disks.iter().try_fold(0u64, |total, disk| {
-        total
-            .checked_add(disk.disk_bytes)
-            .ok_or(Error::Invalid("full snapshot disk length overflow"))
-    })
-}
-
-#[cfg(not(feature = "blk"))]
-fn disk_segments_len(_disks: &DiskTable) -> Result<u64> {
-    Ok(0)
 }
 
 /// The MMIO slots of every device in `metadata` but the virtio-fs shares,
@@ -184,71 +153,85 @@ fn device_slots(metadata: &Metadata) -> Vec<u64> {
     slots
 }
 
-/// Read and check the fixed header; returns the version and JSON length.
-fn read_header(file: &mut File) -> Result<(u32, usize)> {
-    let mut header = [0; 16];
-    file.read_exact(&mut header)?;
-    if &header[..8] != FULL_MAGIC {
-        return Err(Error::Invalid("invalid/incomplete full snapshot"));
-    }
-    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    match version {
-        FULL_VERSION | CONTRACTLESS_VERSION => {}
-        old @ 1..=6 => {
-            return Err(Error::Full(format!(
-                "full snapshot version {old} predates the unified version {CONTRACTLESS_VERSION} and is not supported"
-            )))
-        }
-        _ => return Err(Error::Invalid("unsupported full snapshot version")),
-    }
-    let len = u32::from_le_bytes(header[12..].try_into().unwrap()) as usize;
-    if len == 0 || len > MAX_METADATA {
-        return Err(Error::Invalid("full metadata exceeds 16 MiB or is empty"));
-    }
-    Ok((version, len))
-}
-
-/// The metadata of a `version` image: version 7 JSON is upgraded first.
-fn decode_metadata(version: u32, encoded: &[u8]) -> Result<Metadata> {
-    let json = |e: serde_json::Error| Error::Full(format!("metadata JSON: {e}"));
-    if version == FULL_VERSION {
-        return serde_json::from_slice(encoded).map_err(json);
-    }
-    let mut value: serde_json::Value = serde_json::from_slice(encoded).map_err(json)?;
-    if let Some(fs) = value.get_mut("fs") {
-        virtio_fs::upgrade_contractless(fs)?;
-    }
-    serde_json::from_value(value).map_err(json)
-}
-
-/// Read the metadata and validate everything checkable before guest RAM or
-/// any target resource exists, including the exact total length.
-fn read_metadata(file: &mut File, max_slots: usize, max_cpus: usize) -> Result<Metadata> {
-    let (version, len) = read_header(file)?;
-    let mut encoded = vec![0; len];
-    file.read_exact(&mut encoded)?;
-    let metadata = decode_metadata(version, &encoded)?;
-    if metadata.cpus.is_empty() || metadata.cpus.len() > max_cpus.min(snapshot::MAX_CPUS) {
+fn read_metadata(
+    file: &mut File,
+    max_slots: usize,
+    max_cpus: usize,
+) -> Result<(Metadata, format::Envelope)> {
+    let envelope = format::read(file)?;
+    let metadata: Metadata = serde_json::from_slice(&envelope.metadata)
+        .map_err(|e| Error::Full(format!("metadata JSON: {e}")))?;
+    if metadata.application_schema != 1
+        || metadata.cpus.is_empty()
+        || metadata.cpus.len() > max_cpus.min(snapshot::MAX_CPUS)
+    {
         return Err(Error::Invalid(
-            "full snapshot vCPU count exceeds target capacity or is zero",
+            "unsupported application schema or vCPU count",
         ));
     }
     metadata.vm.validate_snapshot().map_err(Error::Full)?;
-    // Every device section relies on validated RAM regions.
     let ram = payload_len(&metadata.regions, max_slots)?;
     let shares = validate_devices(&metadata, max_slots)?;
-    let segments = disk_segments_len(&metadata.disks)?;
-    let expected = (16 + len as u64)
-        .checked_add(ram)
-        .and_then(|total| total.checked_add(segments))
-        .and_then(|total| total.checked_add(shares))
-        .ok_or(Error::Invalid("full snapshot length overflow"))?;
-    if expected != file.metadata()?.len() {
+    if ram.checked_add(shares) != Some(envelope.payload) {
         return Err(Error::Invalid(
-            "full snapshot length differs from metadata, disk segments and share payloads",
+            "memory payload extents differ from metadata",
         ));
     }
-    Ok(metadata)
+    #[cfg(feature = "blk")]
+    if metadata.disk_dependencies.len() != metadata.disks.len()
+        || metadata
+            .disk_dependencies
+            .iter()
+            .filter(|d| matches!(d, DiskDependency::ContainerQcow2))
+            .count()
+            != 1
+    {
+        return Err(Error::Invalid(
+            "checkpoint requires exactly one container QCOW2",
+        ));
+    }
+    #[cfg(feature = "blk")]
+    for (disk, dependency) in metadata.disks.iter().zip(&metadata.disk_dependencies) {
+        if disk.read_only != matches!(dependency, DiskDependency::ExternalReadonlyBoot { .. }) {
+            return Err(Error::Invalid(
+                "disk dependency role differs from device access",
+            ));
+        }
+    }
+    #[cfg(not(feature = "blk"))]
+    if !metadata.disk_dependencies.is_empty() {
+        return Err(Error::Invalid("disk dependency requires blk support"));
+    }
+    file.seek(SeekFrom::Start(
+        format::HEADER + envelope.metadata.len() as u64,
+    ))?;
+    Ok((metadata, envelope))
+}
+
+pub(crate) fn inspect(file: &File) -> Result<Vec<u8>> {
+    let mut file = file.try_clone()?;
+    let position = file.stream_position()?;
+    let decoded = read_metadata(&mut file, usize::MAX, snapshot::MAX_CPUS);
+    file.seek(SeekFrom::Start(position))?;
+    let (_, envelope) = decoded?;
+    Ok(envelope.metadata)
+}
+
+pub(super) fn verify_qcow2(file: &File) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut header = [0; 104];
+    file.read_exact_at(&mut header, 0)?;
+    let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    if &header[..4] != b"QFI\xfb"
+        || !matches!(version, 2 | 3)
+        || header[8..20].iter().any(|&b| b != 0)
+        || (version == 3 && header[72..80].iter().any(|&b| b != 0))
+    {
+        return Err(Error::Invalid(
+            "container must be standalone supported QCOW2 without backing",
+        ));
+    }
+    Ok(())
 }
 
 /// Every device section against its fixed slot and the validated RAM
@@ -276,12 +259,12 @@ fn validate_devices(metadata: &Metadata, max_slots: usize) -> Result<u64> {
         legacy::validate_metadata(legacy, &metadata.regions)?;
     }
     match &metadata.fs {
-        Some(meta) => virtio_fs::payload_len(virtio_fs::validate_metadata(
+        Some(meta) => virtio_fs::validate_metadata(
             meta,
             &metadata.regions,
             &device_slots(metadata),
             max_slots,
-        )?),
+        ),
         None => Ok(0),
     }
 }
@@ -351,69 +334,67 @@ fn check_file_size_limit(len: u64) -> Result<()> {
     Ok(())
 }
 
-/// Create the 0600 exclusive image with an invalid magic placeholder, then
-/// write the header, JSON state, RAM, disk segments and the
-/// `share_payloads` bytes of share payloads.
-fn write_pending(
-    path: &Path,
+/// Write an invalid header until metadata, RAM and anonymous payloads are durable.
+fn write_memory(
+    file: &mut File,
+    abort: &std::sync::atomic::AtomicBool,
     memory: &GuestMemoryMmap,
     metadata: &Metadata,
-    #[cfg(feature = "blk")] disks: &[blk::BlkDevice],
-    shares: Option<&devices::virtio::fs::passthrough::ShareArchive>,
-    share_payloads: u64,
-) -> Result<PendingSnapshot> {
+    shares: Option<&virtio_fs::CapturedShares>,
+    qcow2: &File,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDWR
+        || flags & libc::O_APPEND != 0
+        || !file.metadata()?.is_file()
+    {
+        return Err(Error::Invalid(
+            "memory output requires a regular O_RDWR file",
+        ));
+    }
+    verify_qcow2(qcow2)?;
     let mut encoded = BoundedMetadata(Vec::new());
-    serde_json::to_writer(&mut encoded, metadata)
-        .map_err(|e| Error::Full(format!("metadata encoding: {e}")))?;
-    let segments = disk_segments_len(&metadata.disks)?;
-    let len = metadata
-        .regions
-        .iter()
-        .try_fold(16 + encoded.0.len() as u64, |total, region| {
-            total.checked_add(region.len)
-        })
-        .and_then(|total| total.checked_add(segments))
-        .and_then(|total| total.checked_add(share_payloads))
-        .ok_or(Error::Invalid("full snapshot length overflow"))?;
-    check_file_size_limit(len)?;
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    let mut pending = PendingSnapshot {
-        file,
-        path: path.to_owned(),
-        complete: false,
-    };
-    pending.file.write_all(&[0; 8])?;
-    pending.file.write_all(&FULL_VERSION.to_le_bytes())?;
-    pending
-        .file
-        .write_all(&(encoded.0.len() as u32).to_le_bytes())?;
-    pending.file.write_all(&encoded.0)?;
+    serde_json::to_writer(&mut encoded, metadata).map_err(|e| Error::Full(e.to_string()))?;
+    let payload = payload_len(&metadata.regions, usize::MAX)?
+        .checked_add(validate_devices(metadata, usize::MAX)?)
+        .ok_or(Error::Invalid("memory payload overflow"))?;
+    let total = format::HEADER
+        .checked_add(encoded.0.len() as u64)
+        .and_then(|n| n.checked_add(payload))
+        .ok_or(Error::Invalid("memory file overflow"))?;
+    check_file_size_limit(total)?;
+    if file.metadata()?.len() != 0 {
+        return Err(Error::Invalid("memory output FD must be empty"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&[0; format::HEADER as usize])?;
+    file.write_all(&encoded.0)?;
     let mut buffer = [0; CHUNK_SIZE];
     for region in &metadata.regions {
         let mut offset = 0;
         while offset < region.len {
+            if abort.load(Ordering::SeqCst) {
+                return Err(Error::Invalid("checkpoint cancelled"));
+            }
             let len = (region.len - offset).min(CHUNK_SIZE as u64) as usize;
             memory
                 .read_slice(&mut buffer[..len], GuestAddress(region.gpa + offset))
                 .map_err(Error::Memory)?;
-            #[cfg(test)]
-            super::tests::write_payload(&mut pending.file, &buffer[..len])?;
             #[cfg(not(test))]
-            pending.file.write_all(&buffer[..len])?;
+            file.write_all(&buffer[..len])?;
+            #[cfg(test)]
+            super::tests::write_payload(file, &buffer[..len])?;
             offset += len as u64;
         }
     }
-    #[cfg(feature = "blk")]
-    blk::copy_disk_segments(&mut pending.file, disks, &metadata.disks)?;
     if let Some(shares) = shares {
-        virtio_fs::write_payloads(&mut pending.file, shares)?;
+        virtio_fs::write_payloads(file, shares)?;
     }
-    pending.file.sync_all()?;
-    Ok(pending)
+    let disk_len = qcow2.metadata()?.len();
+    let disk_hash = format::digest(qcow2, 0, disk_len)?;
+    format::seal(file, encoded.0.len() as u64, payload, disk_len, disk_hash)
 }
 
 /// Capture the target's compatibility and check the saved CPUs against it.
@@ -453,22 +434,40 @@ impl RamSnapshotVm {
         Ok(())
     }
 
-    /// Export the paused owner's cut: ONE RAM alias probe (every device is
-    /// frozen, so no transient mapping clone is alive) -> device capture
-    /// from the cursors the pause retained, legacy, CPU, KVM, RAM and disk
-    /// capture -> sync file -> publish valid magic. Nothing is resumed, so
-    /// repeated exports capture the same RAM, device and CPU state; each
-    /// captures the KVM clock and TSC at its own time, which keep running
-    /// while paused, and re-reads the virtio-fs host trees
-    /// (`virtio_fs::capture`). A failed export removes its partial image and leaves
-    /// the owner paused and retryable, except a vCPU that never answers its
-    /// state request: that uncertain control disables the owner and stops
-    /// every thread. With virtio-fs shares the caller must have declared
-    /// every host writer stopped (`declare_host_writers_stopped`); the
-    /// shares are archived as they are at the cut in the owner's archive
-    /// mode (`set_fs_archive_mode`), and a share whose DAX window was lost
-    /// disables the owner.
-    pub(crate) fn export(&mut self, path: &Path) -> Result<()> {
+    pub(crate) fn discard_prepared(&mut self) {
+        self.prepared = None;
+    }
+
+    pub(crate) fn prepare_checkpoint(
+        &mut self,
+    ) -> Result<crate::snapshot_vm::checkpoint::PreparedResources> {
+        self.check_execution()?;
+        let paused = self
+            .pause
+            .as_ref()
+            .ok_or(Error::Invalid("checkpoint requires confirmed Paused"))?;
+        virtio_fs::require_declared(self.fs.len(), self.host_writers_stopped)?;
+        self.prepared =
+            virtio_fs::capture(&self.fs, &paused.fs, self.exit_code.load(Ordering::SeqCst))?;
+        let (metadata, files) = match &self.prepared {
+            Some(shares) => (
+                serde_json::to_vec(&shares.meta).map_err(|e| Error::Full(e.to_string()))?,
+                shares.descriptors()?,
+            ),
+            None => (b"null".to_vec(), Vec::new()),
+        };
+        if metadata.len() > MAX_METADATA {
+            return Err(Error::Invalid("prepared metadata exceeds bound"));
+        }
+        Ok(crate::snapshot_vm::checkpoint::PreparedResources { metadata, files })
+    }
+
+    pub(crate) fn export_fd(
+        &mut self,
+        mut file: File,
+        qcow2: File,
+        config: crate::snapshot_vm::checkpoint::ExportMetadata,
+    ) -> Result<()> {
         self.check_execution()?;
         // Only worker devices retain cursors.
         #[cfg_attr(not(feature = "blk"), allow(unused_variables))]
@@ -501,14 +500,24 @@ impl RamSnapshotVm {
             self.disable();
             return Err(Error::Invalid("a virtio-fs share lost its DAX window"));
         }
-        let paused = self.pause.as_ref().expect("checked above");
-        let (fs, shares) = virtio_fs::capture(
-            &self.fs,
-            &paused.fs,
-            self.fs_archive_mode,
-            self.exit_code.load(Ordering::SeqCst),
-        )?
-        .unzip();
+        let mut shares = self.prepared.take();
+        if shares.is_none() && !self.fs.is_empty() {
+            return Err(Error::Invalid(
+                "prepare external dependencies before export",
+            ));
+        }
+        if let Some(shares) = &mut shares {
+            shares.bind_references(config.objects)?;
+        } else if !config.objects.is_empty() {
+            return Err(Error::Invalid("references without shares"));
+        }
+        if config.application_schema != 1 {
+            return Err(Error::Invalid("unsupported application schema"));
+        }
+        #[cfg(feature = "blk")]
+        let disk_dependencies = capture_disk_dependencies(&self.disks, &disks)?;
+        #[cfg(not(feature = "blk"))]
+        let disk_dependencies = Vec::new();
         let cpus = match self.save_cpus(&compatibility) {
             Err(unanswered @ Error::Control(_)) => {
                 self.disable();
@@ -529,31 +538,23 @@ impl RamSnapshotVm {
             vsock,
             console,
             legacy,
-            fs,
+            fs: None,
+            application_schema: config.application_schema,
+            application: config.application,
+            disk_dependencies,
         };
-        let share_payloads = match &metadata.fs {
-            Some(meta) => {
-                let lengths = virtio_fs::validate_metadata(
-                    meta,
-                    &metadata.regions,
-                    &device_slots(&metadata),
-                    self.max_slots,
-                )?;
-                virtio_fs::validate_rings(meta, &self.memory)?;
-                virtio_fs::payload_len(lengths)?
-            }
-            None => 0,
-        };
-        write_pending(
-            path,
+        let mut metadata = metadata;
+        if let Some(shares) = &shares {
+            metadata.fs = Some(shares.meta.clone());
+        }
+        write_memory(
+            &mut file,
+            &self.capture_abort,
             &self.memory,
             &metadata,
-            #[cfg(feature = "blk")]
-            &self.disks,
             shares.as_ref(),
-            share_payloads,
-        )?
-        .finish(FULL_MAGIC)
+            &qcow2,
+        )
     }
 
     /// Capture and check every paused vCPU's state; `Error::Control` means
@@ -610,38 +611,26 @@ impl RamSnapshotVm {
         Ok(())
     }
 
-    /// Import a full checkpoint into a new paused owner. `resources` must
-    /// supply exactly the target resources the image's devices need; all
-    /// metadata is validated before RAM exists, and every ring against the
-    /// loaded RAM before any directory, socket or thread. Disk segments are
-    /// imported into a new 0700 directory of exclusive 0600 raw files, which
-    /// the owner removes on partial failure and destruction. Cut-time NIC TX
-    /// the source had not consumed is already completed as dropped and its
-    /// interrupt raised into the restored irqchip. The owner ends in the
-    /// state a source has after `pause`: devices frozen, their cursors
-    /// retained and every irqfd drained, so it can be exported again before
-    /// it ever runs; `resume` starts it. The legacy UARTs take the fresh
-    /// `resources.serial` endpoints and replay no output; their
-    /// dropped-output counts start at zero. The vsock takes the caller's
-    /// `resources.vsock_ports` paths and keeps its backend stopped with the
-    /// transport reset still owed until `resume`. The console takes the
-    /// caller's `resources.console_ports` endpoints (a new output file is
-    /// the first resource the import creates) without any endpoint I/O or
-    /// new guest handshake; its open ports come back with frozen
-    /// workers holding the saved EOF and partial-TX offsets. The virtio-fs
-    /// shares are imported into the new 0700 `resources.fs_dir` (an
-    /// existing directory is refused untouched), each DAX window is mapped
-    /// and its session restored before any vCPU thread exists, and the
-    /// imported tree is kept once the import succeeds; host writers start
-    /// declared stopped, since only the owner uses those copies. A
-    /// guest-visible archive is refused before anything exists unless this
-    /// process has the effective IDs it recorded, and the owner keeps the
-    /// image's archive mode for later exports.
-    pub(crate) fn import(path: &Path, mut resources: RestoreResources) -> Result<Self> {
-        let kvm = KvmContext::new().map_err(Error::State)?;
-        let mut file = File::open(path)?;
-        let metadata = read_metadata(&mut file, kvm.max_memslots(), kvm.fd().get_max_vcpus())?;
+    pub(crate) fn import_fd(
+        mut file: File,
+        bindings: crate::snapshot_vm::checkpoint::ImportBindings,
+        mut resources: RestoreResources,
+    ) -> Result<Self> {
+        // Envelope, payload and external hashes are verified before allocating VM RAM.
+        let (metadata, envelope) = read_metadata(&mut file, usize::MAX, snapshot::MAX_CPUS)?;
         Requirements::of(&metadata).check(&resources)?;
+        verify_disks(&metadata.disk_dependencies, &bindings.disks, &envelope)?;
+        if let Some(fs) = &metadata.fs {
+            virtio_fs::validate_bindings(fs, &bindings.shares)?;
+        } else if !bindings.shares.is_empty() {
+            return Err(Error::Invalid("bindings supplied without shares"));
+        }
+        let kvm = KvmContext::new().map_err(Error::State)?;
+        validate_regions(&metadata.regions, kvm.max_memslots())?;
+        validate_devices(&metadata, kvm.max_memslots())?;
+        if metadata.cpus.len() > kvm.fd().get_max_vcpus() {
+            return Err(Error::Invalid("target vCPU capacity exceeded"));
+        }
         #[cfg(all(feature = "blk", feature = "net"))]
         if let Some(socket) = &resources.nic_socket {
             nic::check_socket_path(socket)?;
@@ -657,14 +646,6 @@ impl RamSnapshotVm {
         if let Some(serial) = &resources.serial {
             legacy::check_endpoints(serial)?;
         }
-        if let Some(dir) = &resources.fs_dir {
-            virtio_fs::check_fs_dir(dir)?;
-        }
-        let fs_mode = metadata
-            .fs
-            .as_ref()
-            .map(virtio_fs::imported_mode)
-            .transpose()?;
         let target = validate_target(&kvm, &metadata.compatibility, &metadata.cpus)?;
         // RAM first (file order), then every ring against the loaded memory.
         let memory = read_ram(&mut file, &metadata.regions)?;
@@ -684,31 +665,17 @@ impl RamSnapshotVm {
             Some(ConsoleEndpoints::Ports(ports)) => (None, Some(ports)),
             None => (None, None),
         };
-        // The creation guard removes ONLY what this import itself created: a
-        // pre-existing destination directory is an error and is never
-        // modified. The owner takes the guard before any thread starts, so
-        // every later failure cleans up through the owner drop after joining
-        // its threads.
-        #[cfg(feature = "blk")]
-        let (imported, paths) = match &resources.disk_dir {
-            Some(dir) => {
-                let (imported, paths) = blk::import_disks(&mut file, &metadata.disks, dir)?;
-                (Some(imported), paths)
-            }
-            None => (None, Vec::new()),
-        };
-        let shares = match (&metadata.fs, &resources.fs_dir) {
-            (Some(meta), Some(dir)) => Some(virtio_fs::import_shares(&file, meta, dir)?),
-            _ => None,
-        };
         let mut owner = Self::restore_scaffold(&kvm, memory)?;
-        owner.fs_import = shares;
-        if let Some(mode) = fs_mode {
-            owner.fs_archive_mode = mode;
-        }
         #[cfg(feature = "blk")]
         {
-            owner.imported = imported;
+            let paths: Vec<_> = bindings
+                .disks
+                .iter()
+                .map(|file| {
+                    use std::os::fd::AsRawFd;
+                    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                })
+                .collect();
             blk::restore_devices(&mut owner, &metadata.disks, &paths)?;
         }
         #[cfg(all(feature = "blk", feature = "net"))]
@@ -726,7 +693,7 @@ impl RamSnapshotVm {
             legacy::restore(&mut owner, meta, serial)?;
         }
         if let Some(meta) = &metadata.fs {
-            virtio_fs::restore(&mut owner, meta)?;
+            virtio_fs::restore_external(&mut owner, &mut file, meta, bindings.shares)?;
         }
         owner.start_event_thread(events::Start::Restored)?;
         owner.restore_cpus_and_vm(&target, metadata.cpus, metadata.vm)?;
@@ -740,12 +707,6 @@ impl RamSnapshotVm {
         // After the owed injection: draining flushes it into the irqchip.
         owner.pause = Some(owner.quiesce()?);
         owner.host_writers_stopped = true;
-        if let Some(shares) = owner.fs_import.take() {
-            if let Some(meta) = &metadata.fs {
-                owner.restored_shares = virtio_fs::restored_roots(meta, &shares);
-            }
-            shares.persist();
-        }
         if let Some(output) = console_output {
             output.keep();
         }
@@ -753,5 +714,90 @@ impl RamSnapshotVm {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "blk")]
+fn capture_disk_dependencies(
+    devices: &[blk::BlkDevice],
+    metas: &[blk::DiskMeta],
+) -> Result<Vec<DiskDependency>> {
+    let mut result = Vec::new();
+    for (device, meta) in devices.iter().zip(metas) {
+        let block = device.block.lock().unwrap();
+        if !meta.read_only {
+            if !matches!(
+                block.snapshot_image_type(),
+                devices::virtio::block::ImageType::Qcow2
+            ) {
+                return Err(Error::Invalid(
+                    "checkpoint container source must remain QCOW2",
+                ));
+            }
+            result.push(DiskDependency::ContainerQcow2);
+            continue;
+        }
+        if !matches!(
+            block.snapshot_image_type(),
+            devices::virtio::block::ImageType::Raw
+        ) {
+            return Err(Error::Invalid(
+                "external readonly boot disk must be an exact ext4 file",
+            ));
+        }
+        let file = block
+            .snapshot_readonly_source()
+            .ok_or(Error::Invalid("readonly boot source descriptor missing"))?;
+        let length = file.metadata()?.len();
+        result.push(DiskDependency::ExternalReadonlyBoot {
+            length,
+            sha256: format::digest(file, 0, length)?,
+        });
+    }
+    if result
+        .iter()
+        .filter(|d| matches!(d, DiskDependency::ContainerQcow2))
+        .count()
+        != 1
+    {
+        return Err(Error::Invalid(
+            "checkpoint requires exactly one writable container disk",
+        ));
+    }
+    Ok(result)
+}
+
+fn verify_disks(
+    dependencies: &[DiskDependency],
+    disks: &[File],
+    envelope: &format::Envelope,
+) -> Result<()> {
+    if dependencies.len() != disks.len() {
+        return Err(Error::Invalid("external disk count differs"));
+    }
+    for (dependency, file) in dependencies.iter().zip(disks) {
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        let expected = if matches!(dependency, DiskDependency::ContainerQcow2) {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        if flags < 0 || flags & libc::O_ACCMODE != expected || !file.metadata()?.is_file() {
+            return Err(Error::Invalid(
+                "external disk descriptor access or type differs",
+            ));
+        }
+        let (length, hash) = match dependency {
+            DiskDependency::ContainerQcow2 => {
+                verify_qcow2(file)?;
+                (envelope.disk_len, envelope.disk_hash)
+            }
+            DiskDependency::ExternalReadonlyBoot { length, sha256 } => (*length, *sha256),
+        };
+        if file.metadata()?.len() != length || format::digest(file, 0, length)? != hash {
+            return Err(Error::Invalid("external disk length or checksum differs"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "blk"))]
 mod tests;

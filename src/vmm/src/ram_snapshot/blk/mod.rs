@@ -4,9 +4,7 @@
 //! for the private minimal-VM owner. No public BoxLite entry point.
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read as IoRead, Write as IoWrite};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use vm_memory::GuestMemoryMmap;
 
 use super::wiring::{self, MMIO_LEN};
-use super::{CreatedName, Error, RamSnapshotVm, Region, Result, CHUNK_SIZE};
+use super::{Error, RamSnapshotVm, Region, Result};
 
 /// Fixed internal MMIO window for snapshot disks, above ordinary guest RAM.
 pub(super) const MMIO_BASE: u64 = 0xd000_0000;
@@ -50,8 +48,7 @@ impl BlkDevice {
     }
 }
 
-/// Per-disk snapshot metadata; one ordered raw segment follows the RAM
-/// payload for each entry. No host path ever appears here.
+/// Device state; disk bytes are supplied externally and never embedded.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DiskMeta {
@@ -356,143 +353,6 @@ pub(super) fn resume_devices(vm: &RamSnapshotVm) -> Result<()> {
     }
     first.map_or(Ok(()), Err)
 }
-
-/// Copy the frozen logical capacity of every disk into the snapshot file.
-pub(super) fn copy_disk_segments(
-    file: &mut File,
-    disks: &[BlkDevice],
-    metas: &[DiskMeta],
-) -> Result<()> {
-    let mut buffer = vec![0; CHUNK_SIZE];
-    for (device, meta) in disks.iter().zip(metas) {
-        let block = device.block.lock().unwrap();
-        let mut offset = 0;
-        while offset < meta.disk_bytes {
-            let len = ((meta.disk_bytes - offset).min(CHUNK_SIZE as u64)) as usize;
-            let read = block
-                .read_snapshot_chunk(offset, &mut buffer[..len])
-                .map_err(|e| Error::Full(format!("read disk segment at {offset}: {e}")))?;
-            if read != len {
-                return Err(Error::Full(format!(
-                    "short read from disk segment at {offset}"
-                )));
-            }
-            #[cfg(test)]
-            super::tests::write_payload(file, &buffer[..len])?;
-            #[cfg(not(test))]
-            file.write_all(&buffer[..len])?;
-            offset += len as u64;
-        }
-    }
-    Ok(())
-}
-
-/// Exclusive owner of the imported destination directory and the numbered
-/// raw files created inside it. Removal happens only for resources this
-/// guard itself created: a pre-existing directory is an error and is never
-/// modified or removed.
-pub(super) struct ImportedDir {
-    path: PathBuf,
-    /// The directory and the segment files this import created; None once
-    /// handed over.
-    created: Option<(CreatedName, Vec<CreatedName>)>,
-}
-
-impl ImportedDir {
-    /// Create the new 0700 destination directory exclusively.
-    fn create(path: &Path) -> Result<Self> {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(path)
-            .map_err(|e| Error::Full(format!("create import destination: {e}")))?;
-        // No descriptor: the identity comes from the name right away.
-        let dir = CreatedName::new(path, &fs::symlink_metadata(path)?);
-        Ok(Self {
-            path: path.to_owned(),
-            created: Some((dir, Vec::new())),
-        })
-    }
-
-    /// Create the next exclusive 0600 numbered file; it is tracked before
-    /// any byte is written so partial writes are cleaned up too.
-    fn create_segment_file(&mut self, index: usize) -> Result<File> {
-        let path = self.path.join(format!("disk-{index}.raw"));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| Error::Full(format!("create imported disk: {e}")))?;
-        let created = CreatedName::new(&path, &file.metadata()?);
-        if let Some((_, files)) = &mut self.created {
-            files.push(created);
-        }
-        Ok(file)
-    }
-
-    /// Hand the directory and its disk files over to the caller: they are
-    /// never removed anymore.
-    pub(super) fn hand_over(mut self) {
-        self.created = None;
-    }
-}
-
-impl Drop for ImportedDir {
-    fn drop(&mut self) {
-        if let Some((dir, files)) = self.created.take() {
-            for file in files.iter().rev() {
-                file.remove();
-            }
-            dir.remove();
-        }
-    }
-}
-
-/// Import disk segments into a new destination directory as exclusive 0600
-/// numbered raw files, in bounded chunks. Metadata never provides host
-/// paths. On failure the returned guard is dropped and removes everything
-/// this import created; success hands the guard to the owner.
-pub(super) fn import_disks(
-    source: &mut File,
-    metas: &[DiskMeta],
-    destination: &Path,
-) -> Result<(ImportedDir, Vec<PathBuf>)> {
-    let mut dir = ImportedDir::create(destination)?;
-    let import = (|| -> Result<Vec<PathBuf>> {
-        let mut buffer = vec![0; CHUNK_SIZE];
-        let mut paths = Vec::with_capacity(metas.len());
-        for (index, meta) in metas.iter().enumerate() {
-            let mut file = dir.create_segment_file(index)?;
-            let path = destination.join(format!("disk-{index}.raw"));
-            let mut offset = 0;
-            while offset < meta.disk_bytes {
-                let len = ((meta.disk_bytes - offset).min(CHUNK_SIZE as u64)) as usize;
-                source
-                    .read_exact(&mut buffer[..len])
-                    .map_err(|_| Error::Invalid("truncated disk segment"))?;
-                #[cfg(test)]
-                super::tests::write_payload(&mut file, &buffer[..len])?;
-                #[cfg(not(test))]
-                file.write_all(&buffer[..len])?;
-                offset += len as u64;
-            }
-            file.sync_all()?;
-            paths.push(path);
-        }
-        Ok(paths)
-    })();
-    match import {
-        Ok(paths) => Ok((dir, paths)),
-        Err(error) => {
-            drop(dir);
-            Err(error)
-        }
-    }
-}
-
-/// Rebuild frozen devices on the target VM at the saved address and IRQ,
-/// using new eventfds; activated devices start with frozen workers. Every
-/// started worker is joined again if any later step fails.
 pub(super) fn restore_devices(
     vm: &mut RamSnapshotVm,
     metas: &[DiskMeta],
@@ -510,7 +370,11 @@ pub(super) fn restore_devices(
             None,
             cache,
             path.to_string_lossy().into_owned(),
-            ImageType::Raw,
+            if meta.read_only {
+                ImageType::Raw
+            } else {
+                ImageType::Qcow2
+            },
             meta.read_only,
             false,
             snapshot_sync_mode(meta.device.avail_features),

@@ -8,6 +8,8 @@
 //! loading or guest initialization) onto the context's new endpoints, and
 //! owns it on the calling thread until guest execution ends (`control`).
 
+mod descriptor;
+
 use std::path::PathBuf;
 
 #[cfg(feature = "net")]
@@ -27,27 +29,16 @@ use vmm::vmm_config::net::NetworkInterfaceConfig;
 )]
 #[derive(Default)]
 pub(crate) struct Setup {
-    pub(crate) import: Option<Import>,
-    /// The NICs, kept unopened: the VM opens its NIC itself.
-    #[cfg(feature = "net")]
-    pub(crate) nics: Vec<NetworkInterfaceConfig>,
-}
-
-/// The checkpoint to import and the new directories for its disk and
-/// share copies.
-#[cfg_attr(
-    not(all(
+    #[cfg(all(
         target_os = "linux",
         target_arch = "x86_64",
         not(feature = "tee"),
         not(feature = "aws-nitro")
-    )),
-    allow(dead_code)
-)]
-pub(crate) struct Import {
-    pub(crate) image: PathBuf,
-    pub(crate) disk_dir: Option<PathBuf>,
-    pub(crate) fs_dir: Option<PathBuf>,
+    ))]
+    pub(crate) fd_import: Option<supported::DescriptorImport>,
+    /// The NICs, kept unopened: the VM opens its NIC itself.
+    #[cfg(feature = "net")]
+    pub(crate) nics: Vec<NetworkInterfaceConfig>,
 }
 
 #[cfg(all(
@@ -65,7 +56,7 @@ mod control;
     not(feature = "aws-nitro")
 ))]
 mod supported {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use vmm::snapshot_vm::{RestoreEndpoints, SnapshotDevices, SnapshotVm, VmState};
     use vmm::vmm_config::vsock::VsockDeviceConfig;
@@ -97,20 +88,9 @@ mod supported {
         0
     }
 
-    pub(crate) fn import(cfg: &mut ContextConfig, import: Import) -> i32 {
-        let Some(setup) = cfg.snapshot.as_mut() else {
-            return -libc::EINVAL;
-        };
-        let absolute = |path: &Option<PathBuf>| path.as_ref().is_none_or(|p| p.is_absolute());
-        if setup.import.is_some()
-            || !import.image.is_absolute()
-            || !absolute(&import.disk_dir)
-            || !absolute(&import.fs_dir)
-        {
-            return -libc::EINVAL;
-        }
-        setup.import = Some(import);
-        0
+    pub(crate) struct DescriptorImport {
+        pub image: std::fs::File,
+        pub bindings: vmm::snapshot_vm::checkpoint::ImportBindings,
     }
 
     pub(crate) fn pause(ctx_id: u32, flags: u32) -> i32 {
@@ -127,13 +107,6 @@ mod supported {
 
     pub(crate) fn resume(ctx_id: u32) -> i32 {
         control::request(ctx_id, Request::Resume)
-    }
-
-    pub(crate) fn export(ctx_id: u32, path: PathBuf) -> i32 {
-        if !path.is_absolute() {
-            return -libc::EINVAL;
-        }
-        control::request(ctx_id, Request::Export(path))
     }
 
     pub(crate) fn stop(ctx_id: u32) -> i32 {
@@ -192,7 +165,7 @@ mod supported {
         let vsock = crate::vsock_device_config(cfg, nic.is_some());
         #[cfg(not(feature = "net"))]
         let vsock = crate::vsock_device_config(cfg, false);
-        let started = match setup.import {
+        let started = match setup.fd_import {
             Some(import) => {
                 #[cfg(feature = "blk")]
                 if !cfg.get_block_cfg().is_empty() {
@@ -206,14 +179,13 @@ mod supported {
                 let nic_socket = None;
                 let vsock_ports = vsock.map(vsock_ports).transpose()?;
                 crate::set_vmm_ids(cfg)?;
-                SnapshotVm::import(
-                    &import.image,
+                SnapshotVm::import_fd(
+                    import.image,
+                    import.bindings,
                     RestoreEndpoints {
-                        disk_dir: import.disk_dir,
                         nic_socket,
                         vsock_ports,
                         console_output: cfg.console_output.take(),
-                        fs_dir: import.fs_dir,
                     },
                 )
             }
@@ -277,8 +249,25 @@ mod supported {
             SnapshotVm::resume(self).map_err(|e| e.to_string())
         }
 
-        fn export(&mut self, path: &Path) -> Result<(), String> {
-            SnapshotVm::export(self, path).map_err(|e| e.to_string())
+        fn prepare(&mut self) -> Result<vmm::snapshot_vm::checkpoint::PreparedResources, String> {
+            SnapshotVm::prepare_checkpoint(self).map_err(|e| e.to_string())
+        }
+        fn export_fd(
+            &mut self,
+            memory: std::fs::File,
+            qcow2: std::fs::File,
+            metadata: vmm::snapshot_vm::checkpoint::ExportMetadata,
+        ) -> Result<(), String> {
+            SnapshotVm::export_fd(self, memory, qcow2, metadata).map_err(|e| e.to_string())
+        }
+        fn discard_preparation(&mut self) {
+            SnapshotVm::discard_checkpoint_preparation(self);
+        }
+        fn abort_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+            SnapshotVm::capture_abort(self)
+        }
+        fn stop_signal(&self) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+            SnapshotVm::stop_signal(self).map_err(|e| e.to_string())
         }
 
         fn stop(&mut self) {
@@ -326,14 +315,9 @@ pub(crate) use supported::*;
 mod unsupported {
     use std::path::PathBuf;
 
-    use super::Import;
     use crate::ContextConfig;
 
     pub(crate) fn enable(_ctx_id: u32, _cfg: &mut ContextConfig, _flags: u32) -> i32 {
-        -libc::ENOTSUP
-    }
-
-    pub(crate) fn import(_cfg: &mut ContextConfig, _import: Import) -> i32 {
         -libc::ENOTSUP
     }
 
@@ -342,10 +326,6 @@ mod unsupported {
     }
 
     pub(crate) fn resume(_ctx_id: u32) -> i32 {
-        -libc::ENOTSUP
-    }
-
-    pub(crate) fn export(_ctx_id: u32, _path: PathBuf) -> i32 {
         -libc::ENOTSUP
     }
 

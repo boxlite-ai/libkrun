@@ -773,6 +773,88 @@ fn snapshot_fs_directory_list_is_stable_across_changes_and_restore() {
 }
 
 #[test]
+fn snapshot_fs_listing_only_projection_survives_restore() {
+    let dir = TempDir::new();
+    dir.file("surviving", b"untouched");
+    dir.file("stale", b"removed before capture");
+    let source = init_share(dir.path());
+    let handle = source.opendir(CTX, fuse::ROOT_ID, 0).unwrap().0.unwrap();
+    let listed = names(&source, handle, 0, 4096);
+    fs::remove_file(dir.path().join("stale")).unwrap();
+    let checkpoint = source.checkpoint().unwrap();
+    let ino = checkpoint.state.handles[0]
+        .listing
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|entry| entry.name == b"surviving")
+        .unwrap()
+        .ino;
+    // Only the directory is retained; cached names have no object FD.
+    assert_eq!(checkpoint.objects.len(), 1);
+    let recovered = TempDir::new();
+    recovered.file(
+        "surviving",
+        &fs::read(dir.path().join("surviving")).unwrap(),
+    );
+    let recovered_root = File::open(recovered.path()).unwrap();
+    let objects = checkpoint
+        .objects
+        .iter()
+        .map(|o| RestoredObject {
+            file: o_path(&recovered_root),
+            guest_ino: o.guest_ino,
+            ctime: o.ctime,
+        })
+        .collect();
+    let restored = PassthroughFs::restore(
+        snapshot_config(recovered.path()),
+        &checkpoint.state,
+        objects,
+        checkpoint.init_binary.clone(),
+    )
+    .unwrap();
+    assert_eq!(names(&restored, handle, 1, 4096), listed[1..]);
+    let entry = restored
+        .lookup(CTX, fuse::ROOT_ID, &cstr("surviving"))
+        .unwrap();
+    assert_eq!(
+        entry.attr.st_ino, ino,
+        "listing-only inode projection changed"
+    );
+    assert!(restored.lookup(CTX, fuse::ROOT_ID, &cstr("stale")).is_err());
+}
+
+#[test]
+fn snapshot_fs_replaced_listing_name_does_not_project_old_inode() {
+    let dir = TempDir::new();
+    dir.file("name", b"old");
+    dir.file("replacement", b"new");
+    let source = init_share(dir.path());
+    let handle = source.opendir(CTX, fuse::ROOT_ID, 0).unwrap().0.unwrap();
+    names(&source, handle, 0, 4096);
+    fs::rename(dir.path().join("replacement"), dir.path().join("name")).unwrap();
+    let checkpoint = source.checkpoint().unwrap();
+    let listed = checkpoint.state.handles[0]
+        .listing
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == b"name")
+        .unwrap();
+    assert!(!listed.projected && listed.object.is_none());
+    let restored = PassthroughFs::restore(
+        snapshot_config(dir.path()),
+        &checkpoint.state,
+        same_host_objects(&checkpoint),
+        checkpoint.init_binary.clone(),
+    )
+    .unwrap();
+    let current = restored.lookup(CTX, fuse::ROOT_ID, &cstr("name")).unwrap();
+    assert_ne!(current.attr.st_ino, listed.ino);
+}
+
+#[test]
 fn snapshot_fs_restored_inodes_and_ctime_are_projected() {
     let dir = TempDir::new();
     dir.file("kept", b"");
@@ -2698,3 +2780,189 @@ fn snapshot_fs_dax_restore_and_reset_remap_inside_the_owner_control() {
 }
 
 mod archive;
+
+#[test]
+fn snapshot_fs_supplied_roles_reject_missing_wrong_identity_and_access() {
+    let dir = TempDir::new();
+    dir.file("file", &paged(1, 0x44));
+    dir.file("other", &paged(1, 0x55));
+    let source = init_share(dir.path());
+    let inode = source
+        .lookup(CTX, fuse::ROOT_ID, &cstr("file"))
+        .unwrap()
+        .inode;
+    let handle = source
+        .open(CTX, inode, false, libc::O_RDWR as u32)
+        .unwrap()
+        .0
+        .unwrap();
+    let window = Window::new(1);
+    setup(&source, &window, inode, 0, 1, true, 0).unwrap();
+    let checkpoint = source.checkpoint_with_dax(Some(window.dax())).unwrap();
+    let index = checkpoint
+        .state
+        .handles
+        .iter()
+        .find(|h| h.handle == handle)
+        .unwrap()
+        .object;
+    for wrong in ["missing", "identity", "access", "dax", "extra"] {
+        let open = |name: &str, write: bool| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(write)
+                .open(dir.path().join(name))
+                .unwrap()
+        };
+        let mut roles = passthrough::RestoredRoles {
+            handles: [(
+                handle,
+                open(
+                    if wrong == "identity" { "other" } else { "file" },
+                    wrong != "access",
+                ),
+            )]
+            .into(),
+            dax: [((index, true), open("file", wrong != "dax"))].into(),
+        };
+        if wrong == "missing" {
+            roles.handles.clear();
+        }
+        if wrong == "extra" {
+            roles.handles.insert(handle + 1, open("file", true));
+        }
+        let restored = PassthroughFs::restore_with_roles(
+            snapshot_config(dir.path()),
+            &checkpoint.state,
+            same_host_objects(&checkpoint),
+            checkpoint.init_binary.clone(),
+            roles,
+        );
+        assert!(
+            matches!(restored, Err(PassthroughSnapshotError::Invalid(_))),
+            "accepted {wrong} role"
+        );
+    }
+    assert!(PassthroughFs::restore_with_roles(
+        snapshot_config(dir.path()),
+        &checkpoint.state,
+        vec![],
+        checkpoint.init_binary.clone(),
+        passthrough::RestoredRoles::default()
+    )
+    .is_err());
+}
+
+// Use a SNAPSHOT_RUNNER granting only CAP_FOWNER to the test process and
+// appending --include-ignored. The fixture then drops the effective capability
+// before provider opens and restore; no namespace or host policy is changed.
+#[test]
+#[ignore = "requires a real CAP_FOWNER source; restore drops the effective capability"]
+fn snapshot_fs_supplied_noatime_survives_capability_drop() {
+    use caps::{CapSet, Capability};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    assert!(caps::has_cap(None, CapSet::Effective, Capability::CAP_FOWNER).unwrap());
+    let dir = TempDir::new();
+    dir.file("file", b"retained noatime handle");
+    let source = init_share(dir.path());
+    let inode = source
+        .lookup(CTX, fuse::ROOT_ID, &cstr("file"))
+        .unwrap()
+        .inode;
+    let handle = source
+        .open(CTX, inode, false, (libc::O_RDWR | libc::O_NOATIME) as u32)
+        .unwrap()
+        .0
+        .unwrap();
+    let checkpoint = source.checkpoint().unwrap();
+    let saved = checkpoint
+        .state
+        .handles
+        .iter()
+        .find(|h| h.handle == handle)
+        .unwrap();
+    assert_ne!(
+        saved.flags & libc::O_NOATIME,
+        0,
+        "source stripped O_NOATIME"
+    );
+
+    let _cap = passthrough::drop_effective_cap(Capability::CAP_FOWNER)
+        .unwrap()
+        .unwrap();
+    assert!(!caps::has_cap(None, CapSet::Effective, Capability::CAP_FOWNER).unwrap());
+    // Ownership permits this independent provider open without CAP_FOWNER.
+    let roles = |noatime| passthrough::RestoredRoles {
+        handles: [(
+            handle,
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(if noatime { libc::O_NOATIME } else { 0 })
+                .open(dir.path().join("file"))
+                .unwrap(),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    assert!(
+        PassthroughFs::restore_with_roles(
+            snapshot_config(dir.path()),
+            &checkpoint.state,
+            same_host_objects(&checkpoint),
+            checkpoint.init_binary.clone(),
+            roles(false)
+        )
+        .is_err(),
+        "accepted a supplied FD missing saved O_NOATIME"
+    );
+    let supplied = roles(true);
+    let actual = unsafe { libc::fcntl(supplied.handles[&handle].as_raw_fd(), libc::F_GETFL) };
+    assert!(actual >= 0);
+    assert_ne!(actual & libc::O_NOATIME, 0);
+    supplied
+        .validate(&checkpoint.state, &same_host_objects(&checkpoint))
+        .unwrap();
+    let restored = PassthroughFs::restore_with_roles(
+        snapshot_config(dir.path()),
+        &checkpoint.state,
+        same_host_objects(&checkpoint),
+        checkpoint.init_binary.clone(),
+        supplied,
+    )
+    .expect("valid supplied O_NOATIME role failed after capability drop");
+    let recaptured = restored.checkpoint().unwrap();
+    assert_eq!(
+        recaptured
+            .state
+            .handles
+            .iter()
+            .find(|h| h.handle == handle)
+            .unwrap()
+            .flags,
+        saved.flags,
+        "supplied role lost its saved flags"
+    );
+
+    // The legacy reopen path still follows the ordinary open capability policy.
+    let reopened = PassthroughFs::restore(
+        snapshot_config(dir.path()),
+        &checkpoint.state,
+        same_host_objects(&checkpoint),
+        checkpoint.init_binary.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .checkpoint()
+            .unwrap()
+            .state
+            .handles
+            .iter()
+            .find(|h| h.handle == handle)
+            .unwrap()
+            .flags,
+        saved.flags & !libc::O_NOATIME
+    );
+}

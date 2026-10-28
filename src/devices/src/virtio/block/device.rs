@@ -217,6 +217,8 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    snapshot_source: Option<File>,
+    image_type: ImageType,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     worker_control: Option<BlockWorkerHandle>,
@@ -255,6 +257,13 @@ impl Block {
             .open(PathBuf::from(&disk_image_path))?;
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        // Keep the exact readonly file, including bytes beyond guest sectors.
+        let snapshot_source = if is_disk_read_only {
+            Some(disk_image.try_clone()?)
+        } else {
+            None
+        };
+        let image_type = disk_image_format.clone();
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
@@ -333,6 +342,8 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            snapshot_source,
+            image_type,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -409,6 +420,14 @@ impl Block {
             disk.restore_image_id(image_id);
         }
         Ok(())
+    }
+
+    /// Exact external readonly dependency, never guest-visible sector truncation.
+    pub fn snapshot_readonly_source(&self) -> Option<&File> {
+        self.snapshot_source.as_ref()
+    }
+    pub fn snapshot_image_type(&self) -> &ImageType {
+        &self.image_type
     }
 
     /// Read guest-visible logical disk bytes through the shared image.

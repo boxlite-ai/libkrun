@@ -2,7 +2,7 @@
 
 //! The checkpointing VM for libkrun's C API: a Linux guest cold-booted
 //! from `VmResources`, or imported from a checkpoint, that pauses, exports
-//! a self-contained checkpoint and resumes. Linux x86_64/KVM only.
+//! a memory checkpoint with external dependencies and resumes. Linux x86_64/KVM only.
 //!
 //! It wraps the private owner (`ram_snapshot`): the owner holds guest RAM,
 //! the VM, every device and thread; no mapping, descriptor or vCPU handle
@@ -11,9 +11,12 @@
 //! An import runs no payload loader, boot setup or guest initialization:
 //! it returns the paused guest of the image, which `resume` continues.
 
+pub mod checkpoint;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ram_snapshot::{
@@ -66,12 +69,6 @@ pub struct SnapshotDevices {
 /// image has the device. Images never name host paths or descriptors.
 #[derive(Default)]
 pub struct RestoreEndpoints {
-    /// A new directory for the disk copies, created exclusively with mode
-    /// 0700: `disk-<i>.raw` (0600, raw) for the image's disk `i` in guest
-    /// order. Once the import succeeds the directory and its files are the
-    /// caller's and never removed by the VM; a failed import removes what
-    /// it created.
-    pub disk_dir: Option<PathBuf>,
     /// The freshly started UnixStream network backend.
     pub nic_socket: Option<PathBuf>,
     /// New host socket paths of the vsock ports; ports and roles must
@@ -81,10 +78,6 @@ pub struct RestoreEndpoints {
     /// every other endpoint passed their checks (an existing file is
     /// refused untouched), removed again if the import fails.
     pub console_output: Option<PathBuf>,
-    /// A new absolute directory for the share copies, created exclusively
-    /// with mode 0700 and kept as guest data once the import succeeds (a
-    /// VM-owned boot root copy inside it goes with the VM).
-    pub fs_dir: Option<PathBuf>,
 }
 
 /// Where guest execution stands.
@@ -158,28 +151,15 @@ impl SnapshotVm {
     }
 
     /// Import the checkpoint at `path` into a new paused VM on
-    /// `endpoints`; `resume` starts it. The disk and share copies are the
-    /// caller's once it succeeds (see `RestoreEndpoints`).
+    /// Legacy path integration is refused; use `import_fd`.
     pub fn import(path: &Path, endpoints: RestoreEndpoints) -> Result<Self> {
-        let resources = RestoreResources {
-            disk_dir: endpoints.disk_dir,
-            nic_socket: endpoints.nic_socket,
-            // A booted VM's UARTs are sinks.
-            serial: Some([None, None, None, None]),
-            vsock_ports: endpoints.vsock_ports,
-            console_ports: endpoints.console_output.map(ConsoleEndpoints::NewOutput),
-            fs_dir: endpoints.fs_dir,
-        };
-        #[cfg_attr(not(feature = "blk"), allow(unused_mut))]
-        let mut vm = RamSnapshotVm::import(path, resources).map_err(failed)?;
-        #[cfg(feature = "blk")]
-        vm.hand_over_imported_disks();
-        Ok(Self(vm))
+        let _ = (path, endpoints);
+        Err(SnapshotError(
+            "version 9 requires descriptor-based checkpoint import".into(),
+        ))
     }
 
-    /// Each imported share's tag and the root of its copy in
-    /// `RestoreEndpoints::fs_dir`, except the VM-owned boot root; empty
-    /// for a booted VM.
+    /// Each imported external share's tag and caller-bound root; empty for a booted VM.
     pub fn restored_shares(&self) -> &[(String, PathBuf)] {
         self.0.restored_shares()
     }
@@ -195,10 +175,60 @@ impl SnapshotVm {
         self.0.declare_host_writers_stopped().map_err(failed)
     }
 
-    /// Write a checkpoint of the paused VM to the new file `path`; the VM
-    /// stays paused, also on failure.
+    /// Legacy path-only integration is refused; use `export_fd`.
     pub fn export(&mut self, path: &Path) -> Result<()> {
-        self.0.export(path).map_err(failed)
+        let _ = path;
+        Err(SnapshotError(
+            "version 9 requires descriptor-based checkpoint export".into(),
+        ))
+    }
+
+    pub fn prepare_checkpoint(&mut self) -> Result<checkpoint::PreparedResources> {
+        self.0.prepare_checkpoint().map_err(failed)
+    }
+
+    pub fn export_fd(
+        &mut self,
+        memory: std::fs::File,
+        qcow2: std::fs::File,
+        metadata: checkpoint::ExportMetadata,
+    ) -> Result<()> {
+        self.0.export_fd(memory, qcow2, metadata).map_err(failed)
+    }
+
+    pub fn inspect_fd(memory: &std::fs::File) -> Result<Vec<u8>> {
+        crate::ram_snapshot::full::inspect(memory).map_err(failed)
+    }
+
+    pub fn import_fd(
+        memory: std::fs::File,
+        bindings: checkpoint::ImportBindings,
+        endpoints: RestoreEndpoints,
+    ) -> Result<Self> {
+        let resources = RestoreResources {
+            nic_socket: endpoints.nic_socket,
+            serial: Some([None, None, None, None]),
+            vsock_ports: endpoints.vsock_ports,
+            console_ports: endpoints.console_output.map(ConsoleEndpoints::NewOutput),
+        };
+        RamSnapshotVm::import_fd(memory, bindings, resources)
+            .map(Self)
+            .map_err(failed)
+    }
+
+    pub fn discard_checkpoint_preparation(&mut self) {
+        self.0.discard_prepared();
+    }
+
+    pub fn capture_abort(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.0.capture_abort.clone()
+    }
+
+    pub fn stop_signal(&self) -> Result<Box<dyn Fn() + Send + Sync>> {
+        let signal = self.0.exit.failure_notifier().map_err(failed)?;
+        Ok(Box::new(move || {
+            let _ = signal.write(1);
+        }))
     }
 
     pub fn resume(&mut self) -> Result<()> {

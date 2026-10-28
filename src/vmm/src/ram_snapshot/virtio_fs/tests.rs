@@ -6,10 +6,8 @@
 //! it, driven through MMIO and FUSE requests in guest RAM; plus the layout,
 //! memslot and window-ownership checks. The FUSE driver here is shared with
 //! `kvm_tests`, where the guest vCPU performs every MMIO access. Tests that
-//! archive a share need root with CAP_SYS_ADMIN, as the devices crate's
-//! archive tests do. Every test name contains "snapshot"; the unprivileged
-//! ones in `rootless` also start with "rootless_fs", which
-//! `make snapshot-test` skips.
+//! exercise retained session state without filesystem archives. Every test
+//! name contains "snapshot"; descriptor sandbox tests live in the devices crate.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -32,7 +30,8 @@ use crate::ram_snapshot::execution::ExecutionBarrier;
 /// The high-priority and request queues.
 pub(super) const REQUEST: usize = 1;
 /// Bytes of each reply buffer.
-const REPLY: u32 = 0x1000;
+// A complete 4 KiB data page plus the FUSE header must fit.
+const REPLY: u32 = 0x2000;
 /// VIRTIO_MMIO_INT_VRING in InterruptStatus.
 pub(super) const INT_VRING: u32 = 1;
 /// `VIRTIO_IOC_REMOVE_ROOT_DIR` (`_IO('v', 3)`, the devices crate's
@@ -324,6 +323,7 @@ impl Side {
                 read_only: false,
                 allow_root_dir_delete: true,
                 vm_owned_root: None,
+                recipe_root: None,
                 dax: dax.map(|range| (range, 0)),
             },
             backing,
@@ -352,54 +352,6 @@ impl Side {
         std::slice::from_ref(&self.share)
     }
 
-    /// Capture as an export does, write the payloads to `payloads` and
-    /// return the metadata after a JSON round trip.
-    fn export(&self, cuts: &[Option<Vec<QueueState>>], payloads: &Path) -> FsMeta {
-        self.export_in(ArchiveMode::FullAttributes, cuts, payloads)
-    }
-
-    /// `export` in archive mode `mode`.
-    fn export_in(
-        &self,
-        mode: ArchiveMode,
-        cuts: &[Option<Vec<QueueState>>],
-        payloads: &Path,
-    ) -> FsMeta {
-        let (meta, archive) = capture(self.shares(), cuts, mode, i32::MAX)
-            .unwrap()
-            .unwrap();
-        validate_metadata(&meta, &regions(), &[], 32).unwrap();
-        validate_rings(&meta, &self.mem).unwrap();
-        let mut file = File::create(payloads).unwrap();
-        write_payloads(&mut file, &archive).unwrap();
-        serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap()
-    }
-
-    /// The import path minus KVM: RAM copied, metadata and rings checked
-    /// before anything exists, the shares imported into `dir`, the device
-    /// rebuilt on the imported root and restored into a new window.
-    fn restored(&self, meta: &FsMeta, payloads: &Path, dir: &Path) -> (Side, ImportedArchive) {
-        validate_metadata(meta, &regions(), &[], 32).unwrap();
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
-        let mut ram = vec![0; RAM_LEN];
-        self.mem.read_slice(&mut ram, GuestAddress(0)).unwrap();
-        mem.write_slice(&ram, GuestAddress(0)).unwrap();
-        validate_rings(meta, &mem).unwrap();
-        let mut imported = import_shares(&File::open(payloads).unwrap(), meta, dir).unwrap();
-        let device = &meta.devices[0];
-        let side = Side::new(mem, imported.root(0).to_owned(), &device.tag, device.dax);
-        imported.hold(side.share.device.clone());
-        restore_parts(
-            &side.share.device,
-            &side.share.transport,
-            &imported,
-            0,
-            device,
-        )
-        .unwrap();
-        (side, imported)
-    }
-
     /// References to the RAM mapping: this side, the probe's and every
     /// device clone, as `probe_ram_aliases` counts them.
     fn mapping_refs(&self) -> usize {
@@ -425,510 +377,6 @@ fn regions() -> Vec<Region> {
         len: RAM_LEN as u64,
         attributes: 0,
     }]
-}
-
-/// A paused share's interrupt status and pending request, its handle, its
-/// DAX file mapping and anonymous window bytes continue on an independent
-/// copy after the source directory is gone: the restored worker answers
-/// the request posted at the cut without a notification, the original
-/// handle reads and writes the copy, and the window maps the copy.
-#[test]
-fn snapshot_fs_vmm_export_import_continues_handles_dax_and_requests() {
-    let dir = TempDir::new();
-    let src = dir.path("src");
-    fs::create_dir(&src).unwrap();
-    fs::write(src.join("f"), vec![0x33; PAGE as usize]).unwrap();
-    let source = Side::source(&src, Some(DAX));
-    assert_eq!(source.mapping_refs(), 2 + 1);
-    let mut guest = Fuse::new();
-    guest.activate(&source);
-    let mem = &source.mem;
-    guest.init(mem, &source);
-    let f = guest.lookup(mem, &source, fuse::ROOT_ID, b"f");
-    let fh = guest.open(mem, &source, f.nodeid, libc::O_RDWR);
-    guest.ok(
-        mem,
-        &source,
-        Opcode::Write,
-        f.nodeid,
-        &Fuse::write_body(fh, 0, b"hello"),
-    );
-    let mapping = Fuse::mapping_body(fh, 0, PAGE, PAGE, true);
-    guest.ok(mem, &source, Opcode::SetupMapping, f.nodeid, &mapping);
-    assert_eq!(source.window(PAGE, 5), b"hello");
-    source.write_window(0, b"anon");
-    // A request made available but not yet seen at the cut.
-    let read = Fuse::read_body(fh, 0, PAGE as u32);
-    let (unique, reply) = guest.post(mem, Opcode::Read, f.nodeid, &read);
-    assert_ne!(source.read(0x60) & INT_VRING, 0);
-
-    let cuts = freeze(source.shares()).unwrap();
-    assert_eq!(
-        source.mapping_refs(),
-        2 + 3,
-        "transport, device and worker clones"
-    );
-    let meta = source.export(&cuts, &dir.path("payloads"));
-    assert_eq!(meta.devices[0].dax, Some(DAX));
-    assert!(meta.devices[0].device.activated);
-    fs::remove_dir_all(&src).unwrap();
-
-    let (target, imported) = source.restored(&meta, &dir.path("payloads"), &dir.path("shares"));
-    imported.persist();
-    assert_eq!(target.window(0, 4), b"anon");
-    assert_eq!(target.window(PAGE, 5), b"hello");
-    assert_ne!(target.read(0x60) & INT_VRING, 0);
-    // The restored worker sees the pending request once resumed.
-    resume(target.shares()).unwrap();
-    let tmem = target.mem.clone();
-    wait_until("the pending request", || {
-        Driver::used(&tmem, REQUEST).len() == Driver::used(mem, REQUEST).len() + 1
-    });
-    let (header, payload) = Fuse::reply(&tmem, reply);
-    assert_eq!((header.unique, header.error), (unique, 0));
-    assert_eq!(&payload[..6], b"hello\x33");
-    // The guest keeps its node and handle on the copy, which the window maps.
-    let write = Fuse::write_body(fh, 5, b" world");
-    guest.ok(&tmem, &target, Opcode::Write, f.nodeid, &write);
-    let copy = dir.path("shares").join("0").join("f");
-    assert_eq!(&fs::read(&copy).unwrap()[..11], b"hello world");
-    assert_eq!(target.window(PAGE, 11), b"hello world");
-    target.write_window(PAGE, b"J");
-    assert_eq!(fs::read(&copy).unwrap()[0], b'J');
-    // The source side stops, never having resumed.
-    drop(source);
-}
-
-/// The metadata and payloads of one activated share over `dir` (holding
-/// "f") with an open read-write handle and a DAX window, as an export
-/// captures them.
-pub(in crate::ram_snapshot) fn captured_share(dir: &Path) -> (FsMeta, Vec<u8>) {
-    let side = Side::source(dir, Some(DAX));
-    let mut guest = Fuse::new();
-    guest.activate(&side);
-    let mem = &side.mem;
-    guest.init(mem, &side);
-    let f = guest.lookup(mem, &side, fuse::ROOT_ID, b"f");
-    guest.open(mem, &side, f.nodeid, libc::O_RDWR);
-    let cuts = freeze(side.shares()).unwrap();
-    let (meta, archive) = capture(side.shares(), &cuts, ArchiveMode::FullAttributes, i32::MAX)
-        .unwrap()
-        .unwrap();
-    let mut payloads = Vec::new();
-    archive.write_files(&mut payloads).unwrap();
-    archive.write_init(&mut payloads).unwrap();
-    archive.write_pages(&mut payloads).unwrap();
-    (meta, payloads)
-}
-
-/// A share nested in another under a non-UTF-8 name is rebuilt on its
-/// exact imported root, and allow_root_dir_delete removes that root, not
-/// a stand-in path.
-#[test]
-fn snapshot_fs_vmm_non_utf8_nested_root_restores_on_its_imported_root() {
-    let dir = TempDir::new();
-    let src = dir.path("src");
-    let nested = src.join("sub").join(OsStr::from_bytes(b"bad\xff"));
-    fs::create_dir_all(&nested).unwrap();
-    fs::write(nested.join("g"), b"nested").unwrap();
-    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
-    let outer = Side::new(mem.clone(), src.clone(), "outer", None);
-    let mut inner = Side::new(mem, nested.clone(), "inner", None);
-    inner.share.index = 1;
-    let shares = [clone_share(&outer.share), clone_share(&inner.share)];
-    let (meta, archive) = capture(
-        &shares,
-        &[None, None],
-        ArchiveMode::FullAttributes,
-        i32::MAX,
-    )
-    .unwrap()
-    .unwrap();
-    validate_metadata(&meta, &regions(), &[], 32).unwrap();
-    let payloads = dir.path("payloads");
-    write_payloads(&mut File::create(&payloads).unwrap(), &archive).unwrap();
-    let meta: FsMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
-    let shares_dir = dir.path("shares");
-    let mut imported = import_shares(&File::open(&payloads).unwrap(), &meta, &shares_dir).unwrap();
-    let root = imported.root(1).to_owned();
-    assert_eq!(
-        root,
-        shares_dir.join("0/sub").join(OsStr::from_bytes(b"bad\xff"))
-    );
-    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
-    let target = Side::new(mem.clone(), root.clone(), "inner", None);
-    imported.hold(target.share.device.clone());
-    restore_parts(
-        &target.share.device,
-        &target.share.transport,
-        &imported,
-        1,
-        &meta.devices[1],
-    )
-    .unwrap();
-    imported.persist();
-    let mut guest = Fuse::new();
-    guest.activate(&target);
-    guest.init(&mem, &target);
-    let g = guest.lookup(&mem, &target, fuse::ROOT_ID, b"g");
-    let fh = guest.open(&mem, &target, g.nodeid, libc::O_RDONLY);
-    let data = guest.ok(
-        &mem,
-        &target,
-        Opcode::Read,
-        g.nodeid,
-        &Fuse::read_body(fh, 0, 16),
-    );
-    assert_eq!(data, b"nested");
-    let ioctl = IoctlIn {
-        cmd: REMOVE_ROOT_DIR,
-        ..Default::default()
-    };
-    guest.ok(
-        &mem,
-        &target,
-        Opcode::Ioctl,
-        fuse::ROOT_ID,
-        ioctl.as_slice(),
-    );
-    assert!(!root.exists());
-    assert!(shares_dir.join("0/sub").is_dir());
-    drop((outer, inner));
-}
-
-/// A VM-owned boot root share, as a boot attaches it.
-fn vm_owned_side(mem: GuestMemoryMmap, root: PathBuf, exit_code: Arc<AtomicI32>) -> Side {
-    let parts = build(
-        mem.clone(),
-        DummyIrqChip::new().into(),
-        Share {
-            tag: "/dev/root",
-            root: root.clone(),
-            read_only: false,
-            allow_root_dir_delete: true,
-            vm_owned: true,
-            exit_code,
-            window: None,
-        },
-    )
-    .unwrap();
-    let mut side = Side::wrap(mem, parts, "/dev/root", None, None);
-    side.share.vm_owned_root = Some(root);
-    side
-}
-
-fn ioctl(guest: &mut Fuse, mem: &GuestMemoryMmap, side: &Side, cmd: u32, arg: u64) {
-    let ioctl = IoctlIn {
-        cmd,
-        arg,
-        ..Default::default()
-    };
-    guest.ok(mem, side, Opcode::Ioctl, fuse::ROOT_ID, ioctl.as_slice());
-}
-
-/// The VM-owned boot root outlives the guest's removal request, also on
-/// a share restored from an image captured before that request; only the
-/// owner's teardown removes it, and a restored owner's teardown removes
-/// only its own imported copy, never the source path. A restored share
-/// reports the guest's exit code to its new owner.
-#[test]
-fn snapshot_fs_vmm_vm_owned_root_outlives_guest_removal_and_restore_until_teardown() {
-    let dir = TempDir::new();
-    let src = dir.path("root");
-    fs::create_dir(&src).unwrap();
-    fs::write(src.join("init"), b"boot").unwrap();
-    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
-    let source_code = Arc::new(AtomicI32::new(i32::MAX));
-    let source = vm_owned_side(mem.clone(), src.clone(), source_code.clone());
-    // Captured before the guest ever asked for the removal.
-    let (meta, archive) = capture(
-        source.shares(),
-        &[None],
-        ArchiveMode::FullAttributes,
-        i32::MAX,
-    )
-    .unwrap()
-    .unwrap();
-    let payloads = dir.path("payloads");
-    write_payloads(&mut File::create(&payloads).unwrap(), &archive).unwrap();
-    let meta: FsMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
-    assert!(meta.devices[0].vm_owned);
-
-    let mut guest = Fuse::new();
-    guest.activate(&source);
-    guest.init(&mem, &source);
-    ioctl(&mut guest, &mem, &source, REMOVE_ROOT_DIR, 0);
-    assert!(src.join("init").is_file(), "removal deferred on the source");
-
-    let shares_dir = dir.path("shares");
-    let mut imported = import_shares(&File::open(&payloads).unwrap(), &meta, &shares_dir).unwrap();
-    let root = imported.root(0).to_owned();
-    let target_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
-    let target_code = Arc::new(AtomicI32::new(i32::MAX));
-    let parts = build(
-        target_mem.clone(),
-        DummyIrqChip::new().into(),
-        restored_share(&meta.devices[0], root.clone(), target_code.clone(), None),
-    )
-    .unwrap();
-    let mut target = Side::wrap(target_mem.clone(), parts, "/dev/root", None, None);
-    target.share.vm_owned_root = owned_root(&meta.devices[0], root.clone());
-    imported.hold(target.share.device.clone());
-    restore_parts(
-        &target.share.device,
-        &target.share.transport,
-        &imported,
-        0,
-        &meta.devices[0],
-    )
-    .unwrap();
-    imported.persist();
-    let mut guest = Fuse::new();
-    guest.activate(&target);
-    guest.init(&target_mem, &target);
-    ioctl(&mut guest, &target_mem, &target, REMOVE_ROOT_DIR, 0);
-    assert!(
-        root.join("init").is_file(),
-        "removal deferred after restore"
-    );
-    ioctl(&mut guest, &target_mem, &target, EXIT_CODE, 7);
-    assert_eq!(target_code.load(Ordering::SeqCst), 7);
-    assert_eq!(source_code.load(Ordering::SeqCst), i32::MAX);
-
-    remove_vm_owned_roots(target.shares());
-    assert!(!root.exists(), "the restored owner removes its copy");
-    assert!(src.is_dir(), "never the source path");
-    remove_vm_owned_roots(source.shares());
-    assert!(!src.exists());
-    drop((source, target));
-}
-
-/// The exit code init posted before the cut (the guest has not yet
-/// signalled its shutdown) belongs to the exported state: the restored
-/// owner reports it, not the unset sentinel; a guest that posted none
-/// restores unset.
-#[test]
-fn snapshot_fs_vmm_exit_code_posted_before_the_cut_survives_the_restore() {
-    let dir = TempDir::new();
-    let src = dir.path("root");
-    fs::create_dir(&src).unwrap();
-    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_LEN)]).unwrap();
-    let source_code = Arc::new(AtomicI32::new(i32::MAX));
-    let source = vm_owned_side(mem.clone(), src.clone(), source_code.clone());
-    let restored = |posted: i32| {
-        let cuts = freeze(source.shares()).unwrap();
-        let (meta, _) = capture(source.shares(), &cuts, ArchiveMode::FullAttributes, posted)
-            .unwrap()
-            .unwrap();
-        resume(source.shares()).unwrap();
-        let meta: FsMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
-        let target_code = AtomicI32::new(i32::MAX);
-        restore_exit_code(&meta, &target_code);
-        target_code.load(Ordering::SeqCst)
-    };
-    let mut guest = Fuse::new();
-    guest.activate(&source);
-    guest.init(&mem, &source);
-    assert_eq!(restored(source_code.load(Ordering::SeqCst)), i32::MAX);
-    ioctl(&mut guest, &mem, &source, EXIT_CODE, 3);
-    assert_eq!(source_code.load(Ordering::SeqCst), 3);
-    assert_eq!(restored(source_code.load(Ordering::SeqCst)), 3);
-    drop(source);
-}
-
-/// A second handle on the same device and transport, for a capture of
-/// several shares.
-fn clone_share(share: &FsDevice) -> FsDevice {
-    FsDevice {
-        device: share.device.clone(),
-        transport: share.transport.clone(),
-        index: share.index,
-        tag: share.tag.clone(),
-        read_only: share.read_only,
-        allow_root_dir_delete: share.allow_root_dir_delete,
-        vm_owned_root: share.vm_owned_root.clone(),
-        dax: share.dax,
-    }
-}
-
-/// `meta` is refused for the reason `reason` names.
-fn rejected(meta: &FsMeta, case: &str, reason: &str) {
-    match validate_metadata(meta, &regions(), &[0xd000_9000], 32) {
-        Ok(_) => panic!("accepted {case}"),
-        Err(e) => assert!(e.to_string().contains(reason), "{case}: {e}"),
-    }
-}
-
-const SLOT: &str = "outside its slot";
-const TAG: &str = "tag is empty, longer than 36 bytes";
-const LAYOUT: &str = "DAX window overlaps RAM, a device or another window";
-const SHAPE: &str = "DAX window is empty, unaligned";
-const WRITABLE: &str = "read-only virtio-fs share holds writable state";
-const WINDOW: &str = "DAX window differs from its session";
-
-/// Every metadata check holds before anything exists: slots, tags,
-/// features, activation, the share's session against the device (an
-/// inactive device with a FUSE session, a DAX size, read-only state), the
-/// DAX layout against RAM, devices, architectural windows and each other,
-/// and the memslot capacity; rings are checked against RAM only, so a ring
-/// in a DAX window is refused.
-#[test]
-fn snapshot_fs_vmm_metadata_is_validated_before_anything_exists() {
-    let dir = TempDir::new();
-    let src = dir.path("src");
-    fs::create_dir(&src).unwrap();
-    fs::write(src.join("f"), b"file").unwrap();
-    let side = Side::source(&src, Some(DAX));
-    let mut guest = Fuse::new();
-    guest.activate(&side);
-    let mem = side.mem.clone();
-    guest.init(&mem, &side);
-    let f = guest.lookup(&mem, &side, fuse::ROOT_ID, b"f");
-    guest.open(&mem, &side, f.nodeid, libc::O_RDWR);
-    let cuts = freeze(side.shares()).unwrap();
-    let (meta, _) = capture(side.shares(), &cuts, ArchiveMode::FullAttributes, i32::MAX)
-        .unwrap()
-        .unwrap();
-    let json = serde_json::to_string(&meta).unwrap();
-    let copy = || -> FsMeta { serde_json::from_str(&json).unwrap() };
-    let lengths = validate_metadata(&copy(), &regions(), &[0xd000_9000], 32).unwrap();
-    assert_eq!(lengths.files, 4);
-
-    let mut m = copy();
-    m.devices[0].mmio_addr += MMIO_LEN;
-    rejected(&m, "another slot", SLOT);
-    let mut m = copy();
-    m.devices[0].irq = 8;
-    rejected(&m, "another GSI", SLOT);
-    let mut m = copy();
-    m.devices[0].tag = "t".repeat(37);
-    rejected(&m, "a 37-byte tag", TAG);
-    let mut m = copy();
-    m.devices[0].tag = "a\0b".into();
-    rejected(&m, "a NUL in the tag", TAG);
-    let mut m = copy();
-    m.devices[0].device.avail_features |= 1 << 2;
-    rejected(&m, "a foreign feature", "offers other features");
-    let mut m = copy();
-    m.devices[0].transport.device_status = 0b1011;
-    rejected(&m, "activation without DRIVER_OK", "activation disagrees");
-    let mut m = copy();
-    m.devices[0].device.activated = false;
-    m.devices[0].transport.device_status = 0b1011;
-    for queue in &mut m.devices[0].device.queues {
-        queue.event_idx_enabled = false;
-    }
-    rejected(
-        &m,
-        "an inactive device with a FUSE session",
-        "carries a FUSE session",
-    );
-    let mut m = copy();
-    m.devices[0].dax = Some(DaxRange {
-        len: 2 * PAGE,
-        ..DAX
-    });
-    rejected(
-        &m,
-        "a DAX window of another size than the session's",
-        WINDOW,
-    );
-    let mut m = copy();
-    m.devices[0].dax = None;
-    rejected(&m, "a session window without a device window", WINDOW);
-    let mut m = copy();
-    m.devices[0].read_only = true;
-    rejected(&m, "a read-only share with a writable handle", WRITABLE);
-    let mut m = copy();
-    m.devices.push(copy().devices.remove(0));
-    rejected(
-        &m,
-        "more devices than archived shares",
-        "archive shares differ",
-    );
-    for (gpa, case, reason) in [
-        (0, "RAM", LAYOUT),
-        (0xd000_9000 - PAGE, "another device's slot", LAYOUT),
-        (FS_MMIO_BASE - 2 * PAGE, "the share's own slot", LAYOUT),
-        (0xfee0_0000 - PAGE, "the local APIC", LAYOUT),
-        (0xfec0_0000, "the IOAPIC", LAYOUT),
-        (
-            arch::x86_64::layout::KVM_TSS_ADDRESS - 2 * PAGE,
-            "the identity map and TSS",
-            LAYOUT,
-        ),
-        (0x1001, "an unaligned address", SHAPE),
-        (u64::MAX - PAGE, "the end of the address space", SHAPE),
-    ] {
-        let mut m = copy();
-        m.devices[0].dax = Some(DaxRange { gpa, len: DAX.len });
-        rejected(&m, case, reason);
-    }
-    // Two shares whose windows overlap.
-    let mut m = copy();
-    let mut second = copy().devices.remove(0);
-    second.mmio_addr += MMIO_LEN;
-    second.irq += 1;
-    second.tag = "second".into();
-    second.dax = Some(DaxRange {
-        gpa: DAX.gpa + PAGE,
-        len: DAX.len,
-    });
-    m.devices.push(second);
-    m.archive.shares.push(copy().archive.shares.remove(0));
-    rejected(&m, "overlapping windows", LAYOUT);
-    // Each window takes a memslot after the RAM regions.
-    let full = validate_metadata(&copy(), &regions(), &[], 1);
-    assert!(full.unwrap_err().to_string().contains("memslot capacity"));
-    validate_metadata(&copy(), &regions(), &[], 2).unwrap();
-
-    // A ring in the DAX window is no guest RAM.
-    let mut m = copy();
-    m.devices[0].device.queues[REQUEST].desc_table = DAX.gpa;
-    validate_metadata(&m, &regions(), &[], 32).unwrap();
-    assert!(validate_rings(&m, &side.mem).is_err());
-    validate_rings(&copy(), &side.mem).unwrap();
-}
-
-/// A read-only share refuses writable state in its session: a writable
-/// handle or file mapping, or the writeback cache.
-#[test]
-fn snapshot_fs_vmm_read_only_shares_hold_no_writable_state() {
-    let dir = TempDir::new();
-    let src = dir.path("src");
-    fs::create_dir(&src).unwrap();
-    fs::write(src.join("f"), vec![1; PAGE as usize]).unwrap();
-    let side = Side::source(&src, Some(DAX));
-    let mut guest = Fuse::new();
-    guest.activate(&side);
-    let mem = side.mem.clone();
-    guest.init(&mem, &side);
-    let f = guest.lookup(&mem, &side, fuse::ROOT_ID, b"f");
-    let ro = guest.open(&mem, &side, f.nodeid, libc::O_RDONLY);
-    let mapping = Fuse::mapping_body(ro, 0, PAGE, 0, false);
-    guest.ok(&mem, &side, Opcode::SetupMapping, f.nodeid, &mapping);
-    let cuts = freeze(side.shares()).unwrap();
-    let (meta, _) = capture(side.shares(), &cuts, ArchiveMode::FullAttributes, i32::MAX)
-        .unwrap()
-        .unwrap();
-    let json = serde_json::to_string(&meta).unwrap();
-    let read_only = || -> FsMeta {
-        let mut m: FsMeta = serde_json::from_str(&json).unwrap();
-        m.devices[0].read_only = true;
-        m
-    };
-    validate_metadata(&read_only(), &regions(), &[], 32).unwrap();
-    let mut m = read_only();
-    m.archive.shares[0].session.state.handles[0].flags = libc::O_RDWR;
-    rejected(&m, "a writable handle", WRITABLE);
-    let mut m = read_only();
-    let dax = m.archive.shares[0].session.state.dax.as_mut().unwrap();
-    for mapping in &mut dax.mappings {
-        if let DaxMappingKind::File { writable, .. } = &mut mapping.kind {
-            *writable = true;
-        }
-    }
-    rejected(&m, "a writable file mapping", WRITABLE);
 }
 
 /// Tags, sources, window shapes, memslots and guest ranges are checked
@@ -961,10 +409,6 @@ fn snapshot_fs_vmm_layout_tags_sources_and_slots_are_checked() {
     ] {
         assert!(check_source(&bad).is_err(), "{bad:?}");
     }
-
-    check_fs_dir(&dir.path("shares")).unwrap();
-    assert!(check_fs_dir(Path::new("shares")).is_err());
-    assert!(check_fs_dir(Path::new(OsStr::from_bytes(b"/tmp/a\0b"))).is_err());
 
     check_dax_shape(DAX).unwrap();
     for range in [
@@ -1100,4 +544,435 @@ fn snapshot_fs_vmm_exports_need_declared_host_writers() {
     assert!(require_declared(1, false).is_err());
 }
 
-mod rootless;
+#[test]
+fn snapshot_fs_v9_boot_recipe_rejects_retained_unknown_objects() {
+    let dir = TempDir::new();
+    fs::create_dir(dir.path("newroot")).unwrap();
+    fs::write(dir.path("unexpected"), b"must not be archived").unwrap();
+    let mut side = Side::source(&dir.0, None);
+    side.share.recipe_root = Some(dir.0.clone());
+    let mut guest = Fuse::new();
+    guest.activate(&side);
+    guest.init(&side.mem, &side);
+    guest.lookup(&side.mem, &side, fuse::ROOT_ID, b"newroot");
+    let cuts = freeze(side.shares()).unwrap();
+    let known = capture(side.shares(), &cuts, i32::MAX).unwrap().unwrap();
+    assert!(known.meta.sessions[0]
+        .objects
+        .iter()
+        .all(|o| o.reference.is_none() && o.recipe.is_some()));
+    resume(side.shares()).unwrap();
+    guest.lookup(&side.mem, &side, fuse::ROOT_ID, b"unexpected");
+    let cuts = freeze(side.shares()).unwrap();
+    let error = capture(side.shares(), &cuts, i32::MAX)
+        .err()
+        .expect("unknown object accepted");
+    assert!(error.to_string().contains("non-reconstructible"));
+}
+
+/// `meta` is refused for the reason `reason` names.
+fn rejected(meta: &FsMeta, case: &str, reason: &str) {
+    match validate_metadata(meta, &regions(), &[0xd000_9000], 32) {
+        Ok(_) => panic!("accepted {case}"),
+        Err(e) => assert!(e.to_string().contains(reason), "{case}: {e}"),
+    }
+}
+
+const SLOT: &str = "outside its slot";
+const TAG: &str = "tag is empty, longer than 36 bytes";
+const LAYOUT: &str = "DAX window overlaps RAM, a device or another window";
+const SHAPE: &str = "DAX window is empty, unaligned";
+const WRITABLE: &str = "read-only virtio-fs share holds writable state";
+const WINDOW: &str = "DAX window differs from its session";
+
+#[test]
+fn snapshot_fs_vmm_metadata_is_validated_before_anything_exists() {
+    let dir = TempDir::new();
+    let src = dir.path("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), b"file").unwrap();
+    let side = Side::source(&src, Some(DAX));
+    let mut guest = Fuse::new();
+    guest.activate(&side);
+    let mem = side.mem.clone();
+    guest.init(&mem, &side);
+    let f = guest.lookup(&mem, &side, fuse::ROOT_ID, b"f");
+    guest.open(&mem, &side, f.nodeid, libc::O_RDWR);
+    let cuts = freeze(side.shares()).unwrap();
+    let mut captured = capture(side.shares(), &cuts, i32::MAX).unwrap().unwrap();
+    let references = captured
+        .meta
+        .sessions
+        .iter()
+        .map(|session| {
+            session
+                .objects
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, _)| crate::snapshot_vm::checkpoint::ExternalReference {
+                        resource_id: "metadata-test".into(),
+                        recovery_point: "cut".into(),
+                        object_key: index.to_string(),
+                    },
+                )
+                .collect()
+        })
+        .collect();
+    captured.bind_references(references).unwrap();
+    let meta = captured.meta;
+    let json = serde_json::to_string(&meta).unwrap();
+    let copy = || -> FsMeta { serde_json::from_str(&json).unwrap() };
+    let lengths = validate_metadata(&copy(), &regions(), &[0xd000_9000], 32).unwrap();
+    assert!(meta.sessions[0].dax_offsets.is_empty());
+    assert_eq!(
+        lengths, meta.sessions[0].init_len,
+        "only synthetic init bytes belong in this payload"
+    );
+
+    let mut m = copy();
+    m.devices[0].mmio_addr += MMIO_LEN;
+    rejected(&m, "another slot", SLOT);
+    let mut m = copy();
+    m.devices[0].irq = 8;
+    rejected(&m, "another GSI", SLOT);
+    let mut m = copy();
+    m.devices[0].tag = "t".repeat(37);
+    rejected(&m, "a 37-byte tag", TAG);
+    let mut m = copy();
+    m.devices[0].tag = "a\0b".into();
+    rejected(&m, "a NUL in the tag", TAG);
+    let mut m = copy();
+    m.devices[0].device.avail_features |= 1 << 2;
+    rejected(&m, "a foreign feature", "offers other features");
+    let mut m = copy();
+    m.devices[0].transport.device_status = 0b1011;
+    rejected(&m, "activation without DRIVER_OK", "activation disagrees");
+    let mut m = copy();
+    m.devices[0].device.activated = false;
+    m.devices[0].transport.device_status = 0b1011;
+    for queue in &mut m.devices[0].device.queues {
+        queue.event_idx_enabled = false;
+    }
+    rejected(
+        &m,
+        "an inactive device with a FUSE session",
+        "carries a FUSE session",
+    );
+    let mut m = copy();
+    m.devices[0].dax = Some(DaxRange {
+        len: 2 * PAGE,
+        ..DAX
+    });
+    rejected(
+        &m,
+        "a DAX window of another size than the session's",
+        WINDOW,
+    );
+    let mut m = copy();
+    m.devices[0].dax = None;
+    rejected(&m, "a session window without a device window", WINDOW);
+    let mut m = copy();
+    m.devices[0].read_only = true;
+    rejected(&m, "a read-only share with a writable handle", WRITABLE);
+    let mut m = copy();
+    m.devices.push(copy().devices.remove(0));
+    rejected(
+        &m,
+        "more devices than sessions",
+        "sessions differ from devices",
+    );
+    for (gpa, case, reason) in [
+        (0, "RAM", LAYOUT),
+        (0xd000_9000 - PAGE, "another device's slot", LAYOUT),
+        (FS_MMIO_BASE - 2 * PAGE, "the share's own slot", LAYOUT),
+        (0xfee0_0000 - PAGE, "the local APIC", LAYOUT),
+        (0xfec0_0000, "the IOAPIC", LAYOUT),
+        (
+            arch::x86_64::layout::KVM_TSS_ADDRESS - 2 * PAGE,
+            "the identity map and TSS",
+            LAYOUT,
+        ),
+        (0x1001, "an unaligned address", SHAPE),
+        (u64::MAX - PAGE, "the end of the address space", SHAPE),
+    ] {
+        let mut m = copy();
+        m.devices[0].dax = Some(DaxRange { gpa, len: DAX.len });
+        rejected(&m, case, reason);
+    }
+    // Two shares whose windows overlap.
+    let mut m = copy();
+    let mut second = copy().devices.remove(0);
+    second.mmio_addr += MMIO_LEN;
+    second.irq += 1;
+    second.tag = "second".into();
+    second.dax = Some(DaxRange {
+        gpa: DAX.gpa + PAGE,
+        len: DAX.len,
+    });
+    m.devices.push(second);
+    m.sessions.push(copy().sessions.remove(0));
+    rejected(&m, "overlapping windows", LAYOUT);
+    // Each window takes a memslot after the RAM regions.
+    let full = validate_metadata(&copy(), &regions(), &[], 1);
+    assert!(full.unwrap_err().to_string().contains("memslot capacity"));
+    validate_metadata(&copy(), &regions(), &[], 2).unwrap();
+
+    // A ring in the DAX window is no guest RAM.
+    let mut m = copy();
+    m.devices[0].device.queues[REQUEST].desc_table = DAX.gpa;
+    validate_metadata(&m, &regions(), &[], 32).unwrap();
+    assert!(validate_rings(&m, &side.mem).is_err());
+    validate_rings(&copy(), &side.mem).unwrap();
+}
+
+#[test]
+fn snapshot_fs_vmm_read_only_shares_hold_no_writable_state() {
+    let dir = TempDir::new();
+    let src = dir.path("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), vec![1; PAGE as usize]).unwrap();
+    let side = Side::source(&src, Some(DAX));
+    let mut guest = Fuse::new();
+    guest.activate(&side);
+    let mem = side.mem.clone();
+    guest.init(&mem, &side);
+    let f = guest.lookup(&mem, &side, fuse::ROOT_ID, b"f");
+    let ro = guest.open(&mem, &side, f.nodeid, libc::O_RDONLY);
+    let mapping = Fuse::mapping_body(ro, 0, PAGE, 0, false);
+    guest.ok(&mem, &side, Opcode::SetupMapping, f.nodeid, &mapping);
+    let cuts = freeze(side.shares()).unwrap();
+    let mut captured = capture(side.shares(), &cuts, i32::MAX).unwrap().unwrap();
+    let references = captured
+        .meta
+        .sessions
+        .iter()
+        .map(|session| {
+            session
+                .objects
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, _)| crate::snapshot_vm::checkpoint::ExternalReference {
+                        resource_id: "metadata-test".into(),
+                        recovery_point: "cut".into(),
+                        object_key: index.to_string(),
+                    },
+                )
+                .collect()
+        })
+        .collect();
+    captured.bind_references(references).unwrap();
+    let meta = captured.meta;
+    let json = serde_json::to_string(&meta).unwrap();
+    let read_only = || -> FsMeta {
+        let mut m: FsMeta = serde_json::from_str(&json).unwrap();
+        m.devices[0].read_only = true;
+        m
+    };
+    validate_metadata(&read_only(), &regions(), &[], 32).unwrap();
+    let mut m = read_only();
+    m.sessions[0].state.handles[0].flags = libc::O_RDWR;
+    rejected(&m, "a writable handle", WRITABLE);
+    let mut m = read_only();
+    let dax = m.sessions[0].state.dax.as_mut().unwrap();
+    for mapping in &mut dax.mappings {
+        if let DaxMappingKind::File { writable, .. } = &mut mapping.kind {
+            *writable = true;
+        }
+    }
+    rejected(&m, "a writable file mapping", WRITABLE);
+    let mut m = read_only();
+    m.sessions[0].state.writeback = true;
+    m.sessions[0].options |= 1 << 16; // FUSE_WRITEBACK_CACHE
+    rejected(&m, "writeback cache", WRITABLE);
+}
+
+/// Cross-share alias checks must compare both directions: an alias cannot
+/// split across objects, and distinct aliases cannot collapse to one object.
+#[test]
+fn snapshot_fs_v9_bindings_check_alias_root_kind_and_counts() {
+    use crate::snapshot_vm::checkpoint::ShareBinding;
+    use devices::virtio::fs::passthrough::RestoredRoles;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = TempDir::new();
+    fs::create_dir(dir.path("other")).unwrap();
+    let side = Side::source(&dir.0, None);
+    let mut guest = Fuse::new();
+    guest.activate(&side);
+    guest.init(&side.mem, &side);
+    let cuts = freeze(side.shares()).unwrap();
+    let captured = capture(side.shares(), &cuts, i32::MAX).unwrap().unwrap();
+    assert_eq!(captured.meta.sessions[0].objects.len(), 1);
+    let mut json = serde_json::to_value(&captured.meta).unwrap();
+    let device = json["devices"][0].clone();
+    let session = json["sessions"][0].clone();
+    json["devices"].as_array_mut().unwrap().push(device);
+    json["sessions"].as_array_mut().unwrap().push(session);
+    let mut meta: FsMeta = serde_json::from_value(json).unwrap();
+    let binding = |root: &Path, object: &Path| ShareBinding {
+        root: root.to_owned(),
+        objects: vec![std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(object)
+            .unwrap()],
+        roles: RestoredRoles::default(),
+    };
+    validate_bindings(&meta, &[binding(&dir.0, &dir.0), binding(&dir.0, &dir.0)]).unwrap();
+    let error = validate_bindings(
+        &meta,
+        &[
+            binding(&dir.0, &dir.0),
+            binding(&dir.path("other"), &dir.path("other")),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("aliases disagree"), "{error}");
+    meta.sessions[1].objects[0].alias += 1;
+    let error =
+        validate_bindings(&meta, &[binding(&dir.0, &dir.0), binding(&dir.0, &dir.0)]).unwrap_err();
+    assert!(error.to_string().contains("aliases disagree"), "{error}");
+    validate_bindings(
+        &meta,
+        &[
+            binding(&dir.0, &dir.0),
+            binding(&dir.path("other"), &dir.path("other")),
+        ],
+    )
+    .unwrap();
+    let error = validate_bindings(
+        &meta,
+        &[
+            binding(&dir.path("other"), &dir.0),
+            binding(&dir.path("other"), &dir.path("other")),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("bound root identity"), "{error}");
+    fs::write(dir.path("file"), b"type mismatch").unwrap();
+    let error = validate_bindings(
+        &meta,
+        &[
+            binding(&dir.0, &dir.path("file")),
+            binding(&dir.path("other"), &dir.path("other")),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("type or access"), "{error}");
+    assert!(validate_bindings(&meta, &[binding(&dir.0, &dir.0)]).is_err());
+    let mut missing = binding(&dir.0, &dir.0);
+    missing.objects.clear();
+    assert!(validate_bindings(
+        &meta,
+        &[missing, binding(&dir.path("other"), &dir.path("other"))]
+    )
+    .is_err());
+    let mut extra = binding(&dir.0, &dir.0);
+    extra.objects.push(extra.objects[0].try_clone().unwrap());
+    assert!(validate_bindings(
+        &meta,
+        &[extra, binding(&dir.path("other"), &dir.path("other"))]
+    )
+    .is_err());
+}
+
+/// Metadata and payload from a negotiated production FUSE session, for
+/// connected full-envelope rejection tests; no host file bytes are embedded.
+pub(in crate::ram_snapshot) fn captured_validation_session() -> (serde_json::Value, Vec<u8>) {
+    let dir = TempDir::new();
+    fs::write(dir.path("f"), b"external file").unwrap();
+    let side = Side::source(&dir.0, Some(DAX));
+    let mut guest = Fuse::new();
+    guest.activate(&side);
+    guest.init(&side.mem, &side);
+    let entry = guest.lookup(&side.mem, &side, fuse::ROOT_ID, b"f");
+    guest.open(&side.mem, &side, entry.nodeid, libc::O_RDONLY);
+    let cuts = freeze(side.shares()).unwrap();
+    let mut captured = capture(side.shares(), &cuts, i32::MAX).unwrap().unwrap();
+    captured
+        .bind_references(vec![captured.meta.sessions[0]
+            .objects
+            .iter()
+            .enumerate()
+            .map(
+                |(index, _)| crate::snapshot_vm::checkpoint::ExternalReference {
+                    resource_id: "session-test".into(),
+                    recovery_point: "cut".into(),
+                    object_key: index.to_string(),
+                },
+            )
+            .collect()])
+        .unwrap();
+    let payload = dir.path("payload");
+    write_payloads(&mut File::create(&payload).unwrap(), &captured).unwrap();
+    (
+        serde_json::to_value(&captured.meta).unwrap(),
+        fs::read(payload).unwrap(),
+    )
+}
+
+#[test]
+fn snapshot_fs_v9_external_objects_reject_another_mount_during_restore() {
+    use devices::virtio::fs::passthrough::{
+        Config, PassthroughFs, PassthroughSnapshotError, RestoredRoles,
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = TempDir::new();
+    fs::write(dir.path("f"), b"source").unwrap();
+    let side = Side::source(&dir.0, None);
+    let mut guest = Fuse::new();
+    guest.activate(&side);
+    guest.init(&side.mem, &side);
+    let entry = guest.lookup(&side.mem, &side, fuse::ROOT_ID, b"f");
+    let handle = guest.open(&side.mem, &side, entry.nodeid, libc::O_RDONLY);
+    let cuts = freeze(side.shares()).unwrap();
+    let mut captured = capture(side.shares(), &cuts, i32::MAX).unwrap().unwrap();
+    let session = &mut captured.meta.sessions[0];
+    let objects: Vec<RestoredObject> = session
+        .objects
+        .iter()
+        .enumerate()
+        .map(|(index, saved)| {
+            let path = if session
+                .state
+                .nodes
+                .iter()
+                .any(|node| node.inode == fuse::ROOT_ID && node.object == index as u64)
+            {
+                dir.0.as_path()
+            } else {
+                Path::new("/proc/version")
+            };
+            RestoredObject {
+                file: std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                    .open(path)
+                    .unwrap(),
+                guest_ino: saved.guest_ino,
+                ctime: saved.ctime,
+            }
+        })
+        .collect();
+    let roles = RestoredRoles {
+        handles: [(handle, File::open("/proc/version").unwrap())].into(),
+        dax: Default::default(),
+    };
+    roles.validate(&session.state, &objects).unwrap();
+    let result = PassthroughFs::restore_with_roles(
+        Config {
+            root_dir: dir.0.to_str().unwrap().into(),
+            snapshot: true,
+            ..Default::default()
+        },
+        &session.state,
+        objects,
+        captured.checkpoints[0].init_binary.clone(),
+        roles,
+    );
+    assert!(
+        matches!(result, Err(PassthroughSnapshotError::HostSubmount(_))),
+        "foreign mount was not rejected at session restore"
+    );
+}

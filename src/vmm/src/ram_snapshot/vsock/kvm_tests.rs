@@ -6,6 +6,8 @@
 //! the NIC tests), so no guest driver code runs. Real Unix sockets are the
 //! host side. Every test name contains "snapshot" for `make snapshot-test`.
 
+#![cfg(feature = "blk")]
+
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,6 +21,7 @@ use super::tests::{
     wait, Driver, GUEST_CID, GUEST_PORT, HOST_PORT, OP_REQUEST, OP_RESPONSE, OP_RW, QSIZE, RINGS,
 };
 use super::*;
+use crate::ram_snapshot::test_fixture::{attach_disk, DescriptorFixture};
 use crate::ram_snapshot::RestoreResources;
 
 const RAM_MIB: usize = 2;
@@ -79,6 +82,7 @@ fn source(ports: &VsockPorts) -> RamSnapshotVm {
     vm.memory
         .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
         .unwrap();
+    attach_disk(&mut vm);
     vm.attach_vsock(GUEST_CID, ports).unwrap();
     vm.start_vcpus(1, 0x1000).unwrap();
     wait_counter(&vm, 0);
@@ -248,8 +252,8 @@ fn snapshot_vsock_kvm_pause_export_import_resume_resets_connections() {
         "reset before resume"
     );
     let (first, second) = (dir.path("first"), dir.path("second"));
-    source.export(&first).unwrap();
-    source.export(&second).unwrap();
+    source.export_test(&first).unwrap();
+    source.export_test(&second).unwrap();
     assert_paused(&source);
 
     // The source resumes on its original configuration, reset first.
@@ -266,15 +270,15 @@ fn snapshot_vsock_kvm_pause_export_import_resume_resets_connections() {
     // Import at fresh paths: paused, nothing bound, exportable again.
     let ports_b = port_map(&dir, "lb.sock", "hb.sock");
     let host_b = UnixListener::bind(dir.path("hb.sock")).unwrap();
-    let mut restored = RamSnapshotVm::import(&first, resources(ports_b.clone())).unwrap();
+    let mut restored = RamSnapshotVm::import_test(&first, resources(ports_b.clone())).unwrap();
     assert_paused(&restored);
     assert!(!dir.path("lb.sock").exists());
     let again = dir.path("again");
-    restored.export(&again).unwrap();
+    restored.export_test(&again).unwrap();
     drop(restored);
 
     for image in [&second, &again] {
-        let mut restored = RamSnapshotVm::import(image, resources(ports_b.clone())).unwrap();
+        let mut restored = RamSnapshotVm::import_test(image, resources(ports_b.clone())).unwrap();
         restored.resume().unwrap();
         assert_eq!(Driver::used_idx(&restored.memory, 2), 1);
         assert!(Driver::is_reset(&restored.memory, 0));
@@ -318,10 +322,10 @@ fn snapshot_vsock_kvm_reset_waits_for_buffer_and_inactive_stays_inactive() {
     let mut idle = self::source(&ports);
     idle.pause().unwrap();
     let image = dir.path("inactive");
-    idle.export(&image).unwrap();
+    idle.export_test(&image).unwrap();
     drop(idle);
     let ports_b = port_map(&dir, "lb.sock", "hb.sock");
-    let mut restored = RamSnapshotVm::import(&image, resources(ports_b)).unwrap();
+    let mut restored = RamSnapshotVm::import_test(&image, resources(ports_b)).unwrap();
     assert_eq!(mmio_read(&restored, 0x70), 0, "an inactive vsock activated");
     restored.resume().unwrap();
     activate(&restored);
@@ -344,21 +348,21 @@ fn snapshot_vsock_kvm_resource_errors_and_failed_restart() {
     Driver::default().offer_event(&source.memory);
     source.pause().unwrap();
     let image = dir.path("checkpoint");
-    source.export(&image).unwrap();
+    source.export_test(&image).unwrap();
     drop(source);
 
-    assert!(RamSnapshotVm::import(&image, RestoreResources::default()).is_err());
+    assert!(RamSnapshotVm::import_test(&image, RestoreResources::default()).is_err());
     let mut swapped = port_map(&dir, "lb.sock", "hb.sock");
     swapped.get_mut(&HOST_PORT).unwrap().1 = false;
-    assert!(RamSnapshotVm::import(&image, resources(swapped)).is_err());
+    assert!(RamSnapshotVm::import_test(&image, resources(swapped)).is_err());
     let mut extra = port_map(&dir, "lb.sock", "hb.sock");
     extra.insert(HOST_PORT + 2, (dir.path("x.sock"), true));
-    assert!(RamSnapshotVm::import(&image, resources(extra)).is_err());
+    assert!(RamSnapshotVm::import_test(&image, resources(extra)).is_err());
     assert!(!dir.path("lb.sock").exists());
 
     let ports_b = port_map(&dir, "lb.sock", "hb.sock");
     fs::write(dir.path("lb.sock"), b"occupied").unwrap();
-    let mut restored = RamSnapshotVm::import(&image, resources(ports_b)).unwrap();
+    let mut restored = RamSnapshotVm::import_test(&image, resources(ports_b)).unwrap();
     assert!(restored.resume().is_err());
     assert!(
         restored.pause().is_err(),
@@ -381,12 +385,13 @@ fn snapshot_vsock_kvm_resource_errors_and_failed_restart() {
         vm.memory
             .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
             .unwrap();
+        attach_disk(&mut vm);
         vm.start_vcpus(1, 0x1000).unwrap();
         vm.pause().unwrap();
-        vm.export(&plain).unwrap();
+        vm.export_test(&plain).unwrap();
     }
     let ports_c = port_map(&dir, "lc.sock", "hc.sock");
-    assert!(RamSnapshotVm::import(&plain, resources(ports_c)).is_err());
+    assert!(RamSnapshotVm::import_test(&plain, resources(ports_c)).is_err());
 }
 
 /// The vsock's fixed slot and GSI 7 coexist with the RNG and balloon; a

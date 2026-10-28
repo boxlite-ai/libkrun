@@ -117,13 +117,31 @@ impl FsServer {
         objects: Vec<RestoredObject>,
         init_binary: Arc<[u8]>,
     ) -> result::Result<Self, PassthroughSnapshotError> {
+        Self::restored_with_roles(cfg, read_only, options, state, objects, init_binary, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restored_with_roles(
+        cfg: passthrough::Config,
+        read_only: bool,
+        options: u64,
+        state: &PassthroughState,
+        objects: Vec<RestoredObject>,
+        init_binary: Arc<[u8]>,
+        roles: Option<passthrough::RestoredRoles>,
+    ) -> result::Result<Self, PassthroughSnapshotError> {
         state.check_options(options)?;
         if read_only && state.writeback {
             return Err(PassthroughSnapshotError::Invalid(
                 "negotiated FUSE options disagree with the share",
             ));
         }
-        let fs = PassthroughFs::restore(cfg, state, objects, init_binary)?;
+        let fs = match roles {
+            Some(roles) => {
+                PassthroughFs::restore_with_roles(cfg, state, objects, init_binary, roles)?
+            }
+            None => PassthroughFs::restore(cfg, state, objects, init_binary)?,
+        };
         Ok(if read_only {
             FsServer::ReadOnly(Server::restored(PassthroughFsRo::from_inner(fs), options))
         } else {

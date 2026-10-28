@@ -1232,7 +1232,7 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  *
  * A context opts in with krun_snapshot_enable before krun_start_enter, which
  * then cold-boots the configured guest, or imports a paused one from a
- * checkpoint (krun_snapshot_import), and serves control requests on the
+ * checkpoint (krun_snapshot_import_fd), and serves control requests on the
  * calling thread until guest execution ends; it then RETURNS instead of
  * exiting the process (see krun_start_enter). Other threads control the VM
  * with the functions below. Each control request is run by that thread one
@@ -1288,41 +1288,7 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  */
 int32_t krun_snapshot_enable(uint32_t ctx_id, uint32_t flags);
 
-/**
- * Makes krun_start_enter import the checkpoint at "image_path" instead of
- * booting: the VM starts PAUSED with the image's guest, without loading a
- * payload or kernel or initializing the guest. Call after
- * krun_snapshot_enable. The image is read only during krun_start_enter.
- *
- * The new host endpoints come from the context: the NIC's socket path
- * (krun_add_net_unixstream by path, exactly when the image has a NIC; its
- * MAC and features come from the image), the vsock ports
- * (krun_add_vsock_port2: exactly the image's ports and roles, at new
- * socket paths) and the console output (krun_set_console_output: a path
- * that must not exist yet, created only once every check passed). The
- * context must not configure disks or virtio-fs shares; vCPUs, RAM,
- * kernel, executable, environment and command line are the image's.
- *
- * Arguments:
- *  "ctx_id"     - the configuration context ID.
- *  "image_path" - absolute path of the checkpoint.
- *  "disk_dir"   - absolute path of a new directory for the disk copies,
- *                 required exactly when the image has disks, else NULL.
- *                 Created with mode 0700, holding "disk-<i>.raw" (raw, 0600)
- *                 for the image's disk i in guest order (0 is vda).
- *  "fs_dir"     - absolute path of a new directory for the share copies,
- *                 required exactly when the image has virtio-fs shares,
- *                 else NULL. Created with mode 0700.
- *
- * Once the import succeeds, both directories and everything in them belong
- * to the caller and libkrun never removes them, except the copy of a
- * VM-owned boot root (krun_set_root_disk_remount), which goes with the VM.
- * A failed import removes what it created while it is still what it
- * created, and nothing else.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
+/** Legacy archive/path API: always -ENOTSUP. Use krun_snapshot_import_fd. */
 int32_t krun_snapshot_import(uint32_t ctx_id, const char *image_path,
                              const char *disk_dir, const char *fs_dir);
 
@@ -1350,18 +1316,7 @@ int32_t krun_snapshot_pause(uint32_t ctx_id, uint32_t flags);
  */
 int32_t krun_snapshot_resume(uint32_t ctx_id);
 
-/**
- * Writes a checkpoint of the paused VM to the new file "path" (absolute;
- * must not exist): published complete or removed. The VM stays PAUSED,
- * also after an ordinary failure (-EIO with state PAUSED), which includes
- * an image longer than the process's RLIMIT_FSIZE (refused before the file
- * is created); a failure of vCPU control ends guest execution (-EIO,
- * STOPPED or FAILED).
- *
- * Returns:
- *  Zero on success or a negative error number on failure (-EINVAL unless
- *  PAUSED).
- */
+/** Legacy archive/path API: always -ENOTSUP. Use krun_snapshot_export_fd. */
 int32_t krun_snapshot_export(uint32_t ctx_id, const char *path);
 
 /**
@@ -1394,7 +1349,7 @@ int32_t krun_snapshot_stop(uint32_t ctx_id);
 int32_t krun_snapshot_get_state(uint32_t ctx_id, uint32_t *state, int32_t *exit_code);
 
 /**
- * Gets the root of an imported share's copy in "fs_dir" by its virtio-fs
+ * Gets the externally bound root of an imported share by its virtio-fs
  * tag, from the end of a successful import until krun_free_ctx.
  *
  * Arguments:
@@ -1410,6 +1365,75 @@ int32_t krun_snapshot_get_state(uint32_t ctx_id, uint32_t *state, int32_t *exit_
  */
 int32_t krun_snapshot_get_restored_share(uint32_t ctx_id, const char *tag,
                                          char *path, size_t path_len);
+
+/* Version-9 capabilities (zero on unsupported platforms/builds without blk). */
+#define KRUN_SNAPSHOT_CAP_MEMORY_V9 (1ull << 0)
+#define KRUN_SNAPSHOT_CAP_CAPTURE_RESERVATION (1ull << 1)
+#define KRUN_SNAPSHOT_CAP_EXTERNAL_FDS (1ull << 2)
+#define KRUN_SNAPSHOT_CAPTURE_CHECKPOINT 0u
+#define KRUN_SNAPSHOT_CAPTURE_DISK 1u
+#define KRUN_SNAPSHOT_CAPTURE_COMPLETE 0u
+#define KRUN_SNAPSHOT_CAPTURE_CANCEL 1u
+uint64_t krun_snapshot_capabilities(void);
+
+/* All input FDs are borrowed and duplicated CLOEXEC. JSON is UTF-8, at most
+ * 16 MiB; output lengths exclude NUL. Inspection validates v9 header, full
+ * metadata/payload checksums and extents without KVM/resources. It returns
+ * metadata including application, disk dependencies and FUSE object references.
+ * -ENOBUFS sets required length without transferring any FDs. */
+int32_t krun_snapshot_inspect_fd(int32_t memory_fd, uint8_t *json, size_t *length);
+
+/* Atomically reserve owner state: CHECKPOINT requires confirmed PAUSED;
+ * DISK requires RUNNING and internally drains/pauses while queries still report
+ * RUNNING. Conflicting mutations return -EBUSY. session_fd must be a connected
+ * AF_UNIX SOCK_STREAM; keep the peer open and silent through publication.
+ * EOF, any data, CANCEL, or uncertain result stops execution. Never retry.
+ * COMPLETE resumes a disk capture, leaves a checkpoint PAUSED, and retires the
+ * token. Tokens are context-local; stale/missing tokens return -ESTALE. */
+int32_t krun_snapshot_begin_capture(uint32_t ctx_id, uint32_t kind,
+                                  int32_t session_fd, uint64_t *token);
+int32_t krun_snapshot_end_capture(uint32_t ctx_id, uint64_t token, uint32_t outcome);
+
+/* Prepare a reserved CHECKPOINT's sessions and retained objects. Output FDs are
+ * owned by caller on success, in JSON session/object order (boot recipe objects
+ * included); close them. On -ENOBUFS both required counts are set, no FD escapes;
+ * retrying preparation on the same frozen cut is safe. Cached directory names
+ * alone never require FDs. Caller associates external objects with durable
+ * resource_id/recovery_point/object_key triples; boot recipe objects take no
+ * external references. The output is not a filesystem-content archive. */
+int32_t krun_snapshot_prepare_capture(uint32_t ctx_id, uint64_t token,
+                                    uint8_t *json, size_t *length,
+                                    int32_t *fds, size_t *fd_count);
+
+/* memory_fd must be empty, seekable O_RDWR without O_APPEND; qcow2_fd identifies the caller's
+ * frozen standalone QCOW2 copy. Metadata JSON: {application_schema:1,
+ * application:<value>, objects:[[<external reference>,...],...]}, one vector per
+ * prepared share. Writes/seals/syncs memory only; caller owns pair publication,
+ * dependency retention, cleanup and COMPLETE after durable publication.
+ * Failure leaves memory invalid/partial and owner reserved PAUSED until caller
+ * completes a known failure or cancels an uncertain one. */
+int32_t krun_snapshot_export_fd(uint32_t ctx_id, uint64_t token,
+                               int32_t memory_fd, int32_t qcow2_fd,
+                               const uint8_t *json, size_t length);
+
+/* Configure a new enabled context before start_enter. Binding JSON:
+ * {disks:[fd_index,...], shares:[{root:"/prepared/root", objects:[fd_index,...],
+ * handles:{"saved_handle_id":fd_index,...},
+ * dax:[{object:<index>,writable:<bool>,fd:<index>},...]}]}.
+ * Every FD index is used exactly once, <=16384 total. Disk order is saved guest
+ * order; writable container is QCOW2, readonly boot must match full digest.
+ * Objects are pinned O_PATH descriptors in saved order; O_NOFOLLOW is not required
+ * for descriptors reopened through /proc/self/fd. Supply independent descriptions
+ * with exact saved flags for handles and O_RDONLY/O_RDWR for DAX. For vm_owned
+ * boot roots provide an empty private recipe root with dev/proc/sys/newroot
+ * directories, objects:[], and handle/DAX roles against those recipe objects.
+ * Prepare roots before sandbox installation, pass descriptors afterward; all
+ * bindings precede vCPU creation. start_enter verifies pair/dependencies, opens
+ * QCOW2 directly, restores FUSE/DAX/devices and publishes PAUSED. Caller retains
+ * disks/mounts/leases through VM lifetime and future cold starts. */
+int32_t krun_snapshot_import_fd(uint32_t ctx_id, int32_t memory_fd,
+                               const uint8_t *json, size_t length,
+                               const int32_t *fds, size_t fd_count);
 
 /**
  * Starts and enters the microVM with the configured parameters. The VMM will attempt to take over

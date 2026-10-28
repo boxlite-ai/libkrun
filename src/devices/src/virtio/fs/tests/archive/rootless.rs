@@ -453,3 +453,182 @@ fn rootless_fs_guest_visible_failed_import_leaves_nothing() {
     }
     assert!(!dest.exists());
 }
+
+/// Actual ancillary transfer after the receiver installs the production filter.
+fn receive_roles(socket: &std::os::unix::net::UnixDatagram, expected: usize) -> Vec<File> {
+    let mut byte = [0u8];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let mut control = vec![0usize; 128];
+    let mut message: libc::msghdr = unsafe { mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len() * mem::size_of::<usize>();
+    assert_eq!(
+        unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) },
+        1
+    );
+    assert_eq!(message.msg_flags & libc::MSG_CTRUNC, 0);
+    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    assert!(!header.is_null());
+    assert_eq!(unsafe { (*header).cmsg_type }, libc::SCM_RIGHTS);
+    assert_eq!(
+        unsafe { (*header).cmsg_len },
+        unsafe { libc::CMSG_LEN((expected * 4) as u32) } as usize
+    );
+    let data = unsafe { libc::CMSG_DATA(header).cast::<i32>() };
+    (0..expected)
+        .map(|i| unsafe { File::from_raw_fd(*data.add(i)) })
+        .collect()
+}
+fn send_roles(socket: &std::os::unix::net::UnixDatagram, files: &[File]) {
+    let mut byte = [1u8];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let mut control = vec![0usize; 128];
+    let mut message: libc::msghdr = unsafe { mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = unsafe { libc::CMSG_SPACE((files.len() * 4) as u32) } as usize;
+    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    unsafe {
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN((files.len() * 4) as u32) as usize;
+        let data = libc::CMSG_DATA(header).cast::<i32>();
+        for (index, file) in files.iter().enumerate() {
+            *data.add(index) = file.as_raw_fd();
+        }
+        assert_eq!(libc::sendmsg(socket.as_raw_fd(), &message, 0), 1);
+    }
+}
+
+#[test]
+fn rootless_fs_external_received_orphan_handle_and_writable_dax() {
+    assert_rootless();
+    let dir = TempDir::new();
+    dir.file("orphan", &paged(1, 0x55));
+    let source = init_share(dir.path());
+    let inode = source
+        .lookup(CTX, fuse::ROOT_ID, &cstr("orphan"))
+        .unwrap()
+        .inode;
+    let handle = source
+        .open(CTX, inode, false, libc::O_RDWR as u32)
+        .unwrap()
+        .0
+        .unwrap();
+    let window = Window::new(2);
+    setup(&source, &window, inode, 0, 1, true, 0).unwrap();
+    let handle_fd = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("orphan"))
+        .unwrap();
+    let dax_fd = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join("orphan"))
+        .unwrap();
+    source.unlink(CTX, fuse::ROOT_ID, &cstr("orphan")).unwrap();
+    source.sync_for_snapshot().unwrap();
+    let checkpoint = source.checkpoint_with_dax(Some(window.dax())).unwrap();
+    let object = checkpoint
+        .state
+        .handles
+        .iter()
+        .find(|h| h.handle == handle)
+        .unwrap()
+        .object;
+    let object_count = checkpoint.objects.len();
+    let mut sent: Vec<File> = same_host_objects(&checkpoint)
+        .into_iter()
+        .map(|o| o.file)
+        .collect();
+    sent.push(handle_fd.try_clone().unwrap());
+    sent.push(dax_fd);
+    let (sender, receiver) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    send_roles(&sender, &sent);
+    drop(sent);
+    drop(source);
+    under_seccomp(move || {
+        let mut received = receive_roles(&receiver, object_count + 2);
+        for fd in &received {
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        let dax = received.pop().unwrap();
+        let open = received.pop().unwrap();
+        let objects = received
+            .into_iter()
+            .zip(&checkpoint.objects)
+            .map(|(file, saved)| RestoredObject {
+                file,
+                guest_ino: saved.guest_ino,
+                ctime: saved.ctime,
+            })
+            .collect();
+        let roles = passthrough::RestoredRoles {
+            handles: [(handle, open)].into(),
+            dax: [((object, true), dax)].into(),
+        };
+        let restored = PassthroughFs::restore_with_roles(
+            snapshot_config(dir.path()),
+            &checkpoint.state,
+            objects,
+            checkpoint.init_binary.clone(),
+            roles,
+        )
+        .unwrap();
+        let target = Window::new(2);
+        restored
+            .map_dax(target.dax(), &checkpoint.dax_pages)
+            .unwrap();
+        target.write(0, b"received writable DAX");
+        let mut bytes = vec![0; 21];
+        handle_fd.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"received writable DAX");
+        // Real production FUSE handle reads through the supplied orphan FD.
+        #[derive(Default)]
+        struct ReadResult(Vec<u8>);
+        impl std::io::Write for ReadResult {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::virtio::fs::filesystem::ZeroCopyWriter for ReadResult {
+            fn write_from(
+                &mut self,
+                file: &File,
+                count: usize,
+                offset: u64,
+            ) -> std::io::Result<usize> {
+                let mut bytes = vec![0; count];
+                let len = file.read_at(&mut bytes, offset)?;
+                self.0.extend_from_slice(&bytes[..len]);
+                Ok(len)
+            }
+        }
+        let mut output = ReadResult::default();
+        restored
+            .read(CTX, inode, handle, &mut output, 21, 0, None, 0)
+            .unwrap();
+        assert_eq!(output.0, bytes);
+        assert!(restored
+            .lookup(CTX, fuse::ROOT_ID, &cstr("orphan"))
+            .is_err());
+        drop(restored);
+    });
+}

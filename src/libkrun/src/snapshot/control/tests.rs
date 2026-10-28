@@ -37,6 +37,9 @@ struct Script {
     fail_pause_uncertain: AtomicBool,
     /// Holds the next export until the test sends.
     export_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    discard_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    signal_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    capture_abort: Arc<AtomicBool>,
 }
 
 impl Script {
@@ -107,7 +110,12 @@ impl Vm for Fake {
         })
     }
 
-    fn export(&mut self, _path: &Path) -> Result<(), String> {
+    fn export_fd(
+        &mut self,
+        _memory: File,
+        _qcow2: File,
+        _metadata: ExportMetadata,
+    ) -> Result<(), String> {
         let script = self.0.clone();
         self.op("export", || {
             let gate = script.export_gate.lock().unwrap().take();
@@ -120,6 +128,27 @@ impl Vm for Fake {
             }
             Ok(())
         })
+    }
+
+    fn discard_preparation(&mut self) {
+        if let Some((entered, release)) = self.0.discard_gate.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(LONG).unwrap();
+        }
+    }
+
+    fn abort_flag(&self) -> Arc<AtomicBool> {
+        self.0.capture_abort.clone()
+    }
+
+    fn stop_signal(&self) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let script = self.0.clone();
+        Ok(Box::new(move || {
+            if let Some((entered, release)) = script.signal_gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release.recv_timeout(LONG).unwrap();
+            }
+        }))
     }
 
     fn stop(&mut self) {
@@ -251,11 +280,6 @@ fn snapshot_control_serializes_requests_and_reads_state_during_a_long_export() {
     let ctx = ctx_id();
     let script = Script::new();
     let served = own(ctx, &script);
-    assert_eq!(state(ctx), Ok(State::Running));
-    assert_eq!(
-        restored_share(ctx, "volume0"),
-        Ok(PathBuf::from("/box/shares/0/data"))
-    );
     assert_eq!(
         request(
             ctx,
@@ -265,44 +289,31 @@ fn snapshot_control_serializes_requests_and_reads_state_during_a_long_export() {
         ),
         0
     );
-    assert_eq!(state(ctx), Ok(State::Paused));
-
+    let (session, _peer) = UnixStream::pair().unwrap();
+    let token = begin(ctx, false, session).unwrap();
     let (entered, export_entered) = mpsc::channel();
     let (release, gate) = mpsc::channel();
     *script.export_gate.lock().unwrap() = Some((entered, gate));
-    let export = send(ctx, || Request::Export(PathBuf::from("/box/export.img")));
+    let export = send(ctx, move || export_request(token));
     export_entered.recv_timeout(LONG).unwrap();
-    // Concurrent callers queue behind the running export; reading the
-    // state does not.
-    let resume = send(ctx, || Request::Resume);
-    let pause = send(ctx, || Request::Pause {
-        host_writers_stopped: false,
-    });
     assert_eq!(state(ctx), Ok(State::Paused));
+    assert_eq!(request(ctx, Request::Resume), -libc::EBUSY);
     assert_eq!(free(ctx), Some(-libc::EBUSY));
-    assert_eq!(export.recv_timeout(SHORT), Err(RecvTimeoutError::Timeout));
-    assert_eq!(resume.recv_timeout(SHORT), Err(RecvTimeoutError::Timeout));
     release.send(()).unwrap();
     assert_eq!(export.recv_timeout(LONG).unwrap(), 0);
-    let mut answers = [
-        resume.recv_timeout(LONG).unwrap(),
-        pause.recv_timeout(LONG).unwrap(),
-    ];
-    answers.sort();
-    // Either order runs exactly one of them first; neither overlaps.
-    assert!(
-        answers == [0, 0] || answers == [-libc::EINVAL, 0],
-        "{answers:?}"
+    assert_eq!(
+        request(
+            ctx,
+            Request::End {
+                token,
+                success: true
+            }
+        ),
+        0
     );
-    assert!(!script.overlapped.load(Ordering::SeqCst));
-    let log = script.log();
-    assert_eq!(log[..2], ["pause+declared", "export"]);
-    assert!(log[2..].contains(&"resume"), "{log:?}");
-
+    assert_eq!(request(ctx, Request::Resume), 0);
     assert_eq!(request(ctx, Request::Stop), 0);
     assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
-    assert!(script.dropped.load(Ordering::SeqCst));
-    assert_eq!(state(ctx), Ok(State::Stopped));
     assert_eq!(free(ctx), Some(0));
 }
 
@@ -312,10 +323,7 @@ fn snapshot_control_refuses_requests_the_state_does_not_allow_without_running_th
     let script = Script::new();
     let served = own(ctx, &script);
     assert_eq!(request(ctx, Request::Resume), -libc::EINVAL);
-    assert_eq!(
-        request(ctx, Request::Export(PathBuf::from("/box/export.img"))),
-        -libc::EINVAL
-    );
+    assert_eq!(request(ctx, export_request(0)), -libc::ESTALE);
     assert!(script.log().is_empty());
     assert_eq!(
         request(
@@ -355,18 +363,26 @@ fn snapshot_control_failed_export_keeps_the_vm_paused() {
         ),
         0
     );
+    let (session, _peer) = UnixStream::pair().unwrap();
+    let token = begin(ctx, false, session).unwrap();
     script.fail_export.store(true, Ordering::SeqCst);
-    assert_eq!(
-        request(ctx, Request::Export(PathBuf::from("/box/export.img"))),
-        -libc::EIO
-    );
+    assert_eq!(request(ctx, export_request(token)), -libc::EIO);
     assert_eq!(state(ctx), Ok(State::Paused));
-    // Not replayed: one export ran.
     assert_eq!(script.log(), ["pause", "export"]);
+    assert_eq!(
+        request(
+            ctx,
+            Request::End {
+                token,
+                success: true
+            }
+        ),
+        0
+    );
     assert_eq!(request(ctx, Request::Resume), 0);
-    assert_eq!(state(ctx), Ok(State::Running));
     assert_eq!(request(ctx, Request::Stop), 0);
     assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
+    assert_eq!(free(ctx), Some(0));
 }
 
 #[test]
@@ -438,4 +454,200 @@ fn snapshot_control_stop_of_a_paused_vm_ends_the_owner_after_dropping_it() {
     assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
     assert!(script.dropped.load(Ordering::SeqCst));
     assert_eq!(script.log(), ["pause", "stop"]);
+}
+
+#[test]
+fn snapshot_capture_disk_reserves_running_without_publishing_paused() {
+    let ctx = ctx_id();
+    let script = Script::new();
+    let served = own(ctx, &script);
+    let (session, peer) = UnixStream::pair().unwrap();
+    session.set_nonblocking(true).unwrap();
+    let token = begin(ctx, true, session).unwrap();
+    assert_eq!(script.state(), State::Paused);
+    assert_eq!(state(ctx), Ok(State::Running));
+    assert_eq!(request(ctx, Request::Resume), -libc::EBUSY);
+    assert_eq!(
+        request(
+            ctx,
+            Request::Pause {
+                host_writers_stopped: true
+            }
+        ),
+        -libc::EBUSY
+    );
+    assert_eq!(
+        request(
+            ctx,
+            Request::End {
+                token: token ^ 1,
+                success: true
+            }
+        ),
+        -libc::ESTALE
+    );
+    assert!(matches!(prepare(ctx, token), Err(e) if e == -libc::EINVAL));
+    assert_eq!(
+        request(
+            ctx,
+            Request::End {
+                token,
+                success: true
+            }
+        ),
+        0
+    );
+    assert_eq!(state(ctx), Ok(State::Running));
+    assert_eq!(
+        request(
+            ctx,
+            Request::End {
+                token,
+                success: true
+            }
+        ),
+        -libc::ESTALE
+    );
+    drop(peer);
+    assert_eq!(request(ctx, Request::Stop), 0);
+    assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
+    assert_eq!(script.log(), ["pause+declared", "resume", "stop"]);
+    assert_eq!(free(ctx), Some(0));
+}
+
+#[test]
+fn snapshot_capture_checkpoint_requires_paused_and_stays_paused() {
+    let ctx = ctx_id();
+    let script = Script::new();
+    let served = own(ctx, &script);
+    let (session, peer) = UnixStream::pair().unwrap();
+    assert_eq!(begin(ctx, false, session), Err(-libc::EINVAL));
+    assert!(script.log().is_empty(), "refusal paused the running VM");
+    assert_eq!(
+        request(
+            ctx,
+            Request::Pause {
+                host_writers_stopped: true
+            }
+        ),
+        0
+    );
+    let (session, _peer) = UnixStream::pair().unwrap();
+    let token = begin(ctx, false, session).unwrap();
+    assert_eq!(request(ctx, Request::Resume), -libc::EBUSY);
+    assert_eq!(
+        request(
+            ctx,
+            Request::End {
+                token,
+                success: true
+            }
+        ),
+        0
+    );
+    assert_eq!(state(ctx), Ok(State::Paused));
+    drop(peer);
+    assert_eq!(request(ctx, Request::Stop), 0);
+    assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
+    assert_eq!(free(ctx), Some(0));
+}
+
+#[test]
+fn snapshot_capture_disconnect_and_cancel_stop_the_owner() {
+    for disconnect in [false, true] {
+        let ctx = ctx_id();
+        let script = Script::new();
+        let served = own(ctx, &script);
+        let (session, peer) = UnixStream::pair().unwrap();
+        let token = begin(ctx, true, session).unwrap();
+        if disconnect {
+            drop(peer);
+        } else {
+            assert_eq!(
+                request(
+                    ctx,
+                    Request::End {
+                        token,
+                        success: false
+                    }
+                ),
+                0
+            );
+        }
+        assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
+        assert_eq!(state(ctx), Ok(State::Stopped));
+        assert!(!script.log().contains(&"resume"));
+        assert_eq!(free(ctx), Some(0));
+    }
+}
+
+fn export_request(token: u64) -> Request {
+    Request::ExportFd {
+        token,
+        memory: File::open("/dev/null").unwrap(),
+        qcow2: File::open("/dev/null").unwrap(),
+        metadata: ExportMetadata {
+            application_schema: 1,
+            application: serde_json::Value::Null,
+            objects: vec![],
+        },
+    }
+}
+
+/// Hold COMPLETE after the owner has sampled Paused and checked the token.
+/// Cancellation still arrives through the real admission/session paths.
+fn complete_during_cancellation(disconnect: bool) {
+    let ctx = ctx_id();
+    let script = Script::new();
+    let served = own(ctx, &script);
+    let (session, peer) = UnixStream::pair().unwrap();
+    let token = begin(ctx, true, session).unwrap();
+    let (entered, completing) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    *script.discard_gate.lock().unwrap() = Some((entered, gate));
+    let complete = send(ctx, move || Request::End {
+        token,
+        success: true,
+    });
+    completing.recv_timeout(LONG).unwrap();
+    let (signalled, cancelling) = mpsc::channel();
+    let (finish_signal, gate) = mpsc::channel();
+    *script.signal_gate.lock().unwrap() = Some((signalled, gate));
+    let stop = if disconnect {
+        drop(peer);
+        None
+    } else {
+        Some(send(ctx, || Request::Stop))
+    };
+    cancelling.recv_timeout(LONG).unwrap();
+    // The watcher/Stop has invalidated the reservation before COMPLETE decides.
+    release.send(()).unwrap();
+    assert_eq!(complete.recv_timeout(SHORT), Err(RecvTimeoutError::Timeout));
+    finish_signal.send(()).unwrap();
+    let status = complete.recv_timeout(LONG).unwrap();
+    if let Some(stop) = stop {
+        assert_eq!(stop.recv_timeout(LONG).unwrap(), 0);
+    }
+    assert_eq!(served.recv_timeout(LONG).unwrap(), 0);
+    assert_eq!(state(ctx), Ok(State::Stopped));
+    assert_eq!(free(ctx), Some(0));
+    assert_eq!(
+        status,
+        -libc::ECANCELED,
+        "aborted COMPLETE reported success"
+    );
+    assert!(
+        !script.log().contains(&"resume"),
+        "cancelled source resumed"
+    );
+}
+
+#[test]
+fn snapshot_capture_complete_rejects_concurrent_stop() {
+    complete_during_cancellation(false);
+}
+
+#[test]
+fn snapshot_capture_complete_joins_session_abort_before_resuming() {
+    complete_during_cancellation(true);
 }

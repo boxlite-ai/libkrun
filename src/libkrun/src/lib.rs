@@ -2823,14 +2823,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 }
 
-/// A path argument: non-NULL UTF-8.
-unsafe fn path_arg(c_path: *const c_char) -> Option<PathBuf> {
-    if c_path.is_null() {
-        return None;
-    }
-    CStr::from_ptr(c_path).to_str().ok().map(PathBuf::from)
-}
-
 #[no_mangle]
 pub extern "C" fn krun_snapshot_enable(ctx_id: u32, flags: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
@@ -2847,30 +2839,8 @@ pub unsafe extern "C" fn krun_snapshot_import(
     c_disk_dir: *const c_char,
     c_fs_dir: *const c_char,
 ) -> i32 {
-    let Some(image) = path_arg(c_image_path) else {
-        return -libc::EINVAL;
-    };
-    let optional = |c_dir: *const c_char| -> Result<Option<PathBuf>, i32> {
-        if c_dir.is_null() {
-            return Ok(None);
-        }
-        path_arg(c_dir).map(Some).ok_or(-libc::EINVAL)
-    };
-    let (disk_dir, fs_dir) = match (optional(c_disk_dir), optional(c_fs_dir)) {
-        (Ok(disk_dir), Ok(fs_dir)) => (disk_dir, fs_dir),
-        _ => return -libc::EINVAL,
-    };
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => snapshot::import(
-            ctx_cfg.get_mut(),
-            snapshot::Import {
-                image,
-                disk_dir,
-                fs_dir,
-            },
-        ),
-        Entry::Vacant(_) => -libc::ENOENT,
-    }
+    let _ = (ctx_id, c_image_path, c_disk_dir, c_fs_dir);
+    -libc::ENOTSUP
 }
 
 #[no_mangle]
@@ -2886,10 +2856,8 @@ pub extern "C" fn krun_snapshot_resume(ctx_id: u32) -> i32 {
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_snapshot_export(ctx_id: u32, c_path: *const c_char) -> i32 {
-    match path_arg(c_path) {
-        Some(path) => snapshot::export(ctx_id, path),
-        None => -libc::EINVAL,
-    }
+    let _ = (ctx_id, c_path);
+    -libc::ENOTSUP
 }
 
 #[no_mangle]

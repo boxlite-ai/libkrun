@@ -159,6 +159,7 @@ impl RamSnapshotVm {
         if self.exit.requested() {
             return Err(Error::Invalid("the VM is exiting"));
         }
+        self.prepared = None;
         // Host writers may run again once anything in the guest does.
         self.host_writers_stopped = false;
         let resumed = wiring::reassign_irqfds(self, drained)

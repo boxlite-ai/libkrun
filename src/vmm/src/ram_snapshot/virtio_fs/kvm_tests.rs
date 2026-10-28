@@ -10,9 +10,8 @@
 //! replies live in guest RAM (`tests::Fuse`). Every test name contains
 //! "snapshot" for `make snapshot-test`.
 //!
-//! Their execution is UNVERIFIED until run on a Linux KVM host (see the
-//! README's stage-12 validation status); the archive capture also needs
-//! root with CAP_SYS_ADMIN.
+//! These tests require Linux/KVM. Share contents remain external and the
+//! descriptor fixtures run without privileged archive capture.
 
 use std::fs;
 use std::sync::atomic::fence;
@@ -148,13 +147,6 @@ fn source(dir: &Path) -> RamSnapshotVm {
     vm
 }
 
-fn resources(fs_dir: &Path) -> RestoreResources {
-    RestoreResources {
-        fs_dir: Some(fs_dir.to_owned()),
-        ..Default::default()
-    }
-}
-
 /// A share directory holding "f", one page of 0x33.
 fn share_dir(dir: &TempDir) -> PathBuf {
     let src = dir.path("src");
@@ -180,121 +172,6 @@ fn bring_up(vm: &RamSnapshotVm) -> (Fuse, u64, u64) {
     assert_eq!(guest.read32(DAX.gpa), u32::from_le_bytes(*b"hell"));
     guest.write32(DAX.gpa + 8, u32::from_le_bytes(*b"ABCD"));
     (client, f.nodeid, fh)
-}
-
-/// A share continues on an independent copy after its source VM and
-/// directory are gone: the CPU continues from the cut, the interrupt
-/// raised before the cut (interrupts off) is delivered once by the
-/// restored irqchip, the original handle reads and writes the copy, and
-/// the guest's DAX window maps the copy.
-#[test]
-fn snapshot_fs_kvm_restored_guest_continues_handles_dax_and_irq() {
-    let dir = TempDir::new();
-    let src = share_dir(&dir);
-    let mut vm = source(&src);
-    let (mut client, nodeid, fh) = bring_up(&vm);
-    assert_eq!(
-        &fs::read(src.join("f")).unwrap()[..12],
-        b"hello\x33\x33\x33ABCD"
-    );
-    assert_ne!(Guest(&vm).read(0x60) & INT_VRING, 0);
-    assert_eq!(read16(&vm, IRQ_COUNT), 0);
-
-    vm.declare_host_writers_stopped().unwrap();
-    vm.pause().unwrap();
-    let paused_at = read16(&vm, COUNTER);
-    let image = dir.path("image");
-    vm.export(&image).unwrap();
-    drop(vm);
-    fs::remove_dir_all(&src).unwrap();
-
-    let shares = dir.path("shares");
-    let mut target = RamSnapshotVm::import(&image, resources(&shares)).unwrap();
-    assert_eq!(read16(&target, COUNTER), paused_at);
-    // The copies are the owner's own: it exports again before it runs.
-    target.export(&dir.path("again")).unwrap();
-    target.resume().unwrap();
-    wait_counter(&target, paused_at);
-    let guest = Guest(&target);
-    assert_ne!(guest.read(0x60) & INT_VRING, 0);
-    std::thread::sleep(QUIET);
-    assert_eq!(read16(&target, IRQ_COUNT), 0, "taken with IF=0");
-    guest.sti();
-    wait_until("pending IRQ", || read16(&target, IRQ_COUNT) == 1);
-    guest.write(0x64, INT_VRING);
-
-    let read = Fuse::read_body(fh, 0, PAGE as u32);
-    let data = client.ok(&target.memory, &guest, Opcode::Read, nodeid, &read);
-    assert_eq!(&data[..12], b"hello\x33\x33\x33ABCD");
-    let write = Fuse::write_body(fh, 0, b"HE");
-    client.ok(&target.memory, &guest, Opcode::Write, nodeid, &write);
-    assert_eq!(guest.read32(DAX.gpa), u32::from_le_bytes(*b"HEll"));
-    guest.write32(DAX.gpa + 12, u32::from_le_bytes(*b"WXYZ"));
-    let copy = shares.join("0").join("f");
-    assert_eq!(
-        &fs::read(&copy).unwrap()[..16],
-        b"HEllo\x33\x33\x33ABCDWXYZ"
-    );
-    // New replies interrupt the guest again.
-    wait_until("reply IRQ", || read16(&target, IRQ_COUNT) > 1);
-    assert_eq!(Driver::used(&target.memory, REQUEST).len(), 7);
-}
-
-/// Exports with shares need the caller's declaration, made while running
-/// and kept through a pause; resume clears it and an undeclared export
-/// creates nothing.
-#[test]
-fn snapshot_fs_kvm_exports_need_host_writers_declared_stopped() {
-    let dir = TempDir::new();
-    let src = share_dir(&dir);
-    let mut vm = fixture();
-    vm.attach_fs(share(&src, Some(DAX))).unwrap();
-    assert!(vm.declare_host_writers_stopped().is_err(), "before start");
-    vm.start_vcpus(1, MMIO_ENTRY).unwrap();
-    vm.pause().unwrap();
-    assert!(vm.declare_host_writers_stopped().is_err(), "while paused");
-    let refused = dir.path("refused");
-    assert!(vm.export(&refused).is_err());
-    assert!(!refused.exists());
-    vm.resume().unwrap();
-    vm.declare_host_writers_stopped().unwrap();
-    vm.pause().unwrap();
-    vm.export(&dir.path("first")).unwrap();
-    vm.export(&dir.path("second")).unwrap();
-    vm.resume().unwrap();
-    vm.pause().unwrap();
-    assert!(vm.export(&refused).is_err(), "resume cleared it");
-    assert!(!refused.exists());
-}
-
-/// The archive mode is chosen before the CPUs start; a guest-visible
-/// export records the exporter's IDs in the image, and the imported owner
-/// keeps exporting in that mode.
-#[test]
-fn snapshot_fs_kvm_archive_mode_is_set_before_start_and_kept_by_import() {
-    let dir = TempDir::new();
-    let src = share_dir(&dir);
-    let mut vm = fixture();
-    vm.attach_fs(share(&src, Some(DAX))).unwrap();
-    vm.set_fs_archive_mode(ArchiveMode::GuestVisible).unwrap();
-    vm.start_vcpus(1, MMIO_ENTRY).unwrap();
-    assert!(vm.set_fs_archive_mode(ArchiveMode::FullAttributes).is_err());
-    vm.declare_host_writers_stopped().unwrap();
-    vm.pause().unwrap();
-    let image = dir.path("image");
-    vm.export(&image).unwrap();
-    let bytes = fs::read(&image).unwrap();
-    let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    let json: serde_json::Value = serde_json::from_slice(&bytes[16..16 + len]).unwrap();
-    // SAFETY: these calls only return the effective IDs.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    assert_eq!(
-        json["fs"]["archive"]["contract"],
-        serde_json::json!({"guest_visible": {"uid": uid, "gid": gid}})
-    );
-    drop(vm);
-    let target = RamSnapshotVm::import(&image, resources(&dir.path("shares"))).unwrap();
-    assert_eq!(target.fs_archive_mode, ArchiveMode::GuestVisible);
 }
 
 /// Attachments are checked whichever comes first: a DAX window over RAM,
@@ -330,35 +207,6 @@ fn snapshot_fs_kvm_attachments_check_layout_in_every_order() {
     };
     vm.attach_fs(share(&src, Some(over_balloon))).unwrap();
     assert!(vm.attach_balloon().is_err());
-}
-
-/// An import needs exactly its share directory: a missing one or an
-/// existing one is refused, the existing one untouched, before the import
-/// creates anything; a failed export leaves no image and the source paused.
-#[test]
-fn snapshot_fs_kvm_imports_need_a_new_share_directory() {
-    let dir = TempDir::new();
-    let src = share_dir(&dir);
-    let mut vm = source(&src);
-    bring_up(&vm);
-    vm.declare_host_writers_stopped().unwrap();
-    vm.pause().unwrap();
-    let image = dir.path("image");
-    vm.export(&image).unwrap();
-    assert!(vm.export(&image).is_err(), "never overwrites an image");
-    assert!(vm.is_paused());
-    drop(vm);
-
-    assert!(RamSnapshotVm::import(&image, RestoreResources::default()).is_err());
-    let existing = dir.path("existing");
-    fs::create_dir(&existing).unwrap();
-    fs::write(existing.join("keep"), b"keep").unwrap();
-    assert!(RamSnapshotVm::import(&image, resources(&existing)).is_err());
-    assert_eq!(fs::read(existing.join("keep")).unwrap(), b"keep");
-    let target = RamSnapshotVm::import(&image, resources(&dir.path("shares"))).unwrap();
-    drop(target);
-    // A successful import keeps its copies.
-    assert!(dir.path("shares").join("0").join("f").is_file());
 }
 
 /// Two running vCPUs of an owner with a DAX window: a remapping runs only
@@ -419,4 +267,461 @@ fn snapshot_fs_kvm_dax_failure_during_resume_resumes_no_vcpu() {
         .all(crate::vstate::VcpuHandle::is_finished));
     std::thread::sleep(QUIET);
     assert_eq!(read16(&vm, COUNTER), paused_at);
+}
+
+/// Full v9 import consumes provider objects/roles before restoring an active FUSE/DAX device.
+#[test]
+fn snapshot_fs_kvm_v9_external_orphan_session_and_dax_continue() {
+    use crate::snapshot_vm::checkpoint::{
+        ExportMetadata, ExternalReference, ImportBindings, ShareBinding,
+    };
+    use devices::virtio::block::ImageType;
+    use devices::virtio::fs::passthrough::RestoredRoles;
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+    let dir = TempDir::new();
+    let root = share_dir(&dir);
+    let disk = dir.path("source.qcow2");
+    assert!(std::process::Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2"])
+        .arg(&disk)
+        .arg("1M")
+        .status()
+        .unwrap()
+        .success());
+    let mut vm = fixture();
+    vm.attach_disk(&disk, ImageType::Qcow2, false, false)
+        .unwrap();
+    vm.attach_fs(share(&root, Some(DAX))).unwrap();
+    vm.start_vcpus(1, MMIO_ENTRY).unwrap();
+    wait_counter(&vm, 0);
+    let mut fuse = Fuse::new();
+    fuse.activate(&Guest(&vm));
+    fuse.init(&vm.memory, &Guest(&vm));
+    let inode = fuse
+        .lookup(&vm.memory, &Guest(&vm), fuse::ROOT_ID, b"f")
+        .nodeid;
+    let handle = fuse.open(&vm.memory, &Guest(&vm), inode, libc::O_RDWR);
+    // Provider preopens independent descriptions while the external object still has a name.
+    let handle_fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("f"))
+        .unwrap();
+    let dax_fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("f"))
+        .unwrap();
+    let root_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(&root)
+        .unwrap();
+    let mapping = Fuse::mapping_body(handle, 0, PAGE, PAGE, true);
+    fuse.ok(
+        &vm.memory,
+        &Guest(&vm),
+        Opcode::SetupMapping,
+        inode,
+        &mapping,
+    );
+    Guest(&vm).write32(DAX.gpa + PAGE, 0xaabbccdd);
+    fuse.ok(
+        &vm.memory,
+        &Guest(&vm),
+        Opcode::Unlink,
+        fuse::ROOT_ID,
+        b"f\0",
+    );
+    // Forget the lookup as well: the unlinked object now survives only via
+    // its open handle and writable DAX role, without a path-only inode FD.
+    let before_forget = Driver::used(&vm.memory, REQUEST).len();
+    fuse.post(&vm.memory, Opcode::Forget, inode, &1u64.to_ne_bytes());
+    Guest(&vm).write(0x50, REQUEST as u32);
+    wait_until("forget completion", || {
+        Driver::used(&vm.memory, REQUEST).len() == before_forget + 1
+    });
+    use std::os::fd::AsRawFd;
+    let identity = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(format!("/proc/self/fd/{}", handle_fd.as_raw_fd()))
+        .unwrap();
+    assert_eq!(
+        identity.metadata().unwrap().ino(),
+        handle_fd.metadata().unwrap().ino()
+    );
+    let flags = unsafe { libc::fcntl(identity.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags & libc::O_PATH, 0);
+    assert_eq!(
+        flags & libc::O_NOFOLLOW,
+        0,
+        "proc FD reopen must follow the pinned description"
+    );
+    vm.declare_host_writers_stopped().unwrap();
+    vm.pause().unwrap();
+    let prepared = vm.prepare_checkpoint().unwrap();
+    let meta: FsMeta = serde_json::from_slice(&prepared.metadata).unwrap();
+    assert_eq!(meta.sessions[0].objects.len(), 2);
+    assert!(meta.sessions[0]
+        .state
+        .nodes
+        .iter()
+        .all(|node| node.inode != inode));
+    assert_eq!(meta.sessions[0].state.handles.len(), 1);
+    let orphan_ino = identity.metadata().unwrap().ino();
+    // Recover an independent provider tree and orphan while the source is
+    // frozen; the restored owner must use these new objects exclusively.
+    use std::os::unix::ffi::OsStrExt;
+    let recovered = dir
+        .0
+        .join(std::ffi::OsStr::from_bytes(b"recovered-\xff"))
+        .join("nested");
+    fs::create_dir_all(&recovered).unwrap();
+    fs::copy(
+        format!("/proc/self/fd/{}", handle_fd.as_raw_fd()),
+        recovered.join("f"),
+    )
+    .unwrap();
+    drop((identity, handle_fd, dax_fd, root_fd));
+    let handle_fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(recovered.join("f"))
+        .unwrap();
+    let dax_fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(recovered.join("f"))
+        .unwrap();
+    fs::remove_file(recovered.join("f")).unwrap();
+    let identity = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(format!("/proc/self/fd/{}", handle_fd.as_raw_fd()))
+        .unwrap();
+    let root_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(&recovered)
+        .unwrap();
+    let mut objects = Vec::new();
+    for source in &prepared.files {
+        objects.push(if source.metadata().unwrap().ino() == orphan_ino {
+            identity.try_clone().unwrap()
+        } else {
+            root_fd.try_clone().unwrap()
+        });
+    }
+    let object = meta.sessions[0]
+        .state
+        .handles
+        .iter()
+        .find(|h| h.handle == handle)
+        .unwrap()
+        .object;
+    let refs = (0..objects.len())
+        .map(|index| ExternalReference {
+            resource_id: "share".into(),
+            recovery_point: "retained-cut".into(),
+            object_key: format!("object-{index}"),
+        })
+        .collect();
+    fs::copy(&disk, dir.path("snapshot.qcow2")).unwrap();
+    let memory = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.path("snapshot.mem"))
+        .unwrap();
+    vm.export_fd(
+        memory,
+        File::open(dir.path("snapshot.qcow2")).unwrap(),
+        ExportMetadata {
+            application_schema: 1,
+            application: serde_json::Value::Null,
+            objects: vec![refs],
+        },
+    )
+    .unwrap();
+    let paused = read16(&vm, COUNTER);
+    drop(prepared);
+    drop(vm);
+    fs::remove_file(&disk).unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    fs::copy(dir.path("snapshot.qcow2"), dir.path("owned.qcow2")).unwrap();
+    let probe = handle_fd.try_clone().unwrap();
+    let roles = RestoredRoles {
+        handles: [(handle, handle_fd)].into(),
+        dax: [((object, true), dax_fd)].into(),
+    };
+    let bindings = ImportBindings {
+        disks: vec![OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path("owned.qcow2"))
+            .unwrap()],
+        shares: vec![ShareBinding {
+            root: recovered.clone(),
+            objects,
+            roles,
+        }],
+    };
+    validate_bindings(&meta, &bindings.shares).unwrap();
+    let mut target = RamSnapshotVm::import_fd(
+        File::open(dir.path("snapshot.mem")).unwrap(),
+        bindings,
+        RestoreResources::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        target.exit_code.load(std::sync::atomic::Ordering::SeqCst),
+        i32::MAX,
+        "unset guest exit code changed on import"
+    );
+    assert_eq!(read16(&target, COUNTER), paused);
+    target.resume().unwrap();
+    wait_counter(&target, paused);
+    assert_eq!(Guest(&target).read32(DAX.gpa + PAGE), 0xaabbccdd);
+    Guest(&target).write32(DAX.gpa + PAGE, 0x10203040);
+    let mut changed = [0; 4];
+    probe.read_exact_at(&mut changed, 0).unwrap();
+    assert_eq!(u32::from_le_bytes(changed), 0x10203040);
+    // Short-read length is an independently preserved baseline defect.
+    let mut expected = vec![0; PAGE as usize];
+    probe.read_exact_at(&mut expected, 0).unwrap();
+    let read = Fuse::read_body(handle, 0, PAGE as u32);
+    let reply = fuse.ok(&target.memory, &Guest(&target), Opcode::Read, inode, &read);
+    assert_eq!(reply, expected);
+    assert!(
+        !recovered.join("f").exists(),
+        "orphan was recreated as a named archive file"
+    );
+    target.declare_host_writers_stopped().unwrap();
+    target.pause().unwrap();
+    assert_eq!(target.prepare_checkpoint().unwrap().files.len(), 2);
+    drop(target);
+    assert!(
+        recovered.is_dir(),
+        "teardown removed caller-owned recovered share"
+    );
+}
+
+/// A deterministic boot root on a different tree, with a live directory
+/// stream, an unnotified FUSE request, anonymous DAX and a posted exit code.
+#[cfg(feature = "blk")]
+#[test]
+fn snapshot_fs_v9_boot_recipe_cursor_queued_request_and_posted_exit_continue() {
+    use crate::ram_snapshot::test_fixture::attach_disk;
+    use crate::snapshot_vm::checkpoint::{ExportMetadata, ImportBindings, ShareBinding};
+    use devices::virtio::fs::fuse::{IoctlIn, OpenIn, OpenOut};
+    use devices::virtio::fs::passthrough::RestoredRoles;
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    use vm_memory::ByteValued;
+    let dir = TempDir::new();
+    let root = dir.path("recipe-source");
+    let recovered = dir.path("recipe-recovered");
+    for base in [&root, &recovered] {
+        fs::create_dir(base).unwrap();
+        for name in ["dev", "proc", "sys", "newroot"] {
+            fs::create_dir(base.join(name)).unwrap();
+        }
+    }
+    let mut vm = fixture();
+    attach_disk(&mut vm);
+    vm.attach_fs(FsShareConfig {
+        tag: "/dev/root".into(),
+        source: root.clone(),
+        vm_owned: true,
+        allow_root_dir_delete: true,
+        read_only: false,
+        dax: Some(DAX),
+    })
+    .unwrap();
+    vm.start_vcpus(1, MMIO_ENTRY).unwrap();
+    let mut client = Fuse::new();
+    client.activate(&Guest(&vm));
+    client.init(&vm.memory, &Guest(&vm));
+    let open = OpenIn {
+        flags: libc::O_RDONLY as u32,
+        open_flags: 0,
+    };
+    let reply = client.ok(
+        &vm.memory,
+        &Guest(&vm),
+        Opcode::Opendir,
+        fuse::ROOT_ID,
+        open.as_slice(),
+    );
+    let directory = OpenOut::from_slice(&reply).unwrap().fh;
+    let all = client.ok(
+        &vm.memory,
+        &Guest(&vm),
+        Opcode::Readdir,
+        fuse::ROOT_ID,
+        &Fuse::read_body(directory, 0, 4096),
+    );
+    let first_cookie = u64::from_ne_bytes(all[8..16].try_into().unwrap());
+    let name_len = u32::from_ne_bytes(all[16..20].try_into().unwrap()) as usize;
+    let first_len = (24 + name_len + 7) & !7;
+    let suffix = all[first_len..].to_vec();
+    let ioctl = IoctlIn {
+        cmd: (b'v' as u32) << 8 | 2,
+        arg: 3,
+        ..Default::default()
+    };
+    client.ok(
+        &vm.memory,
+        &Guest(&vm),
+        Opcode::Ioctl,
+        fuse::ROOT_ID,
+        ioctl.as_slice(),
+    );
+    assert_eq!(vm.exit_code.load(std::sync::atomic::Ordering::SeqCst), 3);
+    Guest(&vm).write32(DAX.gpa, 0xfeed1234);
+    vm.pause().unwrap();
+    let undeclared = vm
+        .prepare_checkpoint()
+        .err()
+        .expect("undeclared host writers accepted");
+    assert!(
+        undeclared
+            .to_string()
+            .contains("declare_host_writers_stopped"),
+        "{undeclared}"
+    );
+    vm.resume().unwrap();
+    vm.declare_host_writers_stopped().unwrap();
+    vm.pause().unwrap();
+    let before = Driver::used(&vm.memory, REQUEST).len();
+    let (unique, pending_reply) =
+        client.post(&vm.memory, Opcode::Lookup, fuse::ROOT_ID, b"newroot\0");
+    let prepared = vm.prepare_checkpoint().unwrap();
+    let meta: FsMeta = serde_json::from_slice(&prepared.metadata).unwrap();
+    assert_eq!(meta.exit_code, 3);
+    assert!(prepared.files.len() > 0);
+    assert!(meta.sessions[0]
+        .objects
+        .iter()
+        .all(|object| object.recipe.is_some() && object.reference.is_none()));
+    let memory_path = dir.path("recipe.mem");
+    let disk_path = dir.path("recipe.qcow2");
+    assert!(std::process::Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2"])
+        .arg(&disk_path)
+        .arg("1M")
+        .status()
+        .unwrap()
+        .success());
+    vm.export_fd(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&memory_path)
+            .unwrap(),
+        File::open(&disk_path).unwrap(),
+        ExportMetadata {
+            application_schema: 1,
+            application: serde_json::Value::Null,
+            objects: vec![vec![]],
+        },
+    )
+    .unwrap();
+    drop(prepared);
+    drop(vm);
+    assert!(!root.exists(), "source-owned root survived teardown");
+    let role = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(&recovered)
+        .unwrap();
+    let mut target = RamSnapshotVm::import_fd(
+        File::open(&memory_path).unwrap(),
+        ImportBindings {
+            disks: vec![OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&disk_path)
+                .unwrap()],
+            shares: vec![ShareBinding {
+                root: recovered.clone(),
+                objects: vec![],
+                roles: RestoredRoles {
+                    handles: [(directory, role)].into(),
+                    dax: Default::default(),
+                },
+            }],
+        },
+        RestoreResources::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        target.exit_code.load(std::sync::atomic::Ordering::SeqCst),
+        3
+    );
+    assert_eq!(Driver::used(&target.memory, REQUEST).len(), before);
+    target.resume().unwrap();
+    wait_until("queued request after v9 restore", || {
+        Driver::used(&target.memory, REQUEST).len() == before + 1
+    });
+    let (header, _) = Fuse::reply(&target.memory, pending_reply);
+    assert_eq!(header.unique, unique);
+    assert_eq!(header.error, 0);
+    std::thread::sleep(QUIET);
+    assert_eq!(
+        Driver::used(&target.memory, REQUEST).len(),
+        before + 1,
+        "queued FUSE request repeated"
+    );
+    assert_eq!(Guest(&target).read32(DAX.gpa), 0xfeed1234);
+    let continued = client.ok(
+        &target.memory,
+        &Guest(&target),
+        Opcode::Readdir,
+        fuse::ROOT_ID,
+        &Fuse::read_body(directory, first_cookie, 4096),
+    );
+    assert_eq!(
+        continued, suffix,
+        "saved directory cookies/order/inode projection changed"
+    );
+    let remove = IoctlIn {
+        cmd: (b'v' as u32) << 8 | 3,
+        ..Default::default()
+    };
+    client.ok(
+        &target.memory,
+        &Guest(&target),
+        Opcode::Ioctl,
+        fuse::ROOT_ID,
+        remove.as_slice(),
+    );
+    assert!(
+        recovered.join("newroot").is_dir(),
+        "guest removal was not deferred"
+    );
+    target.pause().unwrap();
+    let undeclared = target
+        .prepare_checkpoint()
+        .err()
+        .expect("resume kept host-writer declaration");
+    assert!(
+        undeclared
+            .to_string()
+            .contains("declare_host_writers_stopped"),
+        "{undeclared}"
+    );
+    target.resume().unwrap();
+    target.declare_host_writers_stopped().unwrap();
+    target.pause().unwrap();
+    target.prepare_checkpoint().unwrap();
+    drop(target);
+    assert!(
+        recovered.join("newroot").is_dir(),
+        "import teardown removed caller-owned recipe root"
+    );
 }

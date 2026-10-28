@@ -8,7 +8,7 @@
 //! test name contains "snapshot" for `make snapshot-test`.
 
 use super::*;
-use crate::ram_snapshot::tests::with_failed_payload_write;
+use crate::ram_snapshot::test_fixture::{attach_disk, DescriptorFixture};
 use crate::ram_snapshot::RestoreResources;
 use devices::virtio::block::ImageType;
 use std::fs;
@@ -97,14 +97,6 @@ impl Backend {
     }
 }
 
-fn resources(disk_dir: Option<&Path>, socket: &Path) -> RestoreResources {
-    RestoreResources {
-        disk_dir: disk_dir.map(Path::to_owned),
-        nic_socket: Some(socket.to_owned()),
-        ..Default::default()
-    }
-}
-
 fn send_frame(stream: &mut UnixStream, payload: &[u8]) {
     stream
         .write_all(&(payload.len() as u32).to_be_bytes())
@@ -136,7 +128,7 @@ fn payload(tag: u8, len: usize) -> Vec<u8> {
 
 /// A running source owner with the counter fixture on CPU 0, the NIC and
 /// optional disks attached before the CPU starts.
-fn source(socket: &Path, disks: &[PathBuf]) -> RamSnapshotVm {
+fn source(socket: &Path) -> RamSnapshotVm {
     let mut vm = crate::builder::build_ram_snapshot_vm(
         RAM_MIB,
         &Default::default(),
@@ -152,11 +144,14 @@ fn source(socket: &Path, disks: &[PathBuf]) -> RamSnapshotVm {
     vm.memory
         .write_slice(&[0x80, 0x16, 0, 0], GuestAddress(0x30 * 4))
         .unwrap();
-    for disk in disks {
-        vm.attach_disk(disk, ImageType::Raw, false, false).unwrap();
-    }
+    attach_disk(&mut vm);
     vm.attach_net(socket, MAC, 0).unwrap();
-    vm.start_vcpus(1, 0x1000).unwrap();
+    // Enable x2APIC using the existing real guest routine, then enter the
+    // counter fixture with IF=0. Pending device IRQs remain in LAPIC IRR.
+    vm.memory
+        .write_slice(&[0xe8, 0xfd, 0x11, 0xe9, 0xfa, 0x0a], GuestAddress(0x500))
+        .unwrap();
+    vm.start_vcpus(1, 0x500).unwrap();
     wait_counter(&vm, 0);
     vm
 }
@@ -322,13 +317,66 @@ impl Driver {
     }
 }
 
-/// Source with active RX/TX, a partial backend frame and TX the device had
-/// not consumed at the cut; the restore uses a new backend.
+#[test]
+fn snapshot_nic_kvm_attach_limits_share_the_last_gsi() {
+    let dir = TempDir::new();
+    let disks: Vec<_> = (0..8)
+        .map(|i| {
+            let path = dir.path(&format!("d{i}.raw"));
+            fs::write(&path, vec![0u8; 4096]).unwrap();
+            path
+        })
+        .collect();
+    let socket = dir.path("n.sock");
+    let build = || {
+        crate::builder::build_ram_snapshot_vm(
+            RAM_MIB,
+            &Default::default(),
+            &crate::builder::Payload::Empty,
+        )
+        .unwrap()
+    };
+
+    // Eight disks take GSI 16-23: no NIC.
+    let mut vm = build();
+    for disk in &disks {
+        vm.attach_disk(disk, ImageType::Raw, false, false).unwrap();
+    }
+    assert!(vm.attach_net(&socket, MAC, 0).is_err());
+
+    // A NIC leaves seven disk slots.
+    let mut vm = build();
+    vm.attach_net(&socket, MAC, 0).unwrap();
+    assert!(vm.attach_net(&socket, MAC, 0).is_err(), "second NIC");
+    for disk in &disks[..7] {
+        vm.attach_disk(disk, ImageType::Raw, false, false).unwrap();
+    }
+    assert!(vm
+        .attach_disk(&disks[7], ImageType::Raw, false, false)
+        .is_err());
+
+    // Unknown feature bits and late attach are rejected.
+    let mut vm = build();
+    assert!(vm.attach_net(&socket, MAC, 1 << 2).is_err());
+    vm.memory
+        .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
+        .unwrap();
+    vm.start_vcpus(1, 0x1000).unwrap();
+    assert!(vm.attach_net(&socket, MAC, 0).is_err());
+}
+
+fn resources(socket: &Path) -> RestoreResources {
+    RestoreResources {
+        nic_socket: Some(socket.to_owned()),
+        ..Default::default()
+    }
+}
+
 #[test]
 fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
     let dir = TempDir::new();
     let old = Backend::start(dir.path("a.sock"));
-    let mut source = source(&old.path, &[]);
+    let mut source = source(&old.path);
     let mut driver = Driver::default();
     Driver::activate(&source);
     let mut stream = old.accept();
@@ -376,7 +424,25 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
 
     let image = dir.path("checkpoint");
     source.pause().unwrap();
-    source.export(&image).unwrap();
+    let mut ioapic = kvm_bindings::kvm_irqchip {
+        chip_id: kvm_bindings::KVM_IRQCHIP_IOAPIC,
+        ..Default::default()
+    };
+    source.vm.fd().get_irqchip(&mut ioapic).unwrap();
+    // Erase earlier traffic's pending line only after the pause flushed irqfds.
+    // The imported discard must create its own kernel-irqchip pending state.
+    unsafe {
+        ioapic.chip.ioapic.irr &= !(1 << NIC_IRQ);
+    }
+    unsafe {
+        ioapic.chip.ioapic.redirtbl[NIC_IRQ as usize].bits = 0x40;
+    }
+    source.vm.fd().set_irqchip(&ioapic).unwrap();
+    assert!(
+        !lapic_pending(&source, 0x40),
+        "source already had discard vector pending"
+    );
+    source.export_test(&image).unwrap();
 
     // The resumed source keeps its backend and buffers: the partial frame
     // completes and the cut-time TX is sent there, then the guest runs on.
@@ -395,7 +461,7 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
 
     // Restore with a freshly started backend.
     let new = Backend::start(dir.path("b.sock"));
-    let mut restored = RamSnapshotVm::import(&image, resources(None, &new.path)).unwrap();
+    let mut restored = RamSnapshotVm::import_test(&image, resources(&new.path)).unwrap();
     let mut stream = new.accept();
 
     // Before any vCPU runs: the cut-time TX is completed as dropped exactly
@@ -412,6 +478,10 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
     assert_eq!(Driver::used_elem(&restored, TX_USED, 0).0, 0);
     assert_eq!(Driver::used_elem(&restored, TX_USED, 1).0, 1);
     assert_ne!(Driver::interrupt_status(&restored) & 1, 0);
+    assert!(
+        lapic_pending(&restored, 0x40),
+        "discard IRQ was overwritten by restored irqchip"
+    );
     assert_eq!(Driver::used_idx(&restored, RX_USED), 1);
     let paused_at = counter(&restored);
     std::thread::sleep(Duration::from_millis(30));
@@ -449,29 +519,23 @@ fn snapshot_nic_kvm_restore_new_backend_drops_cut_tx_and_continues() {
 
     // The restored owner checkpoints again.
     restored.pause().unwrap();
-    restored.export(&dir.path("second")).unwrap();
+    restored.export_test(&dir.path("second")).unwrap();
 }
 
 #[test]
 fn snapshot_nic_kvm_inactive_nic_with_disk_activates_after_restore() {
     let dir = TempDir::new();
-    let disk = dir.path("disk.raw");
-    let bytes: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-    fs::write(&disk, &bytes).unwrap();
     // The NIC is attached but the driver never activates it before the cut;
     // its backend need not exist.
-    let source = source(&dir.path("absent.sock"), &[disk.clone()]);
+    let source = source(&dir.path("absent.sock"));
     let image = dir.path("checkpoint");
     let mut source = source;
     source.pause().unwrap();
-    source.export(&image).unwrap();
+    source.export_test(&image).unwrap();
     drop(source);
 
     // An inactive NIC connects nothing at restore time.
-    let destination = dir.path("disks");
-    let mut restored =
-        RamSnapshotVm::import(&image, resources(Some(&destination), &dir.path("b.sock"))).unwrap();
-    assert_eq!(fs::read(destination.join("disk-0.raw")).unwrap(), bytes);
+    let mut restored = RamSnapshotVm::import_test(&image, resources(&dir.path("b.sock"))).unwrap();
     restored.resume().unwrap();
     wait_counter(&restored, counter(&restored));
 
@@ -496,31 +560,35 @@ fn snapshot_nic_kvm_inactive_nic_with_disk_activates_after_restore() {
 #[test]
 fn snapshot_nic_kvm_backend_failure_and_resource_mismatch_clean_up() {
     let dir = TempDir::new();
-    let disk = dir.path("disk.raw");
-    fs::write(&disk, vec![0x5a; 4096]).unwrap();
     let old = Backend::start(dir.path("a.sock"));
-    let mut source = source(&old.path, &[disk]);
+    let mut source = source(&old.path);
     Driver::activate(&source);
     let _stream = old.accept();
     let image = dir.path("checkpoint");
     source.pause().unwrap();
-    source.export(&image).unwrap();
+    source.export_test(&image).unwrap();
     drop(source);
 
     // Resources without the NIC socket are rejected before any import.
-    let destination = dir.path("disks");
-    let disks_only = RestoreResources {
-        disk_dir: Some(destination.clone()),
-        ..Default::default()
-    };
-    assert!(RamSnapshotVm::import(&image, disks_only).is_err());
-    assert!(!destination.exists());
+    let disks_only = RestoreResources::default();
+    let count = |path| fs::read_dir(path).unwrap().count();
+    let fds = count("/proc/self/fd");
+    let threads = count("/proc/self/task");
+    assert!(RamSnapshotVm::import_test(&image, disks_only).is_err());
 
-    // No backend listening: the restore fails after importing the disk and
-    // removes everything it created.
+    // No backend listening: late device restore fails and retains caller files.
     let missing = dir.path("missing.sock");
-    assert!(RamSnapshotVm::import(&image, resources(Some(&destination), &missing)).is_err());
-    assert!(!destination.exists(), "failed restore left imported disks");
+    assert!(RamSnapshotVm::import_test(&image, resources(&missing)).is_err());
+    assert_eq!(count("/proc/self/fd"), fds, "failed NIC import leaked FDs");
+    assert_eq!(
+        count("/proc/self/task"),
+        threads,
+        "failed NIC import did not join workers"
+    );
+    assert!(
+        image.exists() && image.with_extension("qcow2").exists(),
+        "failed import deleted caller pair"
+    );
 
     // A NIC-free image takes no NIC socket.
     let plain = dir.path("plain");
@@ -534,20 +602,20 @@ fn snapshot_nic_kvm_backend_failure_and_resource_mismatch_clean_up() {
         vm.memory
             .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
             .unwrap();
+        attach_disk(&mut vm);
         vm.start_vcpus(1, 0x1000).unwrap();
         vm.pause().unwrap();
-        vm.export(&plain).unwrap();
+        vm.export_test(&plain).unwrap();
     }
     let new = Backend::start(dir.path("b.sock"));
-    assert!(RamSnapshotVm::import(&plain, resources(None, &new.path)).is_err());
-    assert!(!destination.exists());
+    assert!(RamSnapshotVm::import_test(&plain, resources(&new.path)).is_err());
 }
 
 #[test]
 fn snapshot_nic_kvm_export_failure_keeps_network_paused_until_resume() {
     let dir = TempDir::new();
     let old = Backend::start(dir.path("a.sock"));
-    let mut source = source(&old.path, &[]);
+    let mut source = source(&old.path);
     let mut driver = Driver::default();
     Driver::activate(&source);
     let mut stream = old.accept();
@@ -556,7 +624,7 @@ fn snapshot_nic_kvm_export_failure_keeps_network_paused_until_resume() {
 
     source.pause().unwrap();
     let image = dir.path("checkpoint");
-    let failed = with_failed_payload_write(64 * 1024, || source.export(&image));
+    let failed = source.export_test_write_failure();
     assert!(failed.is_err());
     assert!(!image.exists(), "a failed export published an image");
 
@@ -576,7 +644,7 @@ fn snapshot_nic_kvm_export_failure_keeps_network_paused_until_resume() {
         0,
         "a frozen NIC delivered"
     );
-    source.export(&image).unwrap();
+    source.export_test(&image).unwrap();
 
     // Resume: the CPU runs and the NIC moves frames on its original backend.
     source.resume().unwrap();
@@ -589,50 +657,18 @@ fn snapshot_nic_kvm_export_failure_keeps_network_paused_until_resume() {
     assert_eq!(recv_frame(&mut stream), outbound);
 }
 
-#[test]
-fn snapshot_nic_kvm_attach_limits_share_the_last_gsi() {
-    let dir = TempDir::new();
-    let disks: Vec<_> = (0..8)
-        .map(|i| {
-            let path = dir.path(&format!("d{i}.raw"));
-            fs::write(&path, vec![0u8; 4096]).unwrap();
-            path
-        })
+/// Read the actual paused vCPU LAPIC IRR. IOAPIC edge IRR is transient;
+/// after routing to an enabled local APIC, the pending vector lives here.
+fn lapic_pending(vm: &RamSnapshotVm, vector: usize) -> bool {
+    use crate::vstate::snapshot::{self, Compatibility, Request};
+    let kvm = crate::vstate::KvmContext::new().unwrap();
+    let size = Compatibility::capture(kvm.fd()).unwrap().xsave_size;
+    let state = snapshot::request(&vm.handles[0], |reply| Request::Save { size, reply }).unwrap();
+    let json = serde_json::to_value(state).unwrap();
+    let offset = 0x200 + (vector / 32) * 0x10;
+    let bytes: Vec<u8> = json["lapic"].as_array().unwrap()[offset..offset + 4]
+        .iter()
+        .map(|byte| byte.as_u64().unwrap() as u8)
         .collect();
-    let socket = dir.path("n.sock");
-    let build = || {
-        crate::builder::build_ram_snapshot_vm(
-            RAM_MIB,
-            &Default::default(),
-            &crate::builder::Payload::Empty,
-        )
-        .unwrap()
-    };
-
-    // Eight disks take GSI 16-23: no NIC.
-    let mut vm = build();
-    for disk in &disks {
-        vm.attach_disk(disk, ImageType::Raw, false, false).unwrap();
-    }
-    assert!(vm.attach_net(&socket, MAC, 0).is_err());
-
-    // A NIC leaves seven disk slots.
-    let mut vm = build();
-    vm.attach_net(&socket, MAC, 0).unwrap();
-    assert!(vm.attach_net(&socket, MAC, 0).is_err(), "second NIC");
-    for disk in &disks[..7] {
-        vm.attach_disk(disk, ImageType::Raw, false, false).unwrap();
-    }
-    assert!(vm
-        .attach_disk(&disks[7], ImageType::Raw, false, false)
-        .is_err());
-
-    // Unknown feature bits and late attach are rejected.
-    let mut vm = build();
-    assert!(vm.attach_net(&socket, MAC, 1 << 2).is_err());
-    vm.memory
-        .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
-        .unwrap();
-    vm.start_vcpus(1, 0x1000).unwrap();
-    assert!(vm.attach_net(&socket, MAC, 0).is_err());
+    u32::from_le_bytes(bytes.try_into().unwrap()) & (1 << (vector % 32)) != 0
 }

@@ -1,60 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Internal virtio-fs checkpoints for the private minimal-VM owner: up to
-//! seven snapshot-mode passthrough shares, share `i` at the fixed MMIO slot
-//! `0xd000_d000 + i * 4 KiB` and GSI `9 + i`, each with an optional DAX
-//! window.
-//!
-//! A DAX window is private anonymous memory the owner maps itself and
-//! registers as one more KVM memslot at the window's guest address, counted
-//! against the target's memslot capacity. It is not guest RAM: the RAM
-//! image, the RAM alias probe and every ring validation see only the
-//! `GuestMemoryMmap`, so a ring placed in a DAX window is refused. A window
-//! may not overlap RAM, any attached device's MMIO slot, another window or
-//! an architectural window KVM serves (identity map and TSS, IOAPIC, local
-//! APIC), whichever is attached first. The owner keeps every window it
-//! mapped, also one of a failed attach or import, until it drops, after
-//! its VM fd closed. A device that leaves its window (`Fs::retire`) names
-//! the ranges a failed `mmap(MAP_FIXED)` may have unmapped; other memory of
-//! the process may live there now, so the owner never unmaps them and they
-//! stay reserved for the life of the process. No guest code runs over such
-//! a range: a share with a window makes every host mapping call on it
-//! under the owner's execution barrier (`execution`), which keeps every
-//! vCPU out of `KVM_RUN` during the call and ends guest execution after a
-//! failed one.
-//!
-//! A pause freezes every share's worker with the disk and NIC workers:
-//! after the last FUSE reply, used-ring entry and interrupt, with writable
-//! handles and writable DAX file mappings synced. An export needs
-//! `declare_host_writers_stopped`, the caller's promise that no host writer
-//! changes a share directory or any alias of its files until resume. It
-//! archives every share at once (`ShareArchive`) in the owner's archive
-//! mode (full attributes, or guest-visible for an unprivileged owner), so
-//! the image restores without the source directories: the JSON holds each device and the
-//! archive manifest (objects, share roots, sessions with their DAX
-//! mappings), and the file, init.krun and DAX page payloads follow the disk
-//! segments. No host path or descriptor of a share appears in the image.
-//! An import recreates the shares under `RestoreResources::fs_dir`
-//! (created exclusively with mode 0700; an existing directory is an error
-//! and stays untouched), maps each DAX window and restores each session
-//! before any vCPU thread exists, and keeps the imported tree once it
-//! succeeds. Those copies belong to the owner alone, so an import starts
-//! with host writers declared stopped. A guest-visible archive imports only
-//! under the effective IDs it recorded, checked before anything exists, and
-//! the imported owner keeps exporting in its image's mode.
+//! Frozen virtio-fs sessions with external object bindings; no filesystem archive.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub(crate) use devices::virtio::fs::passthrough::ArchiveMode;
 use devices::virtio::fs::passthrough::{
-    ArchiveContract, ArchiveManifest, DaxMappingKind, ImportedArchive, PassthroughState,
-    PayloadLengths, ShareArchive,
+    DaxMappingKind, DaxPages, PassthroughCheckpoint, PassthroughState, RestoredObject,
 };
 use devices::virtio::persist::{MmioTransportState, QueueState, VirtioDeviceState};
 use devices::virtio::{
@@ -124,6 +82,7 @@ pub(super) struct FsDevice {
     allow_root_dir_delete: bool,
     /// The root of a VM-owned share, which the owner removes when it drops.
     vm_owned_root: Option<PathBuf>,
+    recipe_root: Option<PathBuf>,
     /// The DAX window and its backing's index in `RamSnapshotVm::dax`.
     dax: Option<(DaxRange, usize)>,
 }
@@ -216,21 +175,21 @@ impl Drop for DaxBacking {
 }
 
 /// Snapshot metadata of every share. No host path or descriptor appears
-/// here: the archive holds what the shares contain.
-#[derive(Serialize, Deserialize)]
+/// here: providers retain the objects that the session references.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FsMeta {
-    /// Share `i` of the archive is device `i`.
+    /// Share `i` corresponds to device `i`.
     pub(super) devices: Vec<FsDeviceMeta>,
-    pub(super) archive: ArchiveManifest,
+    pub(super) sessions: Vec<SessionMeta>,
     /// The exit code the guest set through a share
     /// (`VIRTIO_IOC_EXIT_CODE`) before the cut, `i32::MAX` while unset:
     /// a guest exporting between setting it and shutting down reports it
-    /// after the restore. Version 7 images restore it unset.
+    /// after the restore.
     pub(super) exit_code: i32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FsDeviceMeta {
     pub(super) mmio_addr: u64,
@@ -239,13 +198,36 @@ pub(super) struct FsDeviceMeta {
     pub(super) tag: String,
     pub(super) read_only: bool,
     pub(super) allow_root_dir_delete: bool,
-    /// The share is the VM-owned boot root: a restore keeps deferring the
-    /// guest's removal request and removes its own imported copy when it
-    /// drops. Version 7 images had no such share.
+    /// The VM-owned boot root: source teardown removes it. Restore defers
+    /// guest removal but leaves the caller-bound recipe root alive.
     pub(super) vm_owned: bool,
     pub(super) dax: Option<DaxRange>,
     pub(super) transport: MmioTransportState,
     pub(super) device: VirtioDeviceState,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SessionMeta {
+    options: u64,
+    state: PassthroughState,
+    objects: Vec<ObjectMeta>,
+    init_len: u64,
+    dax_offsets: Vec<u64>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectMeta {
+    alias: u64,
+    guest_ino: u64,
+    ctime: (i64, i64),
+    kind: u32,
+    reference: Option<crate::snapshot_vm::checkpoint::ExternalReference>,
+    recipe: Option<String>,
+}
+pub(super) struct CapturedShares {
+    pub meta: FsMeta,
+    pub checkpoints: Vec<PassthroughCheckpoint>,
 }
 
 fn mmio_addr(index: usize) -> u64 {
@@ -308,18 +290,6 @@ fn check_source(source: &Path) -> Result<()> {
         Ok(meta) if meta.is_dir() => Ok(()),
         _ => Err(Error::Invalid("virtio-fs source is not a directory")),
     }
-}
-
-/// The new directory an import creates the shares in: an absolute path
-/// without NUL bytes, so the imported roots the devices serve (and may
-/// delete) never depend on the working directory.
-pub(super) fn check_fs_dir(dir: &Path) -> Result<()> {
-    if !dir.is_absolute() || dir.as_os_str().as_bytes().contains(&0) {
-        return Err(Error::Invalid(
-            "restore resources: the virtio-fs directory is not an absolute path without NUL bytes",
-        ));
-    }
-    Ok(())
 }
 
 /// Nonzero, 4 KiB aligned, inside the guest physical address space.
@@ -488,6 +458,7 @@ pub(super) fn attach(vm: &mut RamSnapshotVm, config: FsShareConfig) -> Result<()
             tag: config.tag,
             read_only: config.read_only,
             allow_root_dir_delete: config.allow_root_dir_delete,
+            recipe_root: config.vm_owned.then_some(config.source.clone()),
             vm_owned_root: config.vm_owned.then_some(config.source),
             dax,
         })
@@ -621,7 +592,7 @@ fn device_meta(
         tag: share.tag.clone(),
         read_only: share.read_only,
         allow_root_dir_delete: share.allow_root_dir_delete,
-        vm_owned: share.vm_owned_root.is_some(),
+        vm_owned: share.recipe_root.is_some(),
         dax: share.dax.map(|(range, _)| range),
         transport: transport.save_transport_state(),
         device: VirtioDeviceState {
@@ -635,50 +606,128 @@ fn device_meta(
     }
 }
 
-/// Capture every frozen share while the vCPUs are paused and the irqfds
-/// drained: the devices and one archive of all shares. Repeated exports of
-/// one pause see the same guest, RAM and device cut, but each re-reads the
-/// host trees: a symlink atime an earlier readlink moved (and, without
-/// `O_NOATIME` permission, file and directory atimes) is recorded as found,
-/// and the first capture assigns inode projections to objects the guest
-/// never looked up in the live share. Images are not byte-identical.
-/// `exit_code` is the owner's guest exit code at the cut.
+/// Capture frozen device/session state and retained-object descriptors after
+/// vCPUs pause and irqfds drain. Only saved directory names are resolved;
+/// filesystem contents remain external. `exit_code` belongs to the cut.
 pub(super) fn capture(
     shares: &[FsDevice],
     cuts: &[Option<Vec<QueueState>>],
-    mode: ArchiveMode,
     exit_code: i32,
-) -> Result<Option<(FsMeta, ShareArchive)>> {
+) -> Result<Option<CapturedShares>> {
     if shares.is_empty() {
         return Ok(None);
     }
-    let locked: Vec<_> = shares
-        .iter()
-        .map(|share| {
-            (
-                share.transport.lock().unwrap(),
-                share.device.lock().unwrap(),
-            )
-        })
-        .collect();
-    let mut devices = Vec::with_capacity(shares.len());
-    let mut sources = Vec::with_capacity(shares.len());
-    for ((share, (transport, device)), cut) in shares.iter().zip(&locked).zip(cuts) {
-        devices.push(device_meta(share, transport, device, cut.as_ref()));
-        sources.push(
-            device
-                .archive_source()
-                .map_err(|e| Error::Full(format!("virtio-fs share {}: {e}", share.index)))?,
-        );
+    let mut devices = Vec::new();
+    let mut checkpoints = Vec::new();
+    let mut sessions = Vec::new();
+    let mut aliases = std::collections::HashMap::new();
+    for (share, cut) in shares.iter().zip(cuts) {
+        let transport = share.transport.lock().unwrap();
+        let device = share.device.lock().unwrap();
+        devices.push(device_meta(share, &transport, &device, cut.as_ref()));
+        let checkpoint = device
+            .checkpoint_external()
+            .map_err(|e| Error::Full(format!("capture external share {}: {e}", share.index)))?;
+        let mut objects = Vec::new();
+        for object in &checkpoint.passthrough.objects {
+            let kind = object.file.metadata()?.mode() & libc::S_IFMT;
+            let recipe = share
+                .recipe_root
+                .as_ref()
+                .map(|root| boot_object(root, &object.file))
+                .transpose()?;
+            let next = aliases.len() as u64;
+            let alias = *aliases.entry((object.dev, object.ino)).or_insert(next);
+            objects.push(ObjectMeta {
+                alias,
+                guest_ino: object.guest_ino,
+                ctime: object.ctime,
+                kind,
+                reference: None,
+                recipe,
+            });
+        }
+        sessions.push(SessionMeta {
+            options: checkpoint.options,
+            state: checkpoint.passthrough.state.clone(),
+            objects,
+            init_len: checkpoint.passthrough.init_binary.len() as u64,
+            dax_offsets: checkpoint.passthrough.dax_pages.offsets.clone(),
+        });
+        checkpoints.push(checkpoint.passthrough);
     }
-    let archive = ShareArchive::capture(sources, mode)
-        .map_err(|e| Error::Full(format!("virtio-fs archive: {e}")))?;
-    let meta = FsMeta {
-        devices,
-        archive: archive.manifest().clone(),
-        exit_code,
-    };
-    Ok(Some((meta, archive)))
+    Ok(Some(CapturedShares {
+        meta: FsMeta {
+            devices,
+            sessions,
+            exit_code,
+        },
+        checkpoints,
+    }))
+}
+
+// init.c::mount_filesystems and KRUN_BLOCK_ROOT_DEVICE create these directories.
+const BOOT_DIRS: [&str; 5] = [".", "dev", "proc", "sys", "newroot"];
+fn boot_object(root: &Path, file: &File) -> Result<String> {
+    let object = file.metadata()?;
+    for name in BOOT_DIRS {
+        if let Ok(candidate) = std::fs::symlink_metadata(root.join(name)) {
+            if candidate.is_dir()
+                && (object.dev(), object.ino()) == (candidate.dev(), candidate.ino())
+            {
+                return Ok(name.to_owned());
+            }
+        }
+    }
+    Err(Error::Invalid(
+        "non-reconstructible runtime boot-root object",
+    ))
+}
+
+impl CapturedShares {
+    pub(super) fn descriptors(&self) -> Result<Vec<File>> {
+        self.checkpoints
+            .iter()
+            .flat_map(|s| &s.objects)
+            .map(|o| o.file.try_clone().map_err(Error::Io))
+            .collect()
+    }
+    pub(super) fn bind_references(
+        &mut self,
+        references: Vec<Vec<crate::snapshot_vm::checkpoint::ExternalReference>>,
+    ) -> Result<()> {
+        if references.len() != self.meta.sessions.len() {
+            return Err(Error::Invalid("external reference share count differs"));
+        }
+        for (session, refs) in self.meta.sessions.iter_mut().zip(references) {
+            let external = session
+                .objects
+                .iter()
+                .filter(|o| o.recipe.is_none())
+                .count();
+            if refs.len() != external {
+                return Err(Error::Invalid("external object references missing"));
+            }
+            let mut refs = refs.into_iter();
+            for object in &mut session.objects {
+                if object.recipe.is_none() {
+                    let reference = refs.next().unwrap();
+                    if [
+                        &reference.resource_id,
+                        &reference.recovery_point,
+                        &reference.object_key,
+                    ]
+                    .iter()
+                    .any(|s| s.is_empty() || s.len() > 4096)
+                    {
+                        return Err(Error::Invalid("invalid external object reference"));
+                    }
+                    object.reference = Some(reference);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A read-only share holds no writable handle, DAX file mapping or
@@ -702,7 +751,7 @@ fn check_read_only(state: &PassthroughState) -> Result<()> {
 }
 
 /// Metadata-only validation, before guest RAM or any target resource
-/// exists: the archive manifest as a whole, every device against its fixed
+/// exists: each session, every device against its fixed
 /// slot and its share's session, and every DAX window against RAM, the
 /// MMIO slots of every other device in the image (`slots`), every share's
 /// slot, the architectural windows and each other, each taking a memslot.
@@ -712,22 +761,42 @@ pub(super) fn validate_metadata(
     regions: &[Region],
     slots: &[u64],
     max_slots: usize,
-) -> Result<PayloadLengths> {
+) -> Result<u64> {
     let invalid = |why: String| Error::Full(format!("virtio-fs: {why}"));
     if meta.devices.is_empty() || meta.devices.len() > MAX_SHARES {
         return Err(invalid("share count is zero or above 7".into()));
     }
-    let lengths = meta
-        .archive
-        .validate()
-        .map_err(|e| invalid(e.to_string()))?;
-    if meta.archive.shares.len() != meta.devices.len() {
-        return Err(invalid("archive shares differ from the devices".into()));
+    if meta.sessions.len() != meta.devices.len() {
+        return Err(invalid("sessions differ from devices".into()));
+    }
+    let mut lengths = 0u64;
+    for session in &meta.sessions {
+        session
+            .state
+            .validate(session.objects.len())
+            .map_err(|e| invalid(e.to_string()))?;
+        session
+            .state
+            .check_options(session.options)
+            .map_err(|e| invalid(e.to_string()))?;
+        if session.init_len > 64 << 20 {
+            return Err(invalid("init.krun exceeds 64 MiB".into()));
+        }
+        if let Some(dax) = &session.state.dax {
+            dax.validate_page_offsets(&session.dax_offsets)
+                .map_err(|e| invalid(e.to_string()))?;
+        } else if !session.dax_offsets.is_empty() {
+            return Err(invalid("pages without DAX".into()));
+        }
+        lengths = lengths
+            .checked_add(session.init_len)
+            .and_then(|n| n.checked_add((session.dax_offsets.len() as u64).checked_mul(4096)?))
+            .ok_or(Error::Invalid("share payload overflow"))?;
     }
     let ram = || regions.iter().map(|r| (r.gpa, r.len));
     let mut tags = HashSet::new();
     let mut windows = Vec::new();
-    for (index, (device, share)) in meta.devices.iter().zip(&meta.archive.shares).enumerate() {
+    for (index, (device, share)) in meta.devices.iter().zip(&meta.sessions).enumerate() {
         if device.mmio_addr != mmio_addr(index)
             || device.mmio_len != MMIO_LEN
             || device.irq != irq(index)
@@ -757,7 +826,7 @@ pub(super) fn validate_metadata(
         }
         // An inactive device serves no session: its share's is the one a
         // fresh share has before FUSE_INIT (its DAX window may hold pages).
-        let session = &share.session;
+        let session = share;
         let live = session.options != 0
             || !session.state.nodes.is_empty()
             || !session.state.handles.is_empty();
@@ -770,6 +839,48 @@ pub(super) fn validate_metadata(
             return Err(invalid(format!(
                 "share {index} DAX window differs from its session's"
             )));
+        }
+        for object in &session.objects {
+            if device.vm_owned {
+                if object.reference.is_some()
+                    || !object
+                        .recipe
+                        .as_deref()
+                        .is_some_and(|name| BOOT_DIRS.contains(&name))
+                    || object.kind != libc::S_IFDIR
+                {
+                    return Err(invalid("invalid boot-root recipe object".into()));
+                }
+            } else if object.recipe.is_some()
+                || object.reference.as_ref().is_none_or(|r| {
+                    [&r.resource_id, &r.recovery_point, &r.object_key]
+                        .iter()
+                        .any(|s| s.is_empty() || s.len() > 4096)
+                })
+            {
+                return Err(invalid(
+                    "missing or invalid external object reference".into(),
+                ));
+            }
+        }
+        for entry in session
+            .state
+            .handles
+            .iter()
+            .filter_map(|h| h.listing.as_ref())
+            .flatten()
+        {
+            if entry.object.is_some_and(|index| {
+                session
+                    .objects
+                    .get(index as usize)
+                    .is_none_or(|object| object.guest_ino != entry.ino || !entry.projected)
+            }) {
+                return Err(invalid("cached entry object/projection differs".into()));
+            }
+            if entry.projected && (entry.name == b"." || entry.name == b"..") {
+                return Err(invalid("dot entry cannot require a binding".into()));
+            }
         }
         if device.read_only {
             check_read_only(&session.state)?;
@@ -815,234 +926,252 @@ pub(super) fn validate_rings(meta: &FsMeta, memory: &GuestMemoryMmap) -> Result<
 }
 
 /// Bytes of the file, init.krun and DAX page payloads.
-pub(super) fn payload_len(lengths: PayloadLengths) -> Result<u64> {
-    lengths
-        .files
-        .checked_add(lengths.init)
-        .and_then(|len| len.checked_add(lengths.pages))
-        .ok_or(Error::Invalid("virtio-fs payload length overflow"))
-}
-
-/// The payload writer of an export (with the test write-fault hook).
-struct Payload<'a>(&'a mut File);
-
-impl Write for Payload<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        #[cfg(test)]
-        super::tests::write_payload(self.0, bytes)?;
-        #[cfg(not(test))]
-        self.0.write_all(bytes)?;
-        Ok(bytes.len())
+pub(super) fn write_payloads(file: &mut File, capture: &CapturedShares) -> Result<()> {
+    for share in &capture.checkpoints {
+        file.write_all(&share.init_binary)?;
+        file.write_all(&share.dax_pages.data)?;
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Write the file, init.krun and DAX page payloads after the disk
-/// segments; a file that changed since the capture fails the export.
-pub(super) fn write_payloads(file: &mut File, archive: &ShareArchive) -> Result<()> {
-    let mut out = Payload(file);
-    archive
-        .write_files(&mut out)
-        .map_err(|e| Error::Full(format!("virtio-fs files: {e}")))?;
-    archive.write_init(&mut out)?;
-    archive.write_pages(&mut out)?;
     Ok(())
 }
 
-/// Upgrade a version 7 virtio-fs section (JSON, maybe null) in place: its
-/// archive was captured with full attributes and records no contract, none
-/// of its shares was VM-owned, and it recorded no exit code, so it restores
-/// unset; one that records any of these is no version 7 section.
-pub(super) fn upgrade_contractless(fs: &mut serde_json::Value) -> Result<()> {
-    if let Some(archive) = fs.get_mut("archive").and_then(|a| a.as_object_mut()) {
-        if archive.contains_key("contract") {
-            return Err(Error::Invalid(
-                "a version 7 virtio-fs archive carries a contract",
-            ));
-        }
-        let contract = serde_json::to_value(ArchiveContract::FullAttributes)
-            .map_err(|e| Error::Full(format!("virtio-fs contract: {e}")))?;
-        archive.insert("contract".to_owned(), contract);
+/// Validate external identities, aliases and role access before VM allocation.
+pub(super) fn validate_bindings(
+    meta: &FsMeta,
+    bindings: &[crate::snapshot_vm::checkpoint::ShareBinding],
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    if bindings.len() != meta.devices.len() {
+        return Err(Error::Invalid("share binding count differs"));
     }
-    if let Some(devices) = fs.get_mut("devices").and_then(|d| d.as_array_mut()) {
-        for device in devices.iter_mut().filter_map(|d| d.as_object_mut()) {
-            if device.contains_key("vm_owned") {
-                return Err(Error::Invalid(
-                    "a version 7 virtio-fs share records VM ownership",
-                ));
+    let mut references = HashMap::new();
+    let mut identities = HashMap::new();
+    for ((device, session), binding) in meta.devices.iter().zip(&meta.sessions).zip(bindings) {
+        check_source(&binding.root)?;
+        let mut objects = Vec::new();
+        if device.vm_owned {
+            if !binding.objects.is_empty() {
+                return Err(Error::Invalid("boot recipe cannot take external objects"));
             }
-            device.insert("vm_owned".to_owned(), serde_json::Value::Bool(false));
+            for saved in &session.objects {
+                let name = saved
+                    .recipe
+                    .as_deref()
+                    .ok_or(Error::Invalid("missing boot recipe"))?;
+                if !BOOT_DIRS.contains(&name) {
+                    return Err(Error::Invalid("unknown boot recipe"));
+                }
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                    .open(binding.root.join(name))?;
+                objects.push(RestoredObject {
+                    file,
+                    guest_ino: saved.guest_ino,
+                    ctime: saved.ctime,
+                });
+            }
+        } else {
+            if binding.objects.len() != session.objects.len() {
+                return Err(Error::Invalid("missing retained object FD"));
+            }
+            for (file, saved) in binding.objects.iter().zip(&session.objects) {
+                let st = file.metadata()?;
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 || flags & libc::O_PATH == 0 || st.mode() & libc::S_IFMT != saved.kind
+                {
+                    return Err(Error::Invalid(
+                        "retained object descriptor type or access differs",
+                    ));
+                }
+                let identity = (st.dev(), st.ino());
+                if references
+                    .insert(saved.alias, identity)
+                    .is_some_and(|old| old != identity)
+                    || identities
+                        .insert(identity, saved.alias)
+                        .is_some_and(|old| old != saved.alias)
+                {
+                    return Err(Error::Invalid(
+                        "external object aliases disagree across shares",
+                    ));
+                }
+                objects.push(RestoredObject {
+                    file: file.try_clone()?,
+                    guest_ino: saved.guest_ino,
+                    ctime: saved.ctime,
+                });
+            }
         }
-    }
-    if let Some(section) = fs.as_object_mut() {
-        if section.contains_key("exit_code") {
-            return Err(Error::Invalid(
-                "a version 7 virtio-fs section records an exit code",
-            ));
+        let root = std::fs::metadata(&binding.root)?;
+        if let Some(node) = session.state.nodes.iter().find(|n| n.inode == 1) {
+            let object = objects[node.object as usize].file.metadata()?;
+            if (root.dev(), root.ino()) != (object.dev(), object.ino()) {
+                return Err(Error::Invalid("bound root identity differs"));
+            }
         }
-        section.insert("exit_code".to_owned(), i32::MAX.into());
+        binding
+            .roles
+            .validate(&session.state, &objects)
+            .map_err(|e| Error::Full(e.to_string()))?;
     }
     Ok(())
 }
 
-/// The mode an owner restored from `meta` exports in, once this process
-/// passed the archive's importer check (before anything exists).
-pub(super) fn imported_mode(meta: &FsMeta) -> Result<ArchiveMode> {
-    let contract = &meta.archive.contract;
-    contract
-        .check_importer()
-        .map_err(|e| Error::Full(format!("virtio-fs: {e}")))?;
-    Ok(match contract {
-        ArchiveContract::FullAttributes => ArchiveMode::FullAttributes,
-        ArchiveContract::GuestVisible { .. } => ArchiveMode::GuestVisible,
-    })
-}
-
-/// Import the shares into the new directory `dir` from the three payloads
-/// at `file`'s position, consuming exactly their bytes. A failure removes
-/// whatever the import created.
-pub(super) fn import_shares(file: &File, meta: &FsMeta, dir: &Path) -> Result<ImportedArchive> {
-    let lengths = meta
-        .archive
-        .validate()
-        .map_err(|e| Error::Full(format!("virtio-fs: {e}")))?;
-    // Each clone shares the file position, so the payloads read in order.
-    let mut files = file.try_clone()?.take(lengths.files);
-    let mut init = file.try_clone()?.take(lengths.init);
-    let mut pages = file.try_clone()?.take(lengths.pages);
-    ImportedArchive::import(&meta.archive, dir, &mut files, &mut init, &mut pages)
-        .map_err(|e| Error::Full(format!("virtio-fs import: {e}")))
-}
-
-/// Rebuild every share at its fixed slot on the imported tree held in
-/// `vm.fs_import`: each DAX window is mapped and registered, each session
-/// restored (with its window) and each activated share restore-activated
-/// with a frozen worker, before any vCPU thread exists. The archive holds
-/// every device it restored until the import persists it.
-pub(super) fn restore(vm: &mut RamSnapshotVm, meta: &FsMeta) -> Result<()> {
-    restore_exit_code(meta, &vm.exit_code);
-    let mut archive = vm
-        .fs_import
-        .take()
-        .ok_or(Error::Invalid("virtio-fs shares were not imported"))?;
-    let restored = meta
+pub(super) fn restore_external(
+    vm: &mut RamSnapshotVm,
+    file: &mut File,
+    meta: &FsMeta,
+    bindings: Vec<crate::snapshot_vm::checkpoint::ShareBinding>,
+) -> Result<()> {
+    if bindings.len() != meta.devices.len() {
+        return Err(Error::Invalid("share binding count differs"));
+    }
+    vm.exit_code.store(meta.exit_code, Ordering::SeqCst);
+    for (index, ((device_meta, session), mut binding)) in meta
         .devices
         .iter()
+        .zip(&meta.sessions)
+        .zip(bindings)
         .enumerate()
-        .try_for_each(|(index, device)| restore_share(vm, &mut archive, index, device));
-    vm.fs_import = Some(archive);
-    restored
-}
-
-/// Each restored share's tag and imported root, except the VM-owned boot
-/// root, whose copy goes with the owner.
-pub(super) fn restored_roots(meta: &FsMeta, archive: &ImportedArchive) -> Vec<(String, PathBuf)> {
-    meta.devices
-        .iter()
-        .enumerate()
-        .filter(|(_, device)| !device.vm_owned)
-        .map(|(index, device)| (device.tag.clone(), archive.root(index).to_owned()))
-        .collect()
-}
-
-/// The restored owner continues from the exit code the image recorded.
-fn restore_exit_code(meta: &FsMeta, exit_code: &AtomicI32) {
-    exit_code.store(meta.exit_code, Ordering::SeqCst);
-}
-
-fn restore_share(
-    vm: &mut RamSnapshotVm,
-    archive: &mut ImportedArchive,
-    index: usize,
-    meta: &FsDeviceMeta,
-) -> Result<()> {
-    let dax = match meta.dax {
-        Some(range) => Some((range, add_window(vm, range)?)),
-        None => None,
-    };
-    let root = archive.root(index).to_owned();
-    let window = dax.map(|(range, backing)| vm.dax[backing].region(range.gpa));
-    let (device, transport) = new_device(
-        vm,
-        restored_share(meta, root.clone(), vm.exit_code.clone(), window),
-    )?;
-    archive.hold(device.clone());
-    let restored = restore_parts(&device, &transport, archive, index, meta)
-        .and_then(|()| wiring::register_device(vm, &transport, meta.mmio_addr, meta.irq));
-    if let Err(error) = restored {
-        discard(vm, &device, dax.map(|(_, backing)| backing));
-        return Err(error);
-    }
-    vm.fs.push(FsDevice {
-        device,
-        transport,
-        index,
-        tag: meta.tag.clone(),
-        read_only: meta.read_only,
-        allow_root_dir_delete: meta.allow_root_dir_delete,
-        vm_owned_root: owned_root(meta, root),
-        dax,
-    });
-    Ok(())
-}
-
-/// What a restored VM-owned share removes when the owner drops: only its
-/// imported `root`, never a source path.
-fn owned_root(meta: &FsDeviceMeta, root: PathBuf) -> Option<PathBuf> {
-    meta.vm_owned.then_some(root)
-}
-
-/// The device a restore creates for `meta` on its imported `root`: a
-/// VM-owned share keeps deferring the guest's removal request.
-fn restored_share<'a>(
-    meta: &'a FsDeviceMeta,
-    root: PathBuf,
-    exit_code: Arc<AtomicI32>,
-    window: Option<VirtioShmRegion>,
-) -> Share<'a> {
-    Share {
-        tag: &meta.tag,
-        root,
-        read_only: meta.read_only,
-        allow_root_dir_delete: meta.allow_root_dir_delete,
-        vm_owned: meta.vm_owned,
-        exit_code,
-        window,
-    }
-}
-
-/// Adopt the saved device, session and transport state; an activated
-/// share is restore-activated with its worker frozen.
-fn restore_parts(
-    device: &Arc<Mutex<Fs>>,
-    transport: &Arc<Mutex<MmioTransport>>,
-    archive: &ImportedArchive,
-    index: usize,
-    meta: &FsDeviceMeta,
-) -> Result<()> {
     {
-        let mut locked = device.lock().unwrap();
-        locked.set_acked_features(meta.device.acked_features);
-        locked
-            .restore_imported(archive, index)
-            .map_err(|e| Error::Full(format!("restore virtio-fs share {index}: {e}")))?;
-    }
-    let mut locked = transport.lock().unwrap();
-    locked.restore_transport_state(
-        &meta.transport,
-        meta.device
-            .queues
-            .iter()
-            .map(QueueState::to_queue)
-            .collect(),
-    );
-    if meta.device.activated {
-        locked
-            .activate_restored()
-            .map_err(|e| Error::Full(format!("restore-activate virtio-fs share {index}: {e:?}")))?;
+        let mut init = vec![0; session.init_len as usize];
+        file.read_exact(&mut init)?;
+        let mut pages = DaxPages {
+            offsets: session.dax_offsets.clone(),
+            data: vec![0; session.dax_offsets.len() * 4096],
+        };
+        file.read_exact(&mut pages.data)?;
+        if let Some(dax) = &session.state.dax {
+            pages
+                .validate(dax)
+                .map_err(|e| Error::Full(e.to_string()))?;
+        }
+        if device_meta.vm_owned {
+            if !binding.objects.is_empty() {
+                return Err(Error::Invalid("boot recipe cannot take external objects"));
+            }
+            // Caller creates this private empty root before sandboxing, with these known directories.
+            for object in &session.objects {
+                let name = object
+                    .recipe
+                    .as_deref()
+                    .ok_or(Error::Invalid("missing boot object recipe"))?;
+                if !BOOT_DIRS.contains(&name) {
+                    return Err(Error::Invalid("unknown boot object recipe"));
+                }
+                use std::os::unix::fs::OpenOptionsExt;
+                binding.objects.push(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                        .open(binding.root.join(name))?,
+                );
+            }
+        }
+        if binding.objects.len() != session.objects.len() {
+            return Err(Error::Invalid("missing retained object FD"));
+        }
+        let mut objects = Vec::new();
+        let mut identities = HashSet::new();
+        for (file, saved) in binding.objects.into_iter().zip(&session.objects) {
+            let st = file.metadata()?;
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0
+                || flags & libc::O_PATH == 0
+                || st.mode() & libc::S_IFMT != saved.kind
+                || !identities.insert((st.dev(), st.ino()))
+            {
+                return Err(Error::Invalid(
+                    "retained object FD type, alias or access mismatch",
+                ));
+            }
+            objects.push(RestoredObject {
+                file,
+                guest_ino: saved.guest_ino,
+                ctime: saved.ctime,
+            });
+        }
+        if let Some(root) = session.state.nodes.iter().find(|n| n.inode == 1) {
+            let supplied = objects[root.object as usize].file.metadata()?;
+            let expected = std::fs::metadata(&binding.root)?;
+            if (supplied.dev(), supplied.ino()) != (expected.dev(), expected.ino()) {
+                return Err(Error::Invalid(
+                    "supplied root object differs from bound share",
+                ));
+            }
+        }
+        let dax = device_meta
+            .dax
+            .map(|range| -> Result<_> { Ok((range, add_window(vm, range)?)) })
+            .transpose()?;
+        let window = dax.map(|(range, backing)| vm.dax[backing].region(range.gpa));
+        let root = binding.root.clone();
+        let (device, transport) = new_device(
+            vm,
+            Share {
+                tag: &device_meta.tag,
+                root,
+                read_only: device_meta.read_only,
+                allow_root_dir_delete: device_meta.allow_root_dir_delete,
+                vm_owned: device_meta.vm_owned,
+                exit_code: vm.exit_code.clone(),
+                window,
+            },
+        )?;
+        let result = (|| {
+            let mut locked = device.lock().unwrap();
+            locked.set_acked_features(device_meta.device.acked_features);
+            locked
+                .restore_session_with_roles(
+                    session.options,
+                    &session.state,
+                    objects,
+                    Arc::from(init),
+                    &pages,
+                    binding.roles,
+                )
+                .map_err(|e| Error::Full(e.to_string()))?;
+            drop(locked);
+            let mut locked = transport.lock().unwrap();
+            locked.restore_transport_state(
+                &device_meta.transport,
+                device_meta
+                    .device
+                    .queues
+                    .iter()
+                    .map(QueueState::to_queue)
+                    .collect(),
+            );
+            if device_meta.device.activated {
+                locked
+                    .activate_restored()
+                    .map_err(|e| Error::Full(format!("activate external share: {e:?}")))?;
+            }
+            drop(locked);
+            wiring::register_device(vm, &transport, device_meta.mmio_addr, device_meta.irq)
+        })();
+        if let Err(error) = result {
+            discard(vm, &device, dax.map(|(_, backing)| backing));
+            return Err(error);
+        }
+        if !device_meta.vm_owned {
+            vm.restored_shares
+                .push((device_meta.tag.clone(), binding.root.clone()));
+        }
+        vm.fs.push(FsDevice {
+            device,
+            transport,
+            index,
+            tag: device_meta.tag.clone(),
+            read_only: device_meta.read_only,
+            allow_root_dir_delete: device_meta.allow_root_dir_delete,
+            recipe_root: device_meta.vm_owned.then_some(binding.root.clone()),
+            vm_owned_root: None,
+            dax,
+        });
     }
     Ok(())
 }

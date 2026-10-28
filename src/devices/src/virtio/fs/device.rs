@@ -283,6 +283,32 @@ impl Fs {
         init_binary: Arc<[u8]>,
         dax_pages: &DaxPages,
     ) -> Result<(), PassthroughSnapshotError> {
+        self.restore_session_impl(options, state, objects, init_binary, dax_pages, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn restore_session_with_roles(
+        &mut self,
+        options: u64,
+        state: &PassthroughState,
+        objects: Vec<RestoredObject>,
+        init_binary: Arc<[u8]>,
+        dax_pages: &DaxPages,
+        roles: passthrough::RestoredRoles,
+    ) -> Result<(), PassthroughSnapshotError> {
+        self.restore_session_impl(options, state, objects, init_binary, dax_pages, Some(roles))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_session_impl(
+        &mut self,
+        options: u64,
+        state: &PassthroughState,
+        objects: Vec<RestoredObject>,
+        init_binary: Arc<[u8]>,
+        dax_pages: &DaxPages,
+        roles: Option<passthrough::RestoredRoles>,
+    ) -> Result<(), PassthroughSnapshotError> {
         if self.dax_lost {
             return Err(PassthroughSnapshotError::DaxLost);
         }
@@ -306,13 +332,14 @@ impl Fs {
             ));
         }
         let served = init_binary.clone();
-        let server = FsServer::restored(
+        let server = FsServer::restored_with_roles(
             self.passthrough_cfg.clone(),
             self.read_only,
             options,
             state,
             objects,
             init_binary,
+            roles,
         )?;
         if let Some(window) = window {
             if let Err(e) = server.passthrough().map_dax(window, dax_pages) {
@@ -325,6 +352,33 @@ impl Fs {
         // A reset device serves the same init.krun again.
         self.passthrough_cfg.init_binary = Some(served);
         Ok(())
+    }
+
+    /// Capture only retained session objects, init bytes and anonymous DAX pages.
+    #[cfg(target_os = "linux")]
+    pub fn checkpoint_external(&self) -> Result<FsSessionCheckpoint, PassthroughSnapshotError> {
+        if self.retired || self.dax_lost {
+            return Err(PassthroughSnapshotError::Invalid(
+                "device retired or DAX lost",
+            ));
+        }
+        let server = self.server.as_deref().or(self.restored_server.as_ref());
+        if let Some(server) = server {
+            return Ok(FsSessionCheckpoint {
+                options: server.options(),
+                passthrough: server
+                    .passthrough()
+                    .checkpoint_with_dax(self.dax_window())?,
+            });
+        }
+        let fs = passthrough::PassthroughFs::new(passthrough::Config {
+            proc_sfd_rawfd: None,
+            ..self.passthrough_cfg.clone()
+        })?;
+        Ok(FsSessionCheckpoint {
+            options: 0,
+            passthrough: fs.checkpoint_with_dax(self.dax_window())?,
+        })
     }
 
     /// This share as an archive source (see `passthrough::ShareArchive`):

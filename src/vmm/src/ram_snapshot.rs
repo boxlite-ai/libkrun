@@ -23,7 +23,7 @@ pub(crate) use lifecycle::{ExitWaiter, RunState};
 // Callers of the private API name `DaxRange` for `FsShareConfig::dax`; so
 // far only its tests do.
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use virtio_fs::{ArchiveMode, DaxRange, FsShareConfig};
+pub(crate) use virtio_fs::{DaxRange, FsShareConfig};
 pub(crate) use vsock::VsockPorts;
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
@@ -39,7 +39,7 @@ mod console;
 mod event_devices;
 mod events;
 pub(crate) mod execution;
-mod full;
+pub(crate) mod full;
 mod legacy;
 mod lifecycle;
 mod virtio_fs;
@@ -416,8 +416,6 @@ impl CreatedName {
 /// resource, is rejected before anything is created.
 #[derive(Default)]
 pub(crate) struct RestoreResources {
-    /// New directory for the imported disk segments; created exclusively.
-    pub(crate) disk_dir: Option<PathBuf>,
     /// Freshly started UnixStream backend for the NIC.
     pub(crate) nic_socket: Option<PathBuf>,
     /// Fresh endpoints of the four legacy serial ports (COM1–COM4), in
@@ -429,10 +427,6 @@ pub(crate) struct RestoreResources {
     pub(crate) vsock_ports: Option<VsockPorts>,
     /// The console's fresh endpoints.
     pub(crate) console_ports: Option<ConsoleEndpoints>,
-    /// New directory for the imported virtio-fs shares: an absolute path
-    /// without NUL bytes, created exclusively with mode 0700 and kept once
-    /// the import succeeds.
-    pub(crate) fs_dir: Option<PathBuf>,
 }
 
 /// The endpoints a restored console takes.
@@ -462,11 +456,9 @@ pub(crate) struct RamSnapshotVm {
     /// Port-I/O bus: empty unless the legacy devices are attached.
     io_bus: devices::Bus,
     legacy: Option<legacy::Legacy>,
-    exit: Arc<events::Exit>,
+    pub(crate) exit: Arc<events::Exit>,
     #[cfg(feature = "blk")]
     disks: Vec<blk::BlkDevice>,
-    #[cfg(feature = "blk")]
-    imported: Option<blk::ImportedDir>,
     #[cfg(all(feature = "blk", feature = "net"))]
     nic: Option<nic::NicDevice>,
     rng: Option<events::EventDevice<devices::virtio::Rng>>,
@@ -476,14 +468,12 @@ pub(crate) struct RamSnapshotVm {
     events: Option<events::EventThread>,
     /// virtio-fs shares in index order.
     fs: Vec<virtio_fs::FsDevice>,
-    /// The imported shares' tree until the import that created it succeeds.
-    fs_import: Option<devices::virtio::fs::passthrough::ImportedArchive>,
+    /// Retained-object preparation for the current frozen cut.
+    prepared: Option<virtio_fs::CapturedShares>,
+    pub(crate) capture_abort: Arc<std::sync::atomic::AtomicBool>,
     /// The caller declared every host writer of the shares stopped; held
     /// through a pause, cleared by resume and disable.
     host_writers_stopped: bool,
-    /// How exports archive the shares: full attributes unless set before
-    /// vCPU start; an imported owner keeps its image's mode.
-    fs_archive_mode: ArchiveMode,
     /// Every DAX window the owner mapped, in memslot order. Declared after
     /// `vm`: a window is unmapped only after the VM fd (and its memslot)
     /// closed.
@@ -496,7 +486,7 @@ pub(crate) struct RamSnapshotVm {
     exit_code: Arc<AtomicI32>,
     /// The exit status, fixed the first time an ended guest is examined.
     exit_status: Option<i32>,
-    /// Each imported share's tag and root copy, except a VM-owned one.
+    /// Each imported external share's tag and bound root.
     restored_shares: Vec<(String, PathBuf)>,
 }
 
@@ -531,8 +521,6 @@ impl RamSnapshotVm {
             exit,
             #[cfg(feature = "blk")]
             disks: Vec::new(),
-            #[cfg(feature = "blk")]
-            imported: None,
             #[cfg(all(feature = "blk", feature = "net"))]
             nic: None,
             rng: None,
@@ -541,9 +529,9 @@ impl RamSnapshotVm {
             console: None,
             events: None,
             fs: Vec::new(),
-            fs_import: None,
+            prepared: None,
+            capture_abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_writers_stopped: false,
-            fs_archive_mode: ArchiveMode::FullAttributes,
             dax: Vec::new(),
             execution,
             exit_code: Arc::new(AtomicI32::new(i32::MAX)),
@@ -584,14 +572,7 @@ impl RamSnapshotVm {
 
     /// Hand an import's disk directory and files over to the caller: the
     /// owner never removes them anymore.
-    #[cfg(feature = "blk")]
-    pub(crate) fn hand_over_imported_disks(&mut self) {
-        if let Some(imported) = self.imported.take() {
-            imported.hand_over();
-        }
-    }
-
-    /// Each imported share's tag and the root of its copy, in share order,
+    /// Each imported external share's tag and bound root, in share order,
     /// except the VM-owned boot root (removed with the owner); empty unless
     /// imported.
     pub(crate) fn restored_shares(&self) -> &[(String, PathBuf)] {
@@ -652,21 +633,6 @@ impl RamSnapshotVm {
     /// `FsShareConfig`. Every check precedes any effect.
     pub(crate) fn attach_fs(&mut self, config: FsShareConfig) -> Result<()> {
         virtio_fs::attach(self, config)
-    }
-
-    /// Choose how exports archive the virtio-fs shares, before vCPUs start
-    /// (see `passthrough::ArchiveContract`): full attributes, the default,
-    /// needs CAP_SYS_ADMIN in the initial user namespace at export;
-    /// guest-visible works without privilege, records the effective IDs
-    /// the export runs with, and an import needs exactly those.
-    pub(crate) fn set_fs_archive_mode(&mut self, mode: ArchiveMode) -> Result<()> {
-        if self.control.unusable || !self.handles.is_empty() {
-            return Err(Error::Invalid(
-                "the virtio-fs archive mode is set only before vCPU start of a usable owner",
-            ));
-        }
-        self.fs_archive_mode = mode;
-        Ok(())
     }
 
     /// Declare that the caller stopped every host writer of the virtio-fs
@@ -915,16 +881,16 @@ impl RamSnapshotVm {
 
 impl Drop for RamSnapshotVm {
     fn drop(&mut self) {
-        // The imported guards remove only the files they created, after
-        // every thread has exited; the DAX windows unmap after the VM fd
+        // Every thread exits before devices drop; DAX windows unmap after the VM fd
         // closed (field order). A VM-owned share root goes only now: the
         // guest may run until the VM ends.
         self.stop_threads();
         virtio_fs::remove_vm_owned_roots(&self.fs);
-        #[cfg(feature = "blk")]
-        drop(self.imported.take());
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "blk"))]
+mod test_fixture;

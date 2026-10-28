@@ -73,7 +73,7 @@ enum Command {
 /// (a failed DAX window remapping) one of `failure`; only the event thread
 /// reads them and latches `exiting` (and `failed`), which is never
 /// cleared: an exiting owner takes no further snapshot or resume.
-pub(super) struct Exit {
+pub(crate) struct Exit {
     evt: EventFd,
     failure: EventFd,
     exiting: AtomicBool,
@@ -103,7 +103,7 @@ impl Exit {
 
     /// An eventfd a fatal host-side failure writes: it ends guest execution
     /// like an exit, but without a guest exit status.
-    pub(super) fn failure_notifier(&self) -> Result<EventFd> {
+    pub(crate) fn failure_notifier(&self) -> Result<EventFd> {
         Ok(self.failure.try_clone()?)
     }
 

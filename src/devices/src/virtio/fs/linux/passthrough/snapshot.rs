@@ -74,6 +74,12 @@ pub struct DirListEntry {
     pub ino: u64,
     /// The `DT_*` type the host reported.
     pub type_: u32,
+    /// This saved name still denoted its projected object at capture.
+    #[serde(default)]
+    pub projected: bool,
+    /// Present only when a node/handle/DAX mapping retains that object.
+    #[serde(default)]
+    pub object: Option<u64>,
 }
 
 /// One FUSE node the guest holds.
@@ -100,7 +106,7 @@ pub struct HandleState {
     /// may be unlinked).
     pub object: u64,
     /// The flags the host descriptor was opened with, without creation
-    /// flags; a restore reopens the object with exactly these.
+    /// flags; a restore supplies an access description with these status flags.
     pub flags: i32,
     /// The directory list, once the guest read the stream.
     pub listing: Option<Vec<DirListEntry>>,
@@ -127,7 +133,7 @@ pub struct PassthroughState {
 }
 
 /// A host object referenced by a checkpoint, deduplicated by host identity.
-/// Never serialized: the caller archives it and drops the descriptor.
+/// Never serialized: the provider associates it with an external retained object.
 pub struct SnapshotObject {
     /// A duplicate of the share's descriptor for the object: the node's
     /// `O_PATH` descriptor, the open handle for an object only a handle
@@ -164,6 +170,66 @@ pub struct RestoredObject {
     pub guest_ino: u64,
     /// The ctime the guest saw; reported until the object really changes.
     pub ctime: (i64, i64),
+}
+
+/// Independently opened access descriptions supplied by the recovery provider.
+/// Keys are saved handle IDs and (object index, writable) DAX roles.
+/// Handle flags must match the saved status exactly, including O_NOATIME.
+/// Receiving an open description does not require the capabilities needed to
+/// reopen it; only the fallback reopen path normalizes capability-based flags.
+#[derive(Default)]
+pub struct RestoredRoles {
+    pub handles: BTreeMap<u64, File>,
+    pub dax: BTreeMap<(u64, bool), File>,
+}
+
+impl RestoredRoles {
+    /// Check every access description before any session or mapping exists.
+    pub fn validate(
+        &self,
+        state: &PassthroughState,
+        objects: &[RestoredObject],
+    ) -> Result<(), PassthroughSnapshotError> {
+        state.validate(objects.len())?;
+        let handles: BTreeSet<_> = state.handles.iter().map(|h| h.handle).collect();
+        let dax: BTreeSet<_> = state
+            .dax
+            .iter()
+            .flat_map(|d| &d.mappings)
+            .filter_map(|m| match m.kind {
+                DaxMappingKind::File {
+                    object, writable, ..
+                } => Some((object, writable)),
+                _ => None,
+            })
+            .collect();
+        if self.handles.keys().copied().collect::<BTreeSet<_>>() != handles
+            || self.dax.keys().copied().collect::<BTreeSet<_>>() != dax
+        {
+            return Err(PassthroughSnapshotError::Invalid(
+                "supplied role FD count differs",
+            ));
+        }
+        for handle in &state.handles {
+            validate_role(
+                &self.handles[&handle.handle],
+                &objects[handle.object as usize].file,
+                handle.flags,
+            )?;
+        }
+        for (&(index, writable), file) in &self.dax {
+            validate_role(
+                file,
+                &objects[index as usize].file,
+                if writable {
+                    libc::O_RDWR
+                } else {
+                    libc::O_RDONLY
+                },
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Why a share cannot be checkpointed or restored.
@@ -534,6 +600,8 @@ impl PassthroughFs {
                 ino: inos.project((dev, host_ino), |ino| self.host_ino_is_live(ino)),
                 name,
                 type_,
+                projected: false,
+                object: None,
             })
             .collect())
     }
@@ -729,6 +797,32 @@ impl PassthroughFs {
                 ino: key.1,
             });
         }
+        // Resolve only names already in cached streams; never enumerate here.
+        for handle in &mut handle_states {
+            let Some(listing) = &mut handle.listing else {
+                continue;
+            };
+            let directory = &objects[handle.object as usize].file;
+            for entry in listing {
+                entry.projected = false;
+                entry.object = None;
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                if let Some(file) = listed_file(directory, &entry.name)? {
+                    let st = stat(&file)?;
+                    let key = (st.st_dev, st.st_ino);
+                    entry.projected =
+                        inos.project(key, |ino| self.host_ino_is_live(ino)) == entry.ino;
+                    if entry.projected {
+                        entry.object = objects
+                            .iter()
+                            .position(|o| (o.dev, o.ino) == key)
+                            .map(|i| i as u64);
+                    }
+                }
+            }
+        }
         Ok(PassthroughCheckpoint {
             state: PassthroughState {
                 writeback: self.writeback.load(Ordering::Relaxed),
@@ -757,6 +851,28 @@ impl PassthroughFs {
         state: &PassthroughState,
         objects: Vec<RestoredObject>,
         init_binary: Arc<[u8]>,
+    ) -> Result<PassthroughFs, PassthroughSnapshotError> {
+        Self::restore_impl(cfg, state, objects, init_binary, None)
+    }
+
+    /// Restore without reopening any retained object through procfs.
+    pub fn restore_with_roles(
+        cfg: Config,
+        state: &PassthroughState,
+        objects: Vec<RestoredObject>,
+        init_binary: Arc<[u8]>,
+        roles: RestoredRoles,
+    ) -> Result<PassthroughFs, PassthroughSnapshotError> {
+        roles.validate(state, &objects)?;
+        Self::restore_impl(cfg, state, objects, init_binary, Some(roles))
+    }
+
+    fn restore_impl(
+        cfg: Config,
+        state: &PassthroughState,
+        objects: Vec<RestoredObject>,
+        init_binary: Arc<[u8]>,
+        mut roles: Option<RestoredRoles>,
     ) -> Result<PassthroughFs, PassthroughSnapshotError> {
         if !cfg.snapshot {
             return Err(PassthroughSnapshotError::Disabled);
@@ -827,16 +943,75 @@ impl PassthroughFs {
         }
 
         for handle in &state.handles {
+            let Some(listing) = &handle.listing else {
+                continue;
+            };
+            for entry in listing {
+                if !entry.projected {
+                    continue;
+                }
+                if entry.name == b"." || entry.name == b".." {
+                    return Err(PassthroughSnapshotError::Invalid("projected dot entry"));
+                }
+                if let Some(file) = listed_file(&objects[handle.object as usize].file, &entry.name)?
+                {
+                    let (st, mount) = statx(&file)?;
+                    if Some(mount) != root_mnt {
+                        return Err(PassthroughSnapshotError::Invalid(
+                            "listed entry on another mount",
+                        ));
+                    }
+                    if let Some(index) = entry.object {
+                        let object = objects.get(index as usize).ok_or(
+                            PassthroughSnapshotError::Invalid("listed object out of range"),
+                        )?;
+                        let other = stat(&object.file)?;
+                        if (st.st_dev, st.st_ino, entry.ino)
+                            != (other.st_dev, other.st_ino, object.guest_ino)
+                        {
+                            return Err(PassthroughSnapshotError::Invalid(
+                                "listed object identity differs",
+                            ));
+                        }
+                    }
+                    let key = (st.st_dev, st.st_ino);
+                    let inos = fs.inos.get_mut().unwrap();
+                    if !inos.to_guest.contains_key(&key) {
+                        // reserve() above intentionally left no host identity.
+                        inos.reserved.remove(&entry.ino);
+                        inos.restore_object(
+                            key,
+                            entry.ino,
+                            (st.st_ctime, st.st_ctime_nsec),
+                            (st.st_ctime, st.st_ctime_nsec),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        for handle in &state.handles {
             let object = handle.object as usize;
             if Some(identities[object].1) != root_mnt {
                 return Err(PassthroughSnapshotError::HostSubmount(handle.inode));
             }
             let mut flags = handle.flags;
-            if !fs.cap_fowner {
-                // As in do_open: O_NOATIME needs CAP_FOWNER or ownership.
-                flags &= !libc::O_NOATIME;
-            }
-            let file = fs.reopen(&objects[object].file, flags)?;
+            let file = match &mut roles {
+                Some(roles) => {
+                    let file = roles.handles.remove(&handle.handle).ok_or(
+                        PassthroughSnapshotError::Invalid("missing supplied handle FD"),
+                    )?;
+                    validate_role(&file, &objects[object].file, flags)?;
+                    file
+                }
+                None => {
+                    if !fs.cap_fowner {
+                        // As in do_open, normalize only when opening a new FD.
+                        flags &= !libc::O_NOATIME;
+                    }
+                    fs.reopen(&objects[object].file, flags)?
+                }
+            };
             fs.handles.get_mut().unwrap().insert(
                 handle.handle,
                 Arc::new(HandleData {
@@ -862,11 +1037,41 @@ impl PassthroughFs {
                 } else {
                     libc::O_RDONLY
                 };
-                Ok(fs.reopen(&objects[object].file, flags)?)
+                match &roles {
+                    Some(roles) => {
+                        let file = roles
+                            .dax
+                            .get(&(object as u64, writable))
+                            .ok_or(PassthroughSnapshotError::Invalid("missing supplied DAX FD"))?;
+                        validate_role(file, &objects[object].file, flags)?;
+                        Ok(file.try_clone()?)
+                    }
+                    None => Ok(fs.reopen(&objects[object].file, flags)?),
+                }
             })?;
             *fs.dax.get_mut().unwrap() = ledger;
         }
 
+        if let Some(roles) = &roles {
+            let expected: BTreeSet<_> = state
+                .dax
+                .iter()
+                .flat_map(|d| &d.mappings)
+                .filter_map(|m| match m.kind {
+                    DaxMappingKind::File {
+                        object, writable, ..
+                    } => Some((object, writable)),
+                    _ => None,
+                })
+                .collect();
+            if !roles.handles.is_empty()
+                || roles.dax.keys().copied().collect::<BTreeSet<_>>() != expected
+            {
+                return Err(PassthroughSnapshotError::Invalid(
+                    "unexpected supplied role FD",
+                ));
+            }
+        }
         fs.writeback.store(state.writeback, Ordering::Relaxed);
         fs.announce_submounts
             .store(state.announce_submounts, Ordering::Relaxed);
@@ -921,4 +1126,57 @@ mod tests {
             Err(PassthroughSnapshotError::Invalid(_))
         ));
     }
+}
+
+/// Require the exact object and open status, never creation/truncation or O_PATH.
+fn validate_role(file: &File, object: &File, flags: i32) -> Result<(), PassthroughSnapshotError> {
+    let (got, mount) = statx(file)?;
+    let (expected, expected_mount) = statx(object)?;
+    let actual = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if actual < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // Linux reports O_LARGEFILE even when the caller did not request it.
+    let mask = libc::O_ACCMODE
+        | libc::O_APPEND
+        | libc::O_NONBLOCK
+        | libc::O_DSYNC
+        | libc::O_SYNC
+        | libc::O_DIRECT
+        | libc::O_NOATIME
+        | libc::O_DIRECTORY
+        | libc::O_ASYNC;
+    if (got.st_dev, got.st_ino, mount) != (expected.st_dev, expected.st_ino, expected_mount)
+        || actual & libc::O_PATH != 0
+        || (actual & mask) != (flags & mask)
+    {
+        return Err(PassthroughSnapshotError::Invalid(
+            "supplied role FD identity or flags differ",
+        ));
+    }
+    Ok(())
+}
+
+fn listed_file(directory: &File, name: &[u8]) -> io::Result<Option<File>> {
+    if !valid_name(name) || name == b"." || name == b".." {
+        return Err(einval());
+    }
+    let name = CString::new(name).map_err(|_| einval())?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ENOENT) {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+    use std::os::fd::FromRawFd;
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
 }

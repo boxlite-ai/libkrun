@@ -18,13 +18,6 @@ use vm_memory::{Bytes, GuestAddress};
 // Every test name contains "snapshot" so `make snapshot-test` selects them
 // through the cargo filter.
 
-fn disks_at(dir: &Path) -> RestoreResources {
-    RestoreResources {
-        disk_dir: Some(dir.to_owned()),
-        ..Default::default()
-    }
-}
-
 // Guest layout (guest RAM): code 0x1000, handler 0x1400, GDT 0x500, IVT
 // entry 0x100, request header 0xA000, data buffer 0xB000 (512), status byte
 // 0xB700, counters: requests 0xB800, boot marker 0xB802, interrupts 0xB804,
@@ -590,150 +583,122 @@ fn snapshot_disks(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
     (raw, qcow2, backing)
 }
 
+/// Preserve guest block-I/O and pending-IRQ assertions through direct QCOW2 restore.
 #[test]
-fn blk_snapshot_restores_readonly_qcow2_backing_without_sources() {
+fn blk_snapshot_v9_pending_interrupt_and_qcow2_io_continue() {
+    use crate::snapshot_vm::checkpoint::{ExportMetadata, ImportBindings};
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = TempDir::new();
-    let (raw, qcow2, backing) = snapshot_disks(&dir);
-    let readonly = dir.path("d1-readonly.raw");
-    raw_disk(&readonly, 512 * 1024, |image| image.fill(0x5B));
-    let mut vm = guest_vm(
-        &[
-            (raw.clone(), ImageType::Raw, false),
-            (readonly.clone(), ImageType::Raw, true),
-            (qcow2.clone(), ImageType::Qcow2, false),
-        ],
-        true,
-    );
-    // Early requests include reads, writes and flushes with interrupts on.
-    let before = wait_requests(&vm, 9);
-    assert!(
-        read_u16(&vm, 0xB804) >= 1,
-        "no block interrupt was taken before the cut"
-    );
-    // Park at the barrier: request index BARRIER_REQUEST-1 (phase
-    // (BARRIER_REQUEST-1) % 3 == 1) is a WRITE whose 0x41 +
-    // (BARRIER_REQUEST-1) pattern is the last completed guest write at the
-    // cut, completed with IF=0 so its IRQ is pending.
-    let at_barrier = wait_barrier(&vm);
-    assert_eq!(at_barrier, BARRIER_REQUEST as u16);
-    let snapshot = dir.path("checkpoint");
-    vm.pause().unwrap();
-    vm.export(&snapshot).unwrap();
-    // Long offline pause before the source is destroyed.
-    std::thread::sleep(Duration::from_millis(200));
-    drop(vm);
-    fs::remove_file(&raw).unwrap();
-    fs::remove_file(&readonly).unwrap();
-    fs::remove_file(&qcow2).unwrap();
-    fs::remove_file(&backing).unwrap();
-
-    let destination = dir.path("imported");
-    let mut restored = RamSnapshotVm::import(&snapshot, disks_at(&destination)).unwrap();
-    let dir_mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
-    assert_eq!(dir_mode, 0o700);
-    let file_mode = fs::metadata(destination.join("disk-0.raw"))
+    let disk = dir.path("source.qcow2");
+    assert!(std::process::Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2"])
+        .arg(&disk)
+        .arg("1M")
+        .status()
         .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(file_mode, 0o600);
-    // Same cut, read from the restored paused memory: no request was lost,
-    // no cold reboot happened and the cut is not behind the observed state.
-    let saved = read_u16(&restored, 0xB800);
-    assert!(
-        saved >= before,
-        "restored cut is behind the observed source"
-    );
-    assert_eq!(read_u16(&restored, 0xB802), 1, "guest rebooted");
-    assert_eq!(
-        restored
-            .memory
-            .read_obj::<u32>(GuestAddress(0xB806))
-            .unwrap(),
-        2048,
-        "guest-visible capacity was not preserved"
-    );
-    let interrupts = read_u16(&restored, 0xB804);
-    assert_eq!(read_u16(&restored, 0xB814), 1, "guest not parked at cut");
-    assert_eq!(read_u16(&restored, 0xB815), 0);
-    // Stable disk content, asserted BEFORE the resume while nothing runs:
-    // every WRITE targets sector 0 and the barrier write (pattern 0x41 +
-    // (BARRIER_REQUEST-1)) is the last completed one, so the whole sector
-    // is that pattern; sector 1 still carries the read-source pattern.
-    let disk0 = fs::read(destination.join("disk-0.raw")).unwrap();
-    let barrier_pattern = 0x41u8.wrapping_add(BARRIER_REQUEST - 1);
-    assert!(
-        disk0[..512].iter().all(|byte| *byte == barrier_pattern),
-        "the barrier write is not the stable captured sector 0"
-    );
-    assert!(disk0[512..1024].iter().all(|byte| *byte == 0xC7));
-    // Release the barrier and resume: the pending IRQ is proven delivered
-    // by the guest's own post-STI marker before any new request runs.
-    restored
-        .memory
-        .write_obj(1u8, GuestAddress(0xB815))
-        .unwrap();
-    restored.resume().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while read_u16(&restored, 0xB816) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the pending interrupt was not delivered after the cut"
-        );
-        std::thread::yield_now();
-    }
-    assert!(read_u16(&restored, 0xB804) > interrupts);
-    // Continuation: reads, writes and flushes keep completing past the cut.
-    wait_requests(&restored, saved + 9);
-    let disk1 = fs::read(destination.join("disk-1.raw")).unwrap();
-    assert!(disk1.iter().all(|byte| *byte == 0x5B));
-    let disk2 = fs::read(destination.join("disk-2.raw")).unwrap();
-    assert!(
-        disk2.iter().take(4096).all(|byte| *byte == 0x77),
-        "qcow2 backing chain was not flattened into the segment"
-    );
-    drop(restored);
-    assert!(!destination.exists(), "imported disks survived the owner");
-}
-
-#[test]
-fn blk_snapshot_pending_interrupt_barrier_survives_cut_and_restores() {
-    let dir = TempDir::new();
-    let (raw, _qcow2, _backing) = snapshot_disks(&dir);
-    let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], true);
-    // The guest parks in the barrier with IF=0 right after request
-    // BARRIER_REQUEST completes; its interrupt is pending in the irqchip.
+        .success());
+    // The original guest fixture checks sector 1 for 0xc7 before its write/flush loop.
+    assert!(std::process::Command::new("qemu-io")
+        .args(["-f", "qcow2", "-c", "write -P 0xc7 512 512"])
+        .arg(&disk)
+        .status()
+        .unwrap()
+        .success());
+    let mut vm = guest_vm(&[(disk.clone(), ImageType::Qcow2, false)], true);
     let at_barrier = wait_barrier(&vm);
     assert!(at_barrier >= BARRIER_REQUEST as u16);
     let interrupts_before = read_u16(&vm, 0xB804);
-    let snapshot = dir.path("checkpoint");
     vm.pause().unwrap();
-    vm.export(&snapshot).unwrap();
     let cut_requests = read_u16(&vm, 0xB800);
     let cut_interrupts = read_u16(&vm, 0xB804);
     assert_eq!(cut_interrupts, interrupts_before);
-    // The source must still be in the barrier (release byte untouched).
     assert_eq!(read_u16(&vm, 0xB815), 0);
-    // A paused source exports the same cut again.
-    vm.export(&dir.path("again")).unwrap();
-    assert_eq!(read_u16(&vm, 0xB800), cut_requests);
+    for name in ["checkpoint", "again"] {
+        vm.prepare_checkpoint().unwrap();
+        let memory = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.path(name))
+            .unwrap();
+        fs::copy(&disk, dir.path(&format!("{name}.qcow2"))).unwrap();
+        let qcow2 = File::open(dir.path(&format!("{name}.qcow2"))).unwrap();
+        vm.export_fd(
+            memory,
+            qcow2,
+            ExportMetadata {
+                application_schema: 1,
+                application: serde_json::Value::Null,
+                objects: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(read_u16(&vm, 0xB800), cut_requests);
+    }
+    // Mutated metadata comes from the actual activated device boundary.
+    let regions = vm.topology.regions(&vm.memory).unwrap();
+    let captured = capture_disks(&vm, &vm.pause.as_ref().unwrap().disks, &regions).unwrap();
+    let original = serde_json::to_value(&captured).unwrap();
+    for (path, replacement) in [
+        ("/0/irq", serde_json::json!(0)),
+        ("/0/mmio_addr", serde_json::json!(0)),
+        ("/0/mmio_len", serde_json::json!(1)),
+        ("/0/device_id", serde_json::json!("")),
+        ("/0/disk_bytes", serde_json::json!(0)),
+        ("/0/config/0", serde_json::json!(1)),
+        ("/0/image_id", serde_json::json!([])),
+        ("/0/device/avail_features", serde_json::json!(0)),
+        ("/0/device/queues/0/max_size", serde_json::json!(1024)),
+        ("/0/transport/device_status", serde_json::json!(0)),
+    ] {
+        let mut value = original.clone();
+        *value.pointer_mut(path).unwrap() = replacement;
+        let bad: Vec<DiskMeta> = serde_json::from_value(value).unwrap();
+        assert!(
+            validate_disk_metadata(&bad, &regions).is_err(),
+            "accepted bad {path}"
+        );
+    }
+    let mut bad: Vec<DiskMeta> = serde_json::from_value(original).unwrap();
+    bad[0].device.queues[0].desc_table = 1 << 40;
+    validate_disk_metadata(&bad, &regions).unwrap();
+    assert!(
+        validate_disk_rings(&bad, &vm.memory).is_err(),
+        "block ring outside RAM accepted"
+    );
+    let mut bad: Vec<DiskMeta> =
+        serde_json::from_value(serde_json::to_value(&captured).unwrap()).unwrap();
+    for size in [3, 7, 1024] {
+        bad[0].device.queues[0].size = size;
+        assert!(
+            validate_disk_rings(&bad, &vm.memory).is_err(),
+            "invalid size {size} accepted at loaded RAM boundary"
+        );
+    }
     drop(vm);
-    fs::remove_file(&raw).unwrap();
-
-    let destination = dir.path("imported");
-    let mut restored = RamSnapshotVm::import(&snapshot, disks_at(&destination)).unwrap();
-    // Exact RAM fidelity of the barrier state.
+    fs::remove_file(&disk).unwrap();
+    fs::copy(dir.path("checkpoint.qcow2"), dir.path("owned.qcow2")).unwrap();
+    let qcow2 = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path("owned.qcow2"))
+        .unwrap();
+    let mut restored = RamSnapshotVm::import_fd(
+        File::open(dir.path("checkpoint")).unwrap(),
+        ImportBindings {
+            disks: vec![qcow2],
+            shares: vec![],
+        },
+        RestoreResources::default(),
+    )
+    .unwrap();
     assert_eq!(read_u16(&restored, 0xB800), cut_requests);
     assert_eq!(read_u16(&restored, 0xB804), cut_interrupts);
     assert_eq!(read_u16(&restored, 0xB814), 1);
     assert_eq!(read_u16(&restored, 0xB815), 0);
-    // The delivered marker is still clear: nothing but the post-STI proof
-    // stage sets it, and that stage runs only after the release.
     assert_eq!(read_u16(&restored, 0xB816), 0);
-    // Release the barrier and resume: the guest's own post-STI proof stage
-    // spins until the pending IRQ is actually delivered — no new request is
-    // submitted there, so the delivered marker can only be set by the
-    // pending interrupt surviving the cut.
     restored
         .memory
         .write_obj(1u8, GuestAddress(0xB815))
@@ -743,229 +708,11 @@ fn blk_snapshot_pending_interrupt_barrier_survives_cut_and_restores() {
     while read_u16(&restored, 0xB816) == 0 {
         assert!(
             Instant::now() < deadline,
-            "the pending interrupt was not delivered after the cut"
+            "pending interrupt lost across checkpoint"
         );
         std::thread::yield_now();
     }
     assert!(read_u16(&restored, 0xB804) > cut_interrupts);
-    // And the guest keeps making progress across all request types.
     wait_requests(&restored, cut_requests + 9);
-    drop(restored);
-    assert!(!destination.exists());
-}
-
-#[test]
-fn blk_snapshot_rejects_malformed_metadata_and_truncated_segments() {
-    let dir = TempDir::new();
-    let (raw, _qcow2, _backing) = snapshot_disks(&dir);
-    let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
-    wait_requests(&vm, 6);
-    let snapshot = dir.path("checkpoint");
-    vm.pause().unwrap();
-    vm.export(&snapshot).unwrap();
-    drop(vm);
-    let valid = fs::read(&snapshot).unwrap();
-    let destination = || dir.path("import-target");
-
-    // A disk-bearing image needs a destination for its segments.
-    let error = match RamSnapshotVm::import(&snapshot, RestoreResources::default()) {
-        Err(error) => error,
-        Ok(_) => panic!("import must reject a disk image without a destination"),
-    };
-    assert!(error.to_string().contains("disk directory"), "{error}");
-
-    // Truncated segment: the exact-length check fails before creation.
-    let truncated = dir.path("truncated");
-    fs::write(&truncated, &valid[..valid.len() - 512]).unwrap();
-    assert!(RamSnapshotVm::import(&truncated, disks_at(&destination())).is_err());
-    assert!(!destination().exists());
-
-    // Corrupt magic and unknown versions are rejected.
-    let mut bad_magic = valid.clone();
-    bad_magic[3] = b'X';
-    let bad_magic_path = dir.path("bad-magic");
-    fs::write(&bad_magic_path, &bad_magic).unwrap();
-    assert!(RamSnapshotVm::import(&bad_magic_path, disks_at(&destination())).is_err());
-    let mut bad_version = valid.clone();
-    bad_version[8..12].copy_from_slice(&8u32.to_le_bytes());
-    let bad_version_path = dir.path("bad-version");
-    fs::write(&bad_version_path, &bad_version).unwrap();
-    assert!(RamSnapshotVm::import(&bad_version_path, disks_at(&destination())).is_err());
-
-    // Patch the JSON disk table with illegal values; rewrite the file with a
-    // consistent length so only the content checks can fail. `extra_segment`
-    // duplicates the trailing disk segment when a second disk entry is added.
-    let repack = |name: &str, extra_segment: bool, mutate: &dyn Fn(&mut serde_json::Value)| {
-        let json_len = u32::from_le_bytes(valid[12..16].try_into().unwrap()) as usize;
-        let mut disks: serde_json::Value =
-            serde_json::from_slice(&valid[16..16 + json_len]).unwrap();
-        mutate(&mut disks);
-        let encoded = serde_json::to_vec(&disks).unwrap();
-        let mut patched = Vec::with_capacity(valid.len());
-        patched.extend_from_slice(&valid[..12]);
-        patched.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        patched.extend_from_slice(&encoded);
-        patched.extend_from_slice(&valid[16 + json_len..]);
-        if extra_segment {
-            let segment = disks["disks"][0]["disk_bytes"].as_u64().unwrap() as usize;
-            patched.extend_from_slice(&valid[valid.len() - segment..]);
-        }
-        let path = dir.path(name);
-        fs::write(&path, patched).unwrap();
-        path
-    };
-    let illegal_queue = repack("illegal-queue", false, &|value| {
-        value["disks"][0]["device"]["queues"][0]["size"] = serde_json::json!(7);
-    });
-    assert!(RamSnapshotVm::import(&illegal_queue, disks_at(&destination())).is_err());
-    assert!(!destination().exists());
-
-    let mmio_overlap = repack("mmio-overlap", false, &|value| {
-        value["disks"][0]["mmio_addr"] = serde_json::json!(0x1000);
-    });
-    assert!(RamSnapshotVm::import(&mmio_overlap, disks_at(&destination())).is_err());
-
-    let capacity_mismatch = repack("capacity-mismatch", false, &|value| {
-        value["disks"][0]["config"].as_array_mut().unwrap()[0] = serde_json::json!(1);
-    });
-    assert!(RamSnapshotVm::import(&capacity_mismatch, disks_at(&destination())).is_err());
-
-    let irq_out_of_window = repack("irq-window", false, &|value| {
-        value["disks"][0]["irq"] = serde_json::json!(5);
-    });
-    assert!(RamSnapshotVm::import(&irq_out_of_window, disks_at(&destination())).is_err());
-
-    let foreign_features = repack("foreign-features", false, &|value| {
-        value["disks"][0]["device"]["avail_features"] = serde_json::json!(
-            value["disks"][0]["device"]["avail_features"]
-                .as_u64()
-                .unwrap()
-                | 1
-        );
-    });
-    assert!(RamSnapshotVm::import(&foreign_features, disks_at(&destination())).is_err());
-
-    // Duplicate identity with a consistent payload length: only the
-    // identity/MMIO/IRQ conflict checks can reject this one.
-    let duplicate_identity = repack("duplicate-identity", true, &|value| {
-        let mut disk = value["disks"][0].clone();
-        disk["mmio_addr"] = serde_json::json!(MMIO_BASE + MMIO_LEN);
-        disk["irq"] = serde_json::json!(IRQ_BASE + 1);
-        disk["device_id"] = serde_json::json!("blk0");
-        value["disks"].as_array_mut().unwrap().push(disk);
-    });
-    assert!(RamSnapshotVm::import(&duplicate_identity, disks_at(&destination())).is_err());
-}
-
-#[test]
-fn blk_snapshot_never_touches_preexisting_destination() {
-    let dir = TempDir::new();
-    let (raw, _qcow2, _backing) = snapshot_disks(&dir);
-    let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
-    wait_requests(&vm, 6);
-    let snapshot = dir.path("checkpoint");
-    vm.pause().unwrap();
-    vm.export(&snapshot).unwrap();
-    drop(vm);
-    // A pre-existing destination with caller data must never be modified.
-    let destination = dir.path("imported");
-    fs::create_dir(&destination).unwrap();
-    let sentinel = destination.join("sentinel");
-    fs::write(&sentinel, b"caller data").unwrap();
-    assert!(RamSnapshotVm::import(&snapshot, disks_at(&destination)).is_err());
-    assert_eq!(fs::read(&sentinel).unwrap(), b"caller data");
-    assert_eq!(
-        fs::read_dir(&destination).unwrap().count(),
-        1,
-        "the importer created files inside a foreign directory"
-    );
-}
-
-#[test]
-fn blk_snapshot_export_write_failure_stays_paused_and_republishes() {
-    let dir = TempDir::new();
-    let (raw, _qcow2, _backing) = snapshot_disks(&dir);
-    let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
-    wait_requests(&vm, 6);
-    vm.pause().unwrap();
-    let cut = read_u16(&vm, 0xB800);
-    let snapshot = dir.path("checkpoint");
-    let failed = super::super::tests::with_failed_payload_write(64 * 1024, || vm.export(&snapshot));
-    assert!(failed.is_err());
-    // Nothing valid was published and the source stays at its cut: no
-    // request completes while paused.
-    assert!(!snapshot.exists());
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(
-        read_u16(&vm, 0xB800),
-        cut,
-        "a failed export resumed the source"
-    );
-    // The pause is still usable: a second export publishes, and only
-    // resume continues the guest.
-    vm.export(&snapshot).unwrap();
-    vm.resume().unwrap();
-    wait_requests(&vm, cut + 2);
-    drop(vm);
-}
-
-#[test]
-fn blk_snapshot_partial_import_cleanup() {
-    let dir = TempDir::new();
-    let (raw, _qcow2, _backing) = snapshot_disks(&dir);
-    let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
-    wait_requests(&vm, 6);
-    let snapshot = dir.path("checkpoint");
-    vm.pause().unwrap();
-    vm.export(&snapshot).unwrap();
-    drop(vm);
-    let destination = dir.path("imported");
-    let failed = super::super::tests::with_failed_payload_write(32 * 1024, || {
-        RamSnapshotVm::import(&snapshot, disks_at(&destination))
-    });
-    assert!(failed.is_err());
-    assert!(!destination.exists(), "partial import left files behind");
-}
-
-#[test]
-fn blk_snapshot_long_pause_then_export_and_source_resume() {
-    let dir = TempDir::new();
-    let (raw, _qcow2, _backing) = snapshot_disks(&dir);
-    let mut vm = guest_vm(&[(raw.clone(), ImageType::Raw, false)], false);
-    let before = wait_requests(&vm, 6);
-    // Keep everything paused the way the timer tests do; hardware may
-    // mature a pending interrupt before the export of that same pause.
-    vm.pause().unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    let snapshot = dir.path("checkpoint");
-    vm.export(&snapshot).unwrap();
-    // The source continues after its explicit resume.
-    vm.resume().unwrap();
-    wait_requests(&vm, before + 2);
-    drop(vm);
-    fs::remove_file(&raw).unwrap();
-    let destination = dir.path("imported");
-    let mut restored = RamSnapshotVm::import(&snapshot, disks_at(&destination)).unwrap();
-    assert_eq!(read_u16(&restored, 0xB802), 1);
-    restored.resume().unwrap();
-    let restored_at = read_u16(&restored, 0xB800);
-    wait_requests(&restored, restored_at + 4);
-    drop(restored);
-    assert!(!destination.exists());
-}
-
-/// A failed disk import's cleanup removes only what it created: a disk
-/// file that replaced its segment at the same path is someone else's and
-/// stays, and so does the directory holding it.
-#[test]
-fn snapshot_import_disk_cleanup_leaves_a_replacement_at_its_path() {
-    let dir = TempDir::new();
-    let destination = dir.path("imported");
-    let mut imported = ImportedDir::create(&destination).unwrap();
-    drop(imported.create_segment_file(0).unwrap());
-    let segment = destination.join("disk-0.raw");
-    fs::remove_file(&segment).unwrap();
-    fs::write(&segment, b"replacement").unwrap();
-    drop(imported);
-    assert_eq!(fs::read(&segment).unwrap(), b"replacement");
+    restored.pause().unwrap();
 }

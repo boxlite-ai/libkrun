@@ -112,117 +112,6 @@ fn snapshot_boot_kvm_linux_guest_reports_its_init_exit_code_and_its_root_goes_wi
     assert!(dir.path("user").is_dir(), "a user share stays");
 }
 
-/// Paused early in boot, exported, the source destroyed with its root:
-/// an import onto the source's console output is refused untouched, and
-/// one onto new endpoints continues the same boot (no payload or boot
-/// setup again) on the copies and reports the guest's exit through its
-/// own shares.
-#[test]
-fn snapshot_boot_kvm_linux_guest_import_continues_the_boot_after_the_source_is_gone() {
-    let dir = TempDir::new();
-    let mut source = SnapshotVm::boot(&guest(&dir), SnapshotDevices::default()).unwrap();
-    source.declare_host_writers_stopped().unwrap();
-    source.pause().unwrap();
-    assert_eq!(source.state(), VmState::Paused);
-    let image = dir.path("checkpoint");
-    source.export(&image).unwrap();
-    source.stop();
-    drop(source);
-    assert!(!dir.path("root").exists());
-    fs::remove_dir_all(dir.path("user")).unwrap();
-
-    let shares = dir.path("shares");
-    // An existing console output is refused untouched, before the import
-    // created anything.
-    let source_console = fs::read(dir.path("console.log")).unwrap();
-    let onto_existing = SnapshotVm::import(
-        &image,
-        RestoreEndpoints {
-            console_output: Some(dir.path("console.log")),
-            fs_dir: Some(shares.clone()),
-            ..Default::default()
-        },
-    );
-    assert!(onto_existing.is_err());
-    assert_eq!(fs::read(dir.path("console.log")).unwrap(), source_console);
-    assert!(!shares.exists());
-    let mut target = SnapshotVm::import(
-        &image,
-        RestoreEndpoints {
-            console_output: Some(dir.path("restored.log")),
-            fs_dir: Some(shares.clone()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(target.state(), VmState::Paused);
-    target.resume().unwrap();
-    assert_eq!(wait_exit(&mut target), VmState::Exited(127));
-    assert!(console(&dir.path("restored.log")).contains(MISSING_INIT));
-    assert!(shares.join("0").is_dir(), "kept until the VM ends");
-    drop(target);
-    assert!(
-        !shares.join("0").exists(),
-        "the imported boot root copy goes"
-    );
-    assert!(shares.join("1").is_dir(), "the user share copy stays");
-}
-
-/// An import hands its disk and share copies over to the caller: they
-/// outlive the restored VM, the disk as `disk-0.raw` with the source's
-/// bytes, the user share at the root `restored_shares` names; only the
-/// VM-owned boot root copy goes with the VM.
-#[test]
-fn snapshot_boot_kvm_import_hands_its_disk_and_share_copies_over() {
-    let dir = TempDir::new();
-    let mut data = vec![0u8; 1 << 20];
-    data[..8].copy_from_slice(b"KRUNDISK");
-    fs::write(dir.path("data.raw"), &data).unwrap();
-    let devices = SnapshotDevices {
-        disks: vec![BlockDeviceConfig {
-            block_id: "vda".into(),
-            cache_type: CacheType::Writeback,
-            disk_image_path: dir.path("data.raw").to_str().unwrap().into(),
-            disk_image_format: ImageType::Raw,
-            is_disk_read_only: true,
-            direct_io: false,
-            sync_mode: SyncMode::Full,
-        }],
-        ..Default::default()
-    };
-    let mut source = SnapshotVm::boot(&guest(&dir), devices).unwrap();
-    source.declare_host_writers_stopped().unwrap();
-    source.pause().unwrap();
-    let image = dir.path("checkpoint");
-    source.export(&image).unwrap();
-    source.stop();
-    drop(source);
-    fs::remove_file(dir.path("data.raw")).unwrap();
-    fs::remove_dir_all(dir.path("user")).unwrap();
-
-    let (disks, shares) = (dir.path("disks"), dir.path("shares"));
-    let mut target = SnapshotVm::import(
-        &image,
-        RestoreEndpoints {
-            disk_dir: Some(disks.clone()),
-            console_output: Some(dir.path("restored.log")),
-            fs_dir: Some(shares.clone()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        target.restored_shares(),
-        [("user".to_string(), shares.join("1"))]
-    );
-    target.resume().unwrap();
-    assert_eq!(wait_exit(&mut target), VmState::Exited(127));
-    drop(target);
-    assert_eq!(fs::read(disks.join("disk-0.raw")).unwrap(), data);
-    assert!(shares.join("1").is_dir());
-    assert!(!shares.join("0").exists());
-}
-
 #[test]
 fn snapshot_boot_kvm_stop_ends_a_running_guest_without_an_exit_status() {
     let dir = TempDir::new();
@@ -232,4 +121,192 @@ fn snapshot_boot_kvm_stop_ends_a_running_guest_without_an_exit_status() {
     assert!(waiter.wait(Some(Duration::ZERO)));
     assert_eq!(vm.state(), VmState::Stopped);
     assert!(vm.pause().is_err());
+}
+
+/// The same Linux boot continues on a separately prepared recipe root;
+/// external roots and the private disk remain caller-owned after teardown.
+#[cfg(feature = "blk")]
+#[test]
+fn snapshot_boot_kvm_v9_linux_continues_after_source_destruction_on_recipe_root() {
+    use crate::snapshot_vm::checkpoint::{
+        ExportMetadata, ExternalReference, ImportBindings, ShareBinding,
+    };
+    use devices::virtio::fs::passthrough::RestoredRoles;
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = TempDir::new();
+    let disk = dir.path("source.qcow2");
+    assert!(std::process::Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2"])
+        .arg(&disk)
+        .arg("1M")
+        .status()
+        .unwrap()
+        .success());
+    let devices = SnapshotDevices {
+        disks: vec![BlockDeviceConfig {
+            block_id: "vda".into(),
+            cache_type: CacheType::Writeback,
+            disk_image_path: disk.to_str().unwrap().into(),
+            disk_image_format: ImageType::Qcow2,
+            is_disk_read_only: false,
+            direct_io: false,
+            sync_mode: SyncMode::Full,
+        }],
+        ..Default::default()
+    };
+    let mut source = SnapshotVm::boot(&guest(&dir), devices).unwrap();
+    source.declare_host_writers_stopped().unwrap();
+    source.pause().unwrap();
+    let prepared = source.prepare_checkpoint().unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&prepared.metadata).unwrap();
+    let refs = meta["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| {
+            session["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter(|(_, object)| object["recipe"].is_null())
+                .map(|(index, _)| ExternalReference {
+                    resource_id: "boot-test".into(),
+                    recovery_point: "cut".into(),
+                    object_key: index.to_string(),
+                })
+                .collect()
+        })
+        .collect();
+    fs::copy(&disk, dir.path("private.qcow2")).unwrap();
+    let memory = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(dir.path("snapshot.mem"))
+        .unwrap();
+    source
+        .export_fd(
+            memory,
+            File::open(dir.path("private.qcow2")).unwrap(),
+            ExportMetadata {
+                application_schema: 1,
+                application: serde_json::Value::Null,
+                objects: refs,
+            },
+        )
+        .unwrap();
+    drop(prepared);
+    source.stop();
+    drop(source);
+    assert!(!dir.path("root").exists());
+    fs::remove_dir_all(dir.path("user")).unwrap();
+    fs::remove_file(disk).unwrap();
+    let boot = dir.path("recovered-boot");
+    let user = dir.path("recovered-user");
+    fs::create_dir(&boot).unwrap();
+    fs::create_dir(&user).unwrap();
+    for name in ["dev", "proc", "sys", "newroot"] {
+        fs::create_dir(boot.join(name)).unwrap();
+    }
+    let bindings = || {
+        let shares = meta["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, session)| {
+                let root = if index == 0 {
+                    boot.clone()
+                } else {
+                    user.clone()
+                };
+                let recipe = meta["devices"][index]["vm_owned"].as_bool().unwrap();
+                let objects = if recipe {
+                    vec![]
+                } else {
+                    session["objects"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|object| {
+                            assert_eq!(object["kind"].as_u64().unwrap(), libc::S_IFDIR as u64);
+                            OpenOptions::new()
+                                .read(true)
+                                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                                .open(&root)
+                                .unwrap()
+                        })
+                        .collect()
+                };
+                let handles = session["state"]["handles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|handle| {
+                        let object =
+                            &session["objects"][handle["object"].as_u64().unwrap() as usize];
+                        let path = if recipe {
+                            root.join(object["recipe"].as_str().unwrap())
+                        } else {
+                            root.clone()
+                        };
+                        let flags = handle["flags"].as_i64().unwrap() as i32;
+                        let file = OpenOptions::new()
+                            .read(true)
+                            .custom_flags(flags)
+                            .open(path)
+                            .unwrap();
+                        (handle["handle"].as_u64().unwrap(), file)
+                    })
+                    .collect();
+                ShareBinding {
+                    root,
+                    objects,
+                    roles: RestoredRoles {
+                        handles,
+                        dax: Default::default(),
+                    },
+                }
+            })
+            .collect();
+        ImportBindings {
+            disks: vec![OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.path("private.qcow2"))
+                .unwrap()],
+            shares,
+        }
+    };
+    let source_console = fs::read(dir.path("console.log")).unwrap();
+    assert!(SnapshotVm::import_fd(
+        File::open(dir.path("snapshot.mem")).unwrap(),
+        bindings(),
+        RestoreEndpoints {
+            console_output: Some(dir.path("console.log")),
+            ..Default::default()
+        }
+    )
+    .is_err());
+    assert_eq!(fs::read(dir.path("console.log")).unwrap(), source_console);
+    let mut target = SnapshotVm::import_fd(
+        File::open(dir.path("snapshot.mem")).unwrap(),
+        bindings(),
+        RestoreEndpoints {
+            console_output: Some(dir.path("restored.log")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(target.state(), VmState::Paused);
+    target.resume().unwrap();
+    assert_eq!(wait_exit(&mut target), VmState::Exited(127));
+    assert!(console(&dir.path("restored.log")).contains(MISSING_INIT));
+    drop(target);
+    assert!(
+        boot.is_dir() && user.is_dir() && dir.path("private.qcow2").is_file(),
+        "import teardown removed caller resources"
+    );
 }

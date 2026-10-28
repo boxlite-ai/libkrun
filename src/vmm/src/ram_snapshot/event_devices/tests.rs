@@ -5,6 +5,8 @@
 //! through the owner's MMIO bus and guest RAM. Test names contain
 //! "snapshot" for `make snapshot-test`.
 
+#![cfg(feature = "blk")]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 use vm_memory::{Bytes, GuestAddress};
 
 use super::*;
+use crate::ram_snapshot::test_fixture::{attach_disk, DescriptorFixture};
 use crate::ram_snapshot::RestoreResources;
 
 const QSIZE: u32 = 16;
@@ -91,13 +94,14 @@ fn snapshot_rng_balloon_kvm_restore_kicks_pending_request() {
         .memory
         .write_slice(include_bytes!("../full/guest.bin"), GuestAddress(0x1000))
         .unwrap();
+    attach_disk(&mut source);
     source.attach_rng().unwrap();
     source.attach_balloon().unwrap();
     assert!(source.attach_rng().is_err(), "a second RNG attached");
     source.start_vcpus(1, 0x1000).unwrap();
     activate_rng_with_pending_request(&source);
     source.pause().unwrap();
-    source.export(&image).unwrap();
+    source.export_test(&image).unwrap();
 
     // The resumed source continues: its device serves the request once
     // notified.
@@ -106,7 +110,7 @@ fn snapshot_rng_balloon_kvm_restore_kicks_pending_request() {
     wait("source request not served", || used_idx(&source) == 1);
     drop(source);
 
-    let mut restored = RamSnapshotVm::import(&image, RestoreResources::default()).unwrap();
+    let mut restored = RamSnapshotVm::import_test(&image, RestoreResources::default()).unwrap();
     assert_eq!(used_idx(&restored), 0, "the cut completed the request");
     assert_eq!(read(&restored, BALLOON.mmio_addr, 0x08), TYPE_BALLOON);
     assert_eq!(read(&restored, BALLOON.mmio_addr, 0x70), 0);

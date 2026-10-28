@@ -48,7 +48,7 @@ pub use dax::{
 use snapshot::InoMap;
 pub use snapshot::{
     DirListEntry, HandleState, NodeState, PassthroughCheckpoint, PassthroughSnapshotError,
-    PassthroughState, RestoredObject, SnapshotObject, SYNTHETIC_INO_BASE,
+    PassthroughState, RestoredObject, RestoredRoles, SnapshotObject, SYNTHETIC_INO_BASE,
 };
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";

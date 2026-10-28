@@ -28,30 +28,19 @@ fn get_state(ctx: u32) -> Result<(u32, i32), i32> {
     not(feature = "aws-nitro")
 ))]
 mod supported {
-    use std::path::Path;
-
     use super::*;
-    use crate::snapshot::{STATE_CONFIGURED, STATE_FAILED};
+    use crate::snapshot::descriptor::supported::*;
+    use crate::snapshot::STATE_CONFIGURED;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("krun-capi-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        dir
-    }
+    #[cfg(feature = "blk")]
+    mod v9;
 
     fn enabled() -> u32 {
         let ctx = krun_create_ctx() as u32;
         assert_eq!(krun_snapshot_enable(ctx, 0), 0);
         ctx
-    }
-
-    fn import(ctx: u32, image: &Path, disk_dir: Option<&Path>, fs_dir: Option<&Path>) -> i32 {
-        let image = c(image.to_str().unwrap());
-        let disk_dir = disk_dir.map(|dir| c(dir.to_str().unwrap()));
-        let fs_dir = fs_dir.map(|dir| c(dir.to_str().unwrap()));
-        let ptr = |dir: &Option<CString>| dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
-        unsafe { krun_snapshot_import(ctx, image.as_ptr(), ptr(&disk_dir), ptr(&fs_dir)) }
     }
 
     #[test]
@@ -70,7 +59,7 @@ mod supported {
         let export = c("/box/export.img");
         assert_eq!(
             unsafe { krun_snapshot_export(ctx, export.as_ptr()) },
-            -libc::EAGAIN
+            -libc::ENOTSUP
         );
         assert_eq!(krun_free_ctx(ctx), 0);
         assert_eq!(get_state(ctx), Err(-libc::ENOENT));
@@ -106,49 +95,58 @@ mod supported {
     }
 
     #[test]
-    fn snapshot_capi_import_checks_its_arguments_and_order() {
-        let image = Path::new("/box/checkpoint.img");
-        let plain = krun_create_ctx() as u32;
-        assert_eq!(
-            import(plain, image, None, None),
-            -libc::EINVAL,
-            "not enabled"
-        );
-        assert_eq!(krun_free_ctx(plain), 0);
-
+    fn snapshot_capi_v9_descriptor_contract_and_legacy_refusal() {
         let ctx = enabled();
+        let image = c("/box/old-checkpoint");
         assert_eq!(
             unsafe {
-                krun_snapshot_import(ctx, std::ptr::null(), std::ptr::null(), std::ptr::null())
+                krun_snapshot_import(ctx, image.as_ptr(), std::ptr::null(), std::ptr::null())
+            },
+            -libc::ENOTSUP
+        );
+        assert_eq!(
+            krun_snapshot_capabilities(),
+            if cfg!(feature = "blk") { 7 } else { 0 }
+        );
+        let (session, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut token = 0;
+        assert_eq!(
+            unsafe { krun_snapshot_begin_capture(ctx, 0, session.as_raw_fd(), &mut token) },
+            -libc::EAGAIN
+        );
+        assert_eq!(token, 0);
+        assert_eq!(
+            unsafe { krun_snapshot_begin_capture(ctx, 2, session.as_raw_fd(), &mut token) },
+            -libc::EINVAL
+        );
+        let name = c("legacy-image");
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(b"KRUNVM\0\0").unwrap();
+        file.write_all(&8u32.to_le_bytes()).unwrap();
+        let config = br#"{"disks":[],"shares":[]}"#;
+        assert_eq!(
+            unsafe {
+                krun_snapshot_import_fd(
+                    ctx,
+                    file.as_raw_fd(),
+                    config.as_ptr(),
+                    config.len(),
+                    std::ptr::null(),
+                    0,
+                )
             },
             -libc::EINVAL
         );
+        let mut length = 0;
         assert_eq!(
-            import(ctx, Path::new("checkpoint.img"), None, None),
+            unsafe {
+                krun_snapshot_inspect_fd(file.as_raw_fd(), std::ptr::null_mut(), &mut length)
+            },
             -libc::EINVAL
         );
-        assert_eq!(
-            import(ctx, image, Some(Path::new("disks")), None),
-            -libc::EINVAL
-        );
-        assert_eq!(
-            import(ctx, image, None, Some(Path::new("shares"))),
-            -libc::EINVAL
-        );
-        assert_eq!(
-            import(
-                ctx,
-                image,
-                Some(Path::new("/box/disks")),
-                Some(Path::new("/box/shares"))
-            ),
-            0
-        );
-        assert_eq!(
-            import(ctx, image, None, None),
-            -libc::EINVAL,
-            "import twice"
-        );
+        assert_eq!(get_state(ctx), Ok((STATE_CONFIGURED, 0)));
         assert_eq!(krun_free_ctx(ctx), 0);
     }
 
@@ -158,12 +156,12 @@ mod supported {
         assert_eq!(krun_snapshot_pause(ctx, 1 << 1), -libc::EINVAL);
         assert_eq!(
             unsafe { krun_snapshot_export(ctx, std::ptr::null()) },
-            -libc::EINVAL
+            -libc::ENOTSUP
         );
         let relative = c("export.img");
         assert_eq!(
             unsafe { krun_snapshot_export(ctx, relative.as_ptr()) },
-            -libc::EINVAL
+            -libc::ENOTSUP
         );
         let tag = c("volume0");
         let mut path = [0 as libc::c_char; 64];
@@ -183,71 +181,6 @@ mod supported {
             0
         );
         assert_eq!(krun_free_ctx(ctx), 0);
-    }
-
-    /// The control entry outlives krun_start_enter's consumption of the
-    /// context: a refused import's state stays readable until freed, and
-    /// the import created nothing.
-    #[cfg(feature = "blk")]
-    #[test]
-    fn snapshot_capi_refused_import_keeps_the_control_entry_until_freed() {
-        let dir = temp_dir("refused");
-        let console = dir.join("console.log");
-        let disks = dir.join("disks");
-        let ctx = enabled();
-        assert_eq!(import(ctx, &dir.join("missing.img"), Some(&disks), None), 0);
-        let console_c = c(console.to_str().unwrap());
-        assert_eq!(
-            unsafe { krun_set_console_output(ctx, console_c.as_ptr()) },
-            0
-        );
-        let disk = c(dir.join("disk.raw").to_str().unwrap());
-        let id = c("vda");
-        assert_eq!(
-            unsafe { krun_add_disk2(ctx, id.as_ptr(), disk.as_ptr(), 0, false) },
-            0
-        );
-        assert_eq!(
-            krun_start_enter(ctx),
-            -libc::EINVAL,
-            "an import brings its disks"
-        );
-        assert!(!CTX_MAP.lock().unwrap().contains_key(&ctx));
-        assert_eq!(get_state(ctx), Ok((STATE_FAILED, 0)));
-        assert_eq!(krun_snapshot_resume(ctx), -libc::ESRCH);
-        assert_eq!(krun_snapshot_stop(ctx), 0);
-        assert!(!console.exists() && !disks.exists());
-        assert_eq!(krun_free_ctx(ctx), 0);
-        assert_eq!(get_state(ctx), Err(-libc::ENOENT));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// An import whose image cannot be read fails before creating any of
-    /// its new endpoints (without /dev/kvm it fails even earlier).
-    #[test]
-    fn snapshot_capi_failed_import_creates_no_endpoint() {
-        let dir = temp_dir("failed");
-        let console = dir.join("console.log");
-        let disks = dir.join("disks");
-        let shares = dir.join("shares");
-        let ctx = enabled();
-        // The implicit vsock would hijack sockets (TSI), which a
-        // checkpointing VM refuses.
-        assert_eq!(krun_disable_implicit_vsock(ctx), 0);
-        assert_eq!(
-            import(ctx, &dir.join("missing.img"), Some(&disks), Some(&shares)),
-            0
-        );
-        let console_c = c(console.to_str().unwrap());
-        assert_eq!(
-            unsafe { krun_set_console_output(ctx, console_c.as_ptr()) },
-            0
-        );
-        assert_eq!(krun_start_enter(ctx), -libc::EIO);
-        assert_eq!(get_state(ctx), Ok((STATE_FAILED, 0)));
-        assert!(!console.exists() && !disks.exists() && !shares.exists());
-        assert_eq!(krun_free_ctx(ctx), 0);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
