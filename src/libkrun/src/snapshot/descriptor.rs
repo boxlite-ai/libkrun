@@ -268,7 +268,7 @@ mod unsupported {
         0
     }
     macro_rules! unsupported {
-        ($name:ident($($arg:ident: $type:ty),*)) => {
+        ($name:ident($($arg:ident: $type:ty),* $(,)?)) => {
             #[no_mangle]
             pub extern "C" fn $name($($arg: $type),*) -> i32 {
                 let _ = ($($arg),*);
