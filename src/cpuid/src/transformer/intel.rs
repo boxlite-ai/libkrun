@@ -57,9 +57,10 @@ pub fn update_kvm_features(entry: &mut kvm_cpuid_entry2, _vm_spec: &VmSpec) -> R
     Ok(())
 }
 
-#[cfg(feature = "tdx")]
-pub fn update_0xd_for_tdx(entry: &mut kvm_cpuid_entry2, _vm_spec: &VmSpec) -> Result<(), Error> {
-    // set XSAVE features
+pub fn update_extended_state_entry(
+    entry: &mut kvm_cpuid_entry2,
+    _vm_spec: &VmSpec,
+) -> Result<(), Error> {
     if entry.function == 0xD && entry.index == 0 {
         const XFEATURE_MASK_XTILE: u32 = (1 << 17) | (1 << 18);
         if (entry.eax & XFEATURE_MASK_XTILE) != XFEATURE_MASK_XTILE {
@@ -67,6 +68,7 @@ pub fn update_0xd_for_tdx(entry: &mut kvm_cpuid_entry2, _vm_spec: &VmSpec) -> Re
         }
     }
 
+    #[cfg(feature = "tdx")]
     if entry.function == 0xD && entry.index == 1 {
         entry.ecx &= !(1 << 15);
         const XFEATURE_MASK_CET: u32 = (1 << 11) | (1 << 12);
@@ -202,8 +204,7 @@ impl CpuidTransformer for IntelCpuidTransformer {
             leaf_0x6::LEAF_NUM => Some(intel::update_power_management_entry),
             leaf_0xa::LEAF_NUM => Some(intel::update_perf_mon_entry),
             leaf_0xb::LEAF_NUM => Some(intel::update_extended_cache_topology_entry),
-            #[cfg(feature = "tdx")]
-            leaf_0xd::LEAF_NUM => Some(intel::update_0xd_for_tdx),
+            leaf_0xd::LEAF_NUM => Some(intel::update_extended_state_entry),
             #[cfg(feature = "tdx")]
             0x4000_0001 => Some(intel::update_kvm_features),
             0x8000_0002..=0x8000_0004 => Some(common::update_brand_string_entry),
@@ -262,6 +263,44 @@ mod tests {
         assert_eq!(entry.ebx, 0);
         assert_eq!(entry.ecx, 0);
         assert_eq!(entry.edx, 0);
+    }
+
+    #[test]
+    fn test_update_extended_state_entry_clears_incomplete_xtile_features() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let mut entry = kvm_cpuid_entry2 {
+            function: leaf_0xd::LEAF_NUM,
+            index: 0,
+            flags: 0,
+            eax: 0x202e7,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            padding: [0, 0, 0],
+        };
+
+        assert!(update_extended_state_entry(&mut entry, &vm_spec).is_ok());
+
+        assert_eq!(entry.eax, 0x2e7);
+    }
+
+    #[test]
+    fn test_update_extended_state_entry_preserves_complete_xtile_features() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let mut entry = kvm_cpuid_entry2 {
+            function: leaf_0xd::LEAF_NUM,
+            index: 0,
+            flags: 0,
+            eax: 0x602e7,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            padding: [0, 0, 0],
+        };
+
+        assert!(update_extended_state_entry(&mut entry, &vm_spec).is_ok());
+
+        assert_eq!(entry.eax, 0x602e7);
     }
 
     fn check_update_deterministic_cache_entry(
