@@ -18,6 +18,7 @@ pub mod bindings;
 #[cfg(feature = "blk")]
 pub mod block;
 pub mod console;
+pub mod control;
 pub mod descriptor_utils;
 pub mod device;
 pub mod file_traits;
