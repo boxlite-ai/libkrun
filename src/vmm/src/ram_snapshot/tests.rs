@@ -38,7 +38,7 @@ fn discontiguous_ram_round_trip_owns_its_bytes() {
     container.extend_from_slice(&encoded);
     let end = container.len();
     container.extend_from_slice(b"other VM state");
-    let restored = restore(&container[start..end], 2, 0x23000).unwrap();
+    let restored = restore(&container[start..end]).unwrap();
     drop(container);
     assert_eq!(restored.num_regions(), 2);
     assert!(!restored.address_in_range(GuestAddress(0x100000)));
@@ -59,13 +59,12 @@ fn malformed_header_and_image_lengths_are_rejected() {
     for (offset, bytes) in [
         (0, b"BADMAGIC".as_slice()),
         (8, &[2, 0, 0, 0]),
-        (12, &[0, 0, 0, 0]),
         (12, &[255, 255, 255, 255]),
     ] {
         let mut image = fixture(&[(0, 4096, 0)], 4096);
         image[offset..offset + bytes.len()].copy_from_slice(bytes);
         assert_eq!(
-            restore(&image, 2, 8192).unwrap_err().kind(),
+            restore(&image).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -73,46 +72,50 @@ fn malformed_header_and_image_lengths_are_rejected() {
     for len in [0, 15, 39, 40, 4135, 4137] {
         let mut image = fixture(&[(0, 4096, 0)], 4096);
         image.resize(len, 0);
-        assert!(restore(&image, 1, 4096).is_err());
+        assert!(restore(&image).is_err());
     }
 }
 
 #[test]
-fn invalid_regions_are_rejected_before_allocation() {
-    let cases = [
-        vec![(0, 0, 0)],
-        vec![(1, 4096, 0)],
-        vec![(0, 4095, 0)],
+fn metadata_reports_layout_for_caller_policy() {
+    let image = fixture(&[(1, 3, 0), (100, 2, 0)], 5);
+    let metadata = get_metadata(&image).unwrap();
+    assert_eq!(
+        metadata,
+        Metadata {
+            version: 1,
+            memory_bytes: 5,
+            regions: vec![Region { gpa: 1, len: 3 }, Region { gpa: 100, len: 2 }],
+        }
+    );
+    // The caller may reject this layout; the codec imposes no page alignment.
+    let memory = restore(&image).unwrap();
+    assert_eq!(memory.read_obj::<u8>(GuestAddress(100)).unwrap(), 0);
+    assert_eq!(get_metadata(&save(&memory).unwrap()).unwrap(), metadata);
+
+    let overlapping = fixture(&[(0, 4, 0), (2, 4, 0)], 8);
+    assert_eq!(get_metadata(&overlapping).unwrap().regions[1].gpa, 2);
+    assert!(restore(&overlapping).is_err()); // GuestMemoryMmap rejects overlap.
+}
+
+#[test]
+fn malformed_metadata_is_rejected() {
+    for entries in [
         vec![(0, 4096, 1)],
-        vec![(u64::MAX - 4095, 4096, 0)],
+        vec![(0, u64::MAX, 0), (0, 1, 0)],
         vec![(0, 1u64 << 63, 0)],
-        vec![(0, 8192, 0), (4096, 4096, 0)],
-        vec![(8192, 4096, 0), (0, 4096, 0)],
-    ];
-    for entries in cases {
-        let image = fixture(&entries, 8192);
+    ] {
+        let image = fixture(&entries, 8);
         assert_eq!(
-            restore(&image, 2, u64::MAX).unwrap_err().kind(),
+            get_metadata(&image).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert!(restore(&image).is_err());
     }
 }
 
 #[test]
-fn target_region_and_memory_limits_are_enforced() {
-    let image = fixture(&[(0, 4096, 0), (8192, 4096, 0)], 8192);
-    for (regions, bytes) in [(0, 8192), (1, 8192), (2, 0), (2, 8191)] {
-        assert_eq!(
-            restore(&image, regions, bytes).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-    }
-    let memory = restore(&image, 2, 8192).unwrap();
-    assert_eq!(memory.read_obj::<u64>(GuestAddress(8192)).unwrap(), 0);
-}
-
-#[test]
-fn unsupported_mappings_are_rejected() {
+fn readable_mappings_are_copied_to_anonymous_ram() {
     let backing = TempFile::new().unwrap();
     backing.as_file().set_len(4096).unwrap();
     let file_memory = GuestMemoryMmap::from_ranges_with_files(&[(
@@ -121,13 +124,17 @@ fn unsupported_mappings_are_rejected() {
         Some(FileOffset::new(backing.as_file().try_clone().unwrap(), 0)),
     )])
     .unwrap();
-    assert!(save(&file_memory).is_err());
+    file_memory.write_obj(42u8, GuestAddress(0)).unwrap();
+    let restored = restore(&save(&file_memory).unwrap()).unwrap();
+    assert_eq!(restored.read_obj::<u8>(GuestAddress(0)).unwrap(), 42);
+    assert!(restored.iter().next().unwrap().file_offset().is_none());
     for (flags, prot) in [
         (
             libc::MAP_ANONYMOUS | libc::MAP_SHARED,
             libc::PROT_READ | libc::PROT_WRITE,
         ),
         (libc::MAP_ANONYMOUS | libc::MAP_PRIVATE, libc::PROT_READ),
+        (libc::MAP_ANONYMOUS | libc::MAP_PRIVATE, libc::PROT_NONE),
     ] {
         let mapping = MmapRegionBuilder::new(4096)
             .with_mmap_flags(flags)
@@ -139,8 +146,17 @@ fn unsupported_mappings_are_rejected() {
                 GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap()
             ])
             .unwrap();
-        assert!(save(&memory).is_err());
+        if prot == libc::PROT_NONE {
+            assert!(save(&memory).is_err());
+        } else {
+            let image = save(&memory).unwrap();
+            assert_eq!(
+                restore(&image)
+                    .unwrap()
+                    .read_obj::<u8>(GuestAddress(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
-    let unaligned = GuestMemoryMmap::from_ranges(&[(GuestAddress(1), 4096)]).unwrap();
-    assert!(save(&unaligned).is_err());
 }

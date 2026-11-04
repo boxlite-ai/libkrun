@@ -3,8 +3,8 @@
 //! RAM-only images, not runnable VM checkpoints or a stable external format.
 //!
 //! The caller must stop all writers (vCPUs, devices and other memory aliases)
-//! for the entire save. Only owned, private anonymous RAM is supported. This
-//! codec neither discovers mappings outside `memory` nor freezes their owners.
+//! for the entire save. Mappings are copied as bytes and restored as anonymous
+//! RAM. The caller can inspect `get_metadata` before deciding whether to restore.
 
 use std::io::{self, Read};
 
@@ -14,80 +14,33 @@ const MAGIC: &[u8; 8] = b"KRUNRAM\0";
 const VERSION: u32 = 1;
 const HEADER_LEN: u64 = 16;
 const REGION_LEN: u64 = 24;
-const PAGE_SIZE: u64 = 4096;
 
-struct Region {
-    gpa: u64,
-    len: u64,
-    attributes: u64,
+/// A guest RAM region described by an image.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Region {
+    pub gpa: u64,
+    pub len: u64,
+}
+
+/// Image information for caller-defined resource and platform checks.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Metadata {
+    pub version: u32,
+    /// Total RAM payload bytes, excluding address-space gaps and image headers.
+    pub memory_bytes: u64,
+    pub regions: Vec<Region>,
 }
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
-fn validate_regions(
-    regions: &[Region],
-    max_regions: usize,
-    max_memory_bytes: u64,
-) -> io::Result<u64> {
-    if regions.is_empty() || regions.len() > max_regions || regions.len() > u32::MAX as usize {
-        return Err(invalid("invalid RAM region count"));
-    }
-    let mut memory_bytes = 0u64;
-    let mut previous_end = 0;
-    for region in regions {
-        if region.len == 0
-            || region.gpa & (PAGE_SIZE - 1) != 0
-            || region.len & (PAGE_SIZE - 1) != 0
-            || region.len > isize::MAX as u64
-            || region.attributes != 0
-        {
-            return Err(invalid(
-                "unsupported RAM region length, alignment or attributes",
-            ));
-        }
-        let end = region
-            .gpa
+fn memory_bytes(regions: &[Region]) -> io::Result<u64> {
+    regions.iter().try_fold(0u64, |total, region| {
+        total
             .checked_add(region.len)
-            .ok_or_else(|| invalid("RAM address overflow"))?;
-        if region.gpa < previous_end {
-            return Err(invalid("overlapping or unordered RAM regions"));
-        }
-        memory_bytes = memory_bytes
-            .checked_add(region.len)
-            .ok_or_else(|| invalid("RAM length overflow"))?;
-        previous_end = end;
-    }
-    if memory_bytes > max_memory_bytes {
-        return Err(invalid("RAM image exceeds memory budget"));
-    }
-    // The count is bounded by u32::MAX above, so the table fits in u64.
-    (HEADER_LEN + regions.len() as u64 * REGION_LEN)
-        .checked_add(memory_bytes)
-        .ok_or_else(|| invalid("RAM image length overflow"))
-}
-
-fn memory_regions(memory: &GuestMemoryMmap) -> io::Result<Vec<Region>> {
-    memory
-        .iter()
-        .map(|region| {
-            let required = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-            if !region.owned()
-                || region.file_offset().is_some()
-                || region.flags() & required != required
-                || region.flags() & !(required | libc::MAP_NORESERVE) != 0
-                || region.prot() != libc::PROT_READ | libc::PROT_WRITE
-            {
-                return Err(invalid("RAM image requires owned private anonymous memory"));
-            }
-            Ok(Region {
-                gpa: region.start_addr().raw_value(),
-                len: region.len(),
-                attributes: 0,
-            })
-        })
-        .collect()
+            .ok_or_else(|| invalid("RAM length overflow"))
+    })
 }
 
 /// Encode quiescent RAM as one contiguous image owned by the caller.
@@ -96,18 +49,32 @@ fn memory_regions(memory: &GuestMemoryMmap) -> io::Result<Vec<Region>> {
 /// and publication belong to the caller. This allocates an image roughly as large
 /// as guest RAM; all RAM writers must stay stopped until the copy completes.
 pub fn save(memory: &GuestMemoryMmap) -> io::Result<Vec<u8>> {
-    let regions = memory_regions(memory)?;
-    let len = validate_regions(&regions, regions.len(), u64::MAX)?;
+    let regions = memory
+        .iter()
+        .map(|region| {
+            if region.prot() & libc::PROT_READ == 0 {
+                return Err(invalid("RAM mapping is not readable"));
+            }
+            Ok(Region {
+                gpa: region.start_addr().raw_value(),
+                len: region.len(),
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let count = u32::try_from(regions.len()).map_err(|_| invalid("RAM region count overflow"))?;
+    let len = (HEADER_LEN + u64::from(count) * REGION_LEN)
+        .checked_add(memory_bytes(&regions)?)
+        .ok_or_else(|| invalid("RAM image length overflow"))?;
     let len = usize::try_from(len).map_err(|_| invalid("RAM image exceeds host address space"))?;
     let mut image = Vec::new();
     image.try_reserve_exact(len).map_err(io::Error::other)?;
     image.extend_from_slice(MAGIC);
     image.extend_from_slice(&VERSION.to_le_bytes());
-    image.extend_from_slice(&(regions.len() as u32).to_le_bytes());
+    image.extend_from_slice(&count.to_le_bytes());
     for region in &regions {
         image.extend_from_slice(&region.gpa.to_le_bytes());
         image.extend_from_slice(&region.len.to_le_bytes());
-        image.extend_from_slice(&region.attributes.to_le_bytes());
+        image.extend_from_slice(&0u64.to_le_bytes());
     }
     let mut offset = image.len();
     image.resize(len, 0);
@@ -121,24 +88,23 @@ pub fn save(memory: &GuestMemoryMmap) -> io::Result<Vec<u8>> {
     Ok(image)
 }
 
-fn read_regions(
-    image: &[u8],
-    max_regions: usize,
-    max_memory_bytes: u64,
-) -> io::Result<Vec<Region>> {
+/// Decode image metadata without allocating guest RAM or applying resource limits.
+///
+/// Checks only the encoding: header/version, reserved fields, arithmetic and
+/// payload length. Region count, RAM budget and platform layout policy belong
+/// to the caller. Region addresses are reported as encoded.
+pub fn get_metadata(image: &[u8]) -> io::Result<Metadata> {
     let mut reader = image;
     let mut header = [0; HEADER_LEN as usize];
     reader.read_exact(&mut header)?;
     if &header[..8] != MAGIC {
         return Err(invalid("invalid or incomplete RAM image"));
     }
-    if u32::from_le_bytes(header[8..12].try_into().unwrap()) != VERSION {
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    if version != VERSION {
         return Err(invalid("unsupported RAM image version"));
     }
     let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-    if count == 0 || count > max_regions {
-        return Err(invalid("RAM region count exceeds target limit or is zero"));
-    }
     if HEADER_LEN + count as u64 * REGION_LEN > image.len() as u64 {
         return Err(invalid("truncated RAM region table"));
     }
@@ -146,30 +112,34 @@ fn read_regions(
     for _ in 0..count {
         let mut entry = [0; REGION_LEN as usize];
         reader.read_exact(&mut entry)?;
+        if entry[16..24] != [0; 8] {
+            return Err(invalid("unsupported RAM attributes"));
+        }
         regions.push(Region {
             gpa: u64::from_le_bytes(entry[..8].try_into().unwrap()),
             len: u64::from_le_bytes(entry[8..16].try_into().unwrap()),
-            attributes: u64::from_le_bytes(entry[16..24].try_into().unwrap()),
         });
     }
-    if validate_regions(&regions, max_regions, max_memory_bytes)? != image.len() as u64 {
+    let memory_bytes = memory_bytes(&regions)?;
+    if memory_bytes != image.len() as u64 - HEADER_LEN - count as u64 * REGION_LEN {
         return Err(invalid("RAM image length differs from region table"));
     }
-    Ok(regions)
+    Ok(Metadata {
+        version,
+        memory_bytes,
+        regions,
+    })
 }
 
-/// Load independent anonymous RAM, checking the entire layout before allocation.
+/// Copy an image into independent anonymous guest RAM.
 ///
-/// `max_regions` and `max_memory_bytes` are caller-supplied resource limits,
-/// not values trusted from the image. The borrowed image is copied into new
-/// guest RAM and can be released after this call. No CPU/device state is
-/// restored and no guest execution is started.
-pub fn restore(
-    image: &[u8],
-    max_regions: usize,
-    max_memory_bytes: u64,
-) -> io::Result<GuestMemoryMmap> {
-    let regions = read_regions(image, max_regions, max_memory_bytes)?;
+/// Call `get_metadata` first if resource or platform checks are needed. This
+/// function applies no such policy; invalid guest mappings are reported by the
+/// memory allocator. The image can be released after this call. No CPU/device
+/// state is restored and no guest execution is started.
+pub fn restore(image: &[u8]) -> io::Result<GuestMemoryMmap> {
+    let metadata = get_metadata(image)?;
+    let regions = metadata.regions;
     let ranges: Vec<_> = regions
         .iter()
         .map(|r| (GuestAddress(r.gpa), r.len as usize))

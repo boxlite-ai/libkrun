@@ -32,9 +32,21 @@ disk backup. No compatibility promise is made for the old full-image v9 format.
 ## Byte API and single-file artifact
 
 The codec returns an owned `Vec<u8>` from `save(&GuestMemoryMmap)` and accepts a
-borrowed `&[u8]` in `restore`. It does not open, create, sync or delete files.
+borrowed `&[u8]` in `restore`. Neither function takes resource-limit arguments.
+It does not open, create, sync or delete files.
 The caller can pass the bytes to another component or persist them as one file.
 Export currently allocates an additional buffer approximately the size of RAM.
+
+`get_metadata(&[u8])` returns the format version, total RAM payload bytes and
+region addresses/lengths without allocating guest RAM. Callers may inspect
+`metadata.regions.len()` and `metadata.memory_bytes` to enforce their own limits,
+check page alignment or otherwise accept/reject the layout before `restore`.
+The codec retains encoding checks (header/version, reserved fields, lengths and
+arithmetic) and refuses source mappings without read permission. It imposes no
+region-count/memory-budget limits or fixed page alignment; file/shared mappings
+can be copied when the caller quiesces every writer. Invalid destination mappings
+are reported by GuestMemoryMmap during restore. These bytes capture contents,
+not host backing-file identities or sharing relationships.
 
 The final VM checkpoint must also be **one file**: a versioned envelope holds
 CPU/VM/device metadata and RAM sections together, without metadata sidecars or
@@ -87,7 +99,7 @@ platform builds); do not conflate cross-compilation with runtime tests.
 
 | PR | Goal and production scope | Prerequisites | Budget | Verification |
 |---|---|---|---:|---|
-| 01 | RAM v1 byte encode/decode, checked layout, bounded restore allocation; `vmm/ram_snapshot.rs` | main | 330 | H: discontiguous byte round trip, borrowed container section, malformed images, mapping refusal |
+| 01 | RAM v1 byte encode/decode and metadata inspection, caller-owned resource policy; `vmm/ram_snapshot.rs` | main | 330 | H: discontiguous byte round trip, borrowed container section, metadata policy inputs, malformed images |
 | 02 | vCPU pause acknowledgements, bounded requests and terminal timeout handling; existing `linux/vstate.rs` channels | 01 | 280 | K: pause/resume, repeated pause, exit/disconnect/late reply |
 | 03 | Capture/restore existing CPU state on the owning paused thread; `vstate.rs`, new `vstate/snapshot.rs` | 02 | 340 | K: register continuation, running-state refusal, no missed replies |
 | 04 | Dynamic XSAVE sizing, XCRS and partial MSR transfer checks in the existing state methods | 03 | 340 | H: sizes/order; K: extended state, supported MSRs |
@@ -168,15 +180,15 @@ later K-marked steps cannot be called runtime-validated on this machine.
 
 ## PR 01 result
 
-Implemented `ram_snapshot::save(&GuestMemoryMmap) -> io::Result<Vec<u8>>` and
-`restore(&[u8], max_regions, max_memory_bytes)` with the reference RAM v1 layout,
-ordered/nonoverlapping 4 KiB guest regions, checked arithmetic, exact image
-length and caller-supplied region/memory limits before RAM allocation. Save
-accepts only owned private anonymous mappings and returns the complete image;
-restore copies the borrowed payload into independent guest RAM. Callers must
-quiesce all RAM writers during export. The codec has no filesystem operations
-or payload checksum. No production lifecycle, kernel mapping exception, device
-snapshot or C entry point was added.
+Implemented `ram_snapshot::save(&GuestMemoryMmap) -> io::Result<Vec<u8>>`,
+`get_metadata(&[u8]) -> io::Result<Metadata>` and
+`restore(&[u8]) -> io::Result<GuestMemoryMmap>` using the reference RAM v1 layout.
+Metadata exposes version, total RAM bytes and each region's address/length.
+Resource and platform policy belongs to callers; the codec checks encoding and
+copies readable mappings into independent anonymous guest RAM on restore.
+Callers must quiesce all RAM writers during export. No filesystem operations,
+payload checksum, production VM lifecycle, device snapshot or C entry point
+was added.
 
 Validation on macOS arm64 (2026-11-04):
 
@@ -193,9 +205,9 @@ Whole-PR count against the baseline above (including this plan):
 
 | Category | Raw additions | Raw deletions | Nonblank, non-comment code additions + deletions |
 |---|---:|---:|---:|
-| Production (`lib.rs`, `ram_snapshot.rs`) | 192 | 0 | **161 + 0 = 161** |
-| Tests (`ram_snapshot/tests.rs`) | 146 | 0 | 135 + 0 |
-| Documentation (this file) | 201 | 0 | n/a |
-| Total | 539 | 0 | Production gate: **161 <= 400** |
+| Production (`lib.rs`, `ram_snapshot.rs`) | 162 | 0 | **124 + 0 = 124** |
+| Tests (`ram_snapshot/tests.rs`) | 162 | 0 | 149 + 0 |
+| Documentation (this file) | 213 | 0 | n/a |
+| Total | 537 | 0 | Production gate: **124 <= 400** |
 
 No manifest, lockfile, generated artifact or unrelated platform fix changed.
