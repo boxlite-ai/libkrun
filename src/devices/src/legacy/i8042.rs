@@ -69,6 +69,36 @@ const KEY_DEL: u16 = 0xE071;
 /// Internal i8042 buffer size, in bytes
 const BUF_SIZE: usize = 16;
 
+/// Registers and unread bytes in guest read order. Ring cursors are normalized,
+/// so this in-memory state does not depend on the host's usize width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I8042State {
+    pub status: u8,
+    pub control: u8,
+    pub outp: u8,
+    pub cmd: u8,
+    pub buffer: Vec<u8>,
+}
+
+impl I8042State {
+    pub fn validate(&self) -> io::Result<()> {
+        let known_status = SB_OUT_DATA_AVAIL | SB_I8042_CMD_DATA | SB_KBD_ENABLED;
+        if self.status & !known_status != 0
+            || self.status & SB_KBD_ENABLED == 0
+            || self.buffer.len() > BUF_SIZE
+            || (self.status & SB_OUT_DATA_AVAIL != 0) == self.buffer.is_empty()
+            || !matches!(self.cmd, 0 | CMD_WRITE_CTR | CMD_WRITE_OUTP)
+            || (self.status & SB_I8042_CMD_DATA != 0 && self.cmd == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid i8042 register or buffer state",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A i8042 PS/2 controller that emulates just enough to shutdown the machine.
 pub struct I8042Device {
     /// CPU reset eventfd. We will set this event when the guest issues CMD_RESET_CPU.
@@ -96,6 +126,44 @@ pub struct I8042Device {
 }
 
 impl I8042Device {
+    /// Caller must quiesce vCPUs and keyboard/event sources before capture.
+    /// Reset requests exist only in the host eventfd: the owner must settle them
+    /// before capture or track them separately; they cannot be inferred here.
+    pub fn save_state(&self) -> I8042State {
+        I8042State {
+            status: self.status,
+            control: self.control,
+            outp: self.outp,
+            cmd: self.cmd,
+            buffer: (0..self.buf_len())
+                .map(|i| self.buf[self.bhead.0.wrapping_add(i) % BUF_SIZE])
+                .collect(),
+        }
+    }
+
+    /// Validate before mutation while vCPUs and event sources remain quiesced.
+    /// Retain this device's reset/keyboard events, without draining or signaling
+    /// them. The caller must reconcile pending eventfd notifications and irqchip
+    /// state before resuming; buffered bytes do not imply an undelivered IRQ
+    /// (e.g. control-register reads queue data without signaling). Restore never
+    /// replays a reset or keyboard command. Subsequent guest reads rearm keyboard
+    /// interrupts using the existing behavior.
+    /// With fresh events, restore the irqchip and replay only IRQ notifications
+    /// the owner recorded as not yet delivered, exactly once. With reused events,
+    /// the owner must also remove stale notifications from execution after save.
+    pub fn restore_state(&mut self, state: &I8042State) -> io::Result<()> {
+        state.validate()?;
+        self.status = state.status;
+        self.control = state.control;
+        self.outp = state.outp;
+        self.cmd = state.cmd;
+        self.buf = [0; BUF_SIZE];
+        self.buf[..state.buffer.len()].copy_from_slice(&state.buffer);
+        self.bhead = Wrapping(0);
+        self.btail = Wrapping(state.buffer.len());
+        Ok(())
+    }
+
     /// Constructs an i8042 device that will signal the given event when the guest requests it.
     pub fn new(reset_evt: EventFd, kbd_interrupt_evt: EventFd) -> I8042Device {
         I8042Device {
@@ -302,6 +370,200 @@ impl BusDevice for I8042Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn device() -> I8042Device {
+        I8042Device::new(
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        )
+    }
+
+    fn read(device: &mut I8042Device, offset: u64) -> u8 {
+        let mut data = [0];
+        device.read(0, offset, &mut data);
+        data[0]
+    }
+
+    #[test]
+    fn snapshot_preserves_wrapped_input_and_rearms_irq_on_reads() {
+        let mut source = device();
+        // Move ring cursors past a wrap using actual guest reads.
+        for i in 0..BUF_SIZE + 3 {
+            source.trigger_key(i as u16).unwrap();
+            assert_eq!(read(&mut source, OFS_DATA), i as u8);
+        }
+        source.trigger_ctrl_alt_del().unwrap();
+        assert_eq!(read(&mut source, OFS_DATA), KEY_CTRL as u8);
+        let state = source.save_state();
+        assert_eq!(state.buffer, [KEY_ALT as u8, 0xe0, 0x71]);
+        let mut restored = device();
+        restored.restore_state(&state).unwrap();
+        assert_eq!(source.save_state(), state);
+        assert_eq!(restored.save_state(), state);
+        assert_eq!(
+            restored.kbd_interrupt_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for (i, expected) in state.buffer.iter().enumerate() {
+            assert_ne!(read(&mut restored, OFS_STATUS) & SB_OUT_DATA_AVAIL, 0);
+            assert_eq!(read(&mut restored, OFS_DATA), *expected);
+            if i + 1 < state.buffer.len() {
+                assert_eq!(restored.kbd_interrupt_evt.read().unwrap(), 1);
+            }
+        }
+        assert_eq!(read(&mut restored, OFS_STATUS), SB_KBD_ENABLED);
+        assert_eq!(read(&mut restored, OFS_DATA), 0);
+        assert_eq!(
+            restored.kbd_interrupt_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // The target's reset event remains bound, and no reset was replayed.
+        assert_eq!(
+            restored.reset_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        restored.write(0, OFS_STATUS, &[CMD_RESET_CPU]);
+        assert_eq!(restored.reset_evt.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn snapshot_preserves_pending_commands_and_disabled_keyboard() {
+        for (command, read_command, value) in [
+            (CMD_WRITE_CTR, CMD_READ_CTR, 0),
+            (CMD_WRITE_OUTP, CMD_READ_OUTP, 0x52),
+        ] {
+            let mut source = device();
+            source.write(0, OFS_STATUS, &[command]);
+            let state = source.save_state();
+            let mut restored = device();
+            restored.restore_state(&state).unwrap();
+            assert_ne!(read(&mut restored, OFS_STATUS) & SB_I8042_CMD_DATA, 0);
+            restored.write(0, OFS_DATA, &[value]);
+            assert_eq!(read(&mut restored, OFS_STATUS) & SB_I8042_CMD_DATA, 0);
+            restored.write(0, OFS_STATUS, &[read_command]);
+            // Register responses queue data without issuing an IRQ.
+            let response = restored.save_state();
+            restored.restore_state(&response).unwrap();
+            assert_eq!(
+                restored.kbd_interrupt_evt.read().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(read(&mut restored, OFS_DATA), value);
+            if command == CMD_WRITE_CTR {
+                restored.trigger_key(KEY_DEL).unwrap();
+                let disabled = restored.save_state();
+                restored.restore_state(&disabled).unwrap();
+                assert_eq!(
+                    restored.trigger_kbd_interrupt(),
+                    Err(Error::KbdInterruptDisabled)
+                );
+                assert_eq!(read(&mut restored, OFS_DATA), 0xe0);
+                assert_eq!(read(&mut restored, OFS_DATA), 0x71);
+                assert_eq!(
+                    restored.kbd_interrupt_evt.read().unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_does_not_replay_ack_irq_or_reset() {
+        let mut source = device();
+        source.write(0, OFS_DATA, &[0xed]); // Keyboard ACK and one IRQ.
+        source.write(0, OFS_STATUS, &[CMD_RESET_CPU]);
+        let state = source.save_state();
+        // Saving must not consume pending host notifications.
+        assert_eq!(source.reset_evt.read().unwrap(), 1);
+        assert_eq!(source.kbd_interrupt_evt.read().unwrap(), 1);
+        let mut restored = device();
+        restored.reset_evt.write(3).unwrap();
+        restored.kbd_interrupt_evt.write(5).unwrap();
+        restored.restore_state(&state).unwrap();
+        assert_eq!(restored.reset_evt.read().unwrap(), 3);
+        assert_eq!(restored.kbd_interrupt_evt.read().unwrap(), 5);
+        restored.restore_state(&state).unwrap();
+        assert_eq!(
+            restored.reset_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            restored.kbd_interrupt_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(read(&mut restored, OFS_DATA), 0xfa);
+        assert_eq!(read(&mut restored, OFS_DATA), 0);
+        restored.write(0, OFS_DATA, &[0xf4]);
+        assert_eq!(restored.kbd_interrupt_evt.read().unwrap(), 1);
+        assert_eq!(read(&mut restored, OFS_DATA), 0xfa);
+    }
+
+    #[test]
+    fn snapshot_preserves_full_buffer_and_cursor_overflow() {
+        let mut source = device();
+        // Seed the opaque cursor near usize overflow, then use device paths.
+        source.bhead = Wrapping(usize::MAX - 1);
+        source.btail = source.bhead;
+        for i in 0..BUF_SIZE {
+            source.trigger_key(i as u16).unwrap();
+        }
+        let state = source.save_state();
+        let mut restored = device();
+        restored.restore_state(&state).unwrap();
+        assert_eq!(
+            restored.trigger_key(KEY_DEL),
+            Err(Error::InternalBufferFull)
+        );
+        assert_eq!(
+            restored.trigger_ctrl_alt_del(),
+            Err(Error::InternalBufferFull)
+        );
+        assert_eq!(restored.save_state(), state);
+        for i in 0..BUF_SIZE {
+            assert_eq!(read(&mut restored, OFS_DATA), i as u8);
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_state_without_mutation() {
+        let mut target = device();
+        target.trigger_key(KEY_CTRL).unwrap();
+        let original = target.save_state();
+        let mut invalid = Vec::new();
+        for status in [0x80, SB_OUT_DATA_AVAIL, SB_KBD_ENABLED] {
+            let mut state = original.clone();
+            state.status = status;
+            invalid.push(state);
+        }
+        for buffer in [vec![], vec![0; BUF_SIZE + 1]] {
+            let mut state = original.clone();
+            state.buffer = buffer;
+            invalid.push(state);
+        }
+        let mut state = original.clone();
+        state.cmd = CMD_RESET_CPU;
+        invalid.push(state);
+        let mut state = original.clone();
+        state.status |= SB_I8042_CMD_DATA; // No pending command to receive the byte.
+        invalid.push(state);
+        for state in invalid {
+            assert_eq!(
+                state.validate().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                target.restore_state(&state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(target.save_state(), original);
+        }
+        assert_eq!(target.kbd_interrupt_evt.read().unwrap(), 1);
+        assert_eq!(
+            target.reset_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(read(&mut target, OFS_DATA), KEY_CTRL as u8);
+    }
 
     impl PartialEq for Error {
         fn eq(&self, other: &Error) -> bool {
