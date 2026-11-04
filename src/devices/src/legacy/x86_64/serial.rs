@@ -53,6 +53,41 @@ const DEFAULT_MODEM_CONTROL: u8 = 0x8; // Auxiliary output 2
 const DEFAULT_MODEM_STATUS: u8 = 0x20 | 0x10 | 0x80; // data ready, clear to send, carrier detect
 const DEFAULT_BAUD_DIVISOR: u16 = 12; // 9600 bps
 
+/// Device registers and unread input, without host endpoints or eventfd counters.
+/// This is an in-memory state, not a versioned wire format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialState {
+    pub interrupt_enable: u8,
+    pub interrupt_identification: u8,
+    pub line_control: u8,
+    pub line_status: u8,
+    pub modem_control: u8,
+    pub modem_status: u8,
+    pub scratch: u8,
+    pub baud_divisor: u16,
+    pub unread_input: Vec<u8>,
+}
+
+impl SerialState {
+    pub fn validate(&self) -> io::Result<()> {
+        let iir = self.interrupt_identification;
+        if self.interrupt_enable & !IER_FIFO_BITS != 0
+            || (iir != IIR_NONE_BIT && (iir == 0 || iir & !(IIR_THR_BIT | IIR_RECV_BIT) != 0))
+            || self.line_status & !LSR_DATA_BIT != DEFAULT_LINE_STATUS
+            || self.modem_status != DEFAULT_MODEM_STATUS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid UART register state",
+            ));
+        }
+        // IER may be disabled after an IRQ becomes pending. Empty host reads can
+        // set DATA with no input; failed IRQ writes can leave input without DATA.
+        // Host input is unbounded, including before switching into loopback.
+        Ok(())
+    }
+}
+
 /// Emulates serial COM ports commonly seen on x86 I/O ports 0x3f8/0x2f8/0x3e8/0x2e8.
 ///
 /// This can optionally write the guest's output to a Write trait object. To send input to the
@@ -73,6 +108,44 @@ pub struct Serial {
 }
 
 impl Serial {
+    /// Caller must quiesce vCPUs and host input/event sources before capture.
+    /// Only input already consumed from the host endpoint is captured.
+    pub fn save_state(&self) -> SerialState {
+        SerialState {
+            interrupt_enable: self.interrupt_enable,
+            interrupt_identification: self.interrupt_identification,
+            line_control: self.line_control,
+            line_status: self.line_status,
+            modem_control: self.modem_control,
+            modem_status: self.modem_status,
+            scratch: self.scratch,
+            baud_divisor: self.baud_divisor,
+            unread_input: self.in_buffer.iter().copied().collect(),
+        }
+    }
+
+    /// Validate before mutation; retain this device's input, output and IRQ event.
+    /// Caller must keep vCPUs and event sources quiesced. No output or IRQ is
+    /// replayed, and no eventfd is drained. The caller must reconcile outstanding
+    /// eventfd notifications with saved irqchip state before resuming. IIR alone
+    /// cannot tell whether an IRQ has already reached the irqchip or been acked.
+    /// With fresh events, restore the irqchip and replay only notifications the
+    /// owner recorded as not yet delivered, exactly once. With reused events,
+    /// the owner must also remove stale notifications from execution after save.
+    pub fn restore_state(&mut self, state: &SerialState) -> io::Result<()> {
+        state.validate()?;
+        self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_identification = state.interrupt_identification;
+        self.line_control = state.line_control;
+        self.line_status = state.line_status;
+        self.modem_control = state.modem_control;
+        self.modem_status = state.modem_status;
+        self.scratch = state.scratch;
+        self.baud_divisor = state.baud_divisor;
+        self.in_buffer = state.unread_input.iter().copied().collect();
+        Ok(())
+    }
+
     pub fn new(
         interrupt_evt: EventFd,
         out: Option<Box<dyn io::Write + Send>>,
@@ -351,6 +424,172 @@ mod tests {
     impl ReadableFd for SharedBuffer {}
 
     static RAW_INPUT_BUF: [u8; 3] = [b'a', b'b', b'c'];
+
+    fn read_register(serial: &mut Serial, offset: u8) -> u8 {
+        let mut data = [0];
+        serial.read(0, u64::from(offset), &mut data);
+        data[0]
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_registers_input_and_pending_irqs() {
+        let old_output = SharedBuffer::new();
+        let mut source = Serial::new_out(
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Box::new(old_output.clone()),
+        );
+        source.write(0, IER.into(), &[IER_RECV_BIT | IER_THR_BIT]);
+        source.raw_input(b"abc").unwrap();
+        assert_eq!(read_register(&mut source, DATA), b'a');
+        source.raw_input(b"d").unwrap();
+        source.write(0, DATA.into(), b"!");
+        source.write(0, IER.into(), &[0]); // Disabling IER does not clear pending IIR.
+        source.write(0, MCR.into(), &[0xff]);
+        source.write(0, SCR.into(), &[0x5a]);
+        source.write(0, LCR.into(), &[LCR_DLAB_BIT | 3]);
+        source.write(0, DLAB_LOW.into(), &[0x12]);
+        source.write(0, DLAB_HIGH.into(), &[0x34]);
+        let state = source.save_state();
+        state.validate().unwrap();
+
+        let endpoint = SharedBuffer::new();
+        let irq = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let mut restored = Serial::new_in_out(
+            irq.try_clone().unwrap(),
+            Box::new(endpoint.clone()),
+            Box::new(endpoint.clone()),
+        );
+        let input_fd = restored.interest_list()[0].fd();
+        irq.write(7).unwrap(); // Existing target notifications must remain untouched.
+        restored.restore_state(&state).unwrap();
+        assert_eq!(irq.read().unwrap(), 7);
+        restored.restore_state(&state).unwrap();
+        assert_eq!(irq.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(source.save_state(), state);
+        assert_eq!(source.interrupt_evt().read().unwrap(), 3);
+        assert_eq!(restored.save_state(), state);
+        assert_eq!(restored.interest_list()[0].fd(), input_fd);
+        assert!(endpoint.internal.lock().unwrap().write_buf.is_empty());
+        assert_eq!(read_register(&mut restored, LCR), LCR_DLAB_BIT | 3);
+        assert_eq!(read_register(&mut restored, DLAB_LOW), 0x12);
+        assert_eq!(read_register(&mut restored, DLAB_HIGH), 0x34);
+        restored.write(0, LCR.into(), &[3]);
+        assert_eq!(read_register(&mut restored, IER), 0);
+        assert_eq!(read_register(&mut restored, MCR), 0xff);
+        assert_eq!(read_register(&mut restored, MSR), DEFAULT_MODEM_STATUS);
+        assert_eq!(read_register(&mut restored, SCR), 0x5a);
+        assert_eq!(
+            read_register(&mut restored, IIR),
+            IIR_FIFO_BITS | IIR_RECV_BIT | IIR_THR_BIT
+        );
+        assert_eq!(
+            read_register(&mut restored, IIR),
+            IIR_FIFO_BITS | IIR_NONE_BIT
+        );
+        for byte in b"bcd" {
+            assert_eq!(read_register(&mut restored, LSR) & LSR_DATA_BIT, 1);
+            assert_eq!(read_register(&mut restored, DATA), *byte);
+        }
+        assert_eq!(read_register(&mut restored, LSR), DEFAULT_LINE_STATUS);
+        assert_eq!(read_register(&mut restored, DATA), 0);
+
+        // Use the retained host endpoints after restore, without replaying old output.
+        restored.write(0, MCR.into(), &[DEFAULT_MODEM_CONTROL]);
+        restored.write(0, DATA.into(), b"?");
+        assert_eq!(old_output.internal.lock().unwrap().write_buf, b"!");
+        assert_eq!(endpoint.internal.lock().unwrap().write_buf, b"?");
+        endpoint.internal.lock().unwrap().read_buf = b"z".to_vec();
+        restored.write(0, IER.into(), &[IER_RECV_BIT]);
+        restored.process(
+            &EpollEvent::new(EventSet::IN, input_fd as u64),
+            &mut EventManager::new().unwrap(),
+        );
+        assert_eq!(irq.read().unwrap(), 1);
+        assert_eq!(read_register(&mut restored, DATA), b'z');
+    }
+
+    #[test]
+    fn snapshot_accepts_empty_host_reads_and_large_loopback_input() {
+        let mut serial = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        serial.raw_input(&[]).unwrap();
+        let empty = serial.save_state();
+        serial.restore_state(&empty).unwrap();
+        assert_eq!(read_register(&mut serial, LSR) & LSR_DATA_BIT, 1);
+        assert_eq!(read_register(&mut serial, DATA), 0);
+        serial.raw_input(&[0x55; LOOP_SIZE + 1]).unwrap();
+        serial.write(0, MCR.into(), &[MCR_LOOP_BIT]);
+        let state = serial.save_state();
+        serial.restore_state(&state).unwrap();
+        serial.write(0, DATA.into(), &[0xaa]); // Full loopback buffer drops the byte.
+        assert_eq!(serial.save_state(), state);
+        for _ in 0..LOOP_SIZE + 1 {
+            assert_eq!(read_register(&mut serial, DATA), 0x55);
+        }
+        serial.write(0, DATA.into(), &[0xaa]);
+        assert_eq!(read_register(&mut serial, DATA), 0xaa);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_preserves_input_after_irq_notification_failure() {
+        let irq = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new_sink(irq.try_clone().unwrap());
+        serial.write(0, IER.into(), &[IER_RECV_BIT]);
+        irq.write(u64::MAX - 1).unwrap();
+        assert_eq!(
+            serial.raw_input(b"x").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let state = serial.save_state();
+        serial.restore_state(&state).unwrap();
+        assert_eq!(irq.read().unwrap(), u64::MAX - 1);
+        assert_eq!(read_register(&mut serial, LSR), DEFAULT_LINE_STATUS);
+        assert_eq!(
+            read_register(&mut serial, IIR),
+            IIR_FIFO_BITS | IIR_RECV_BIT
+        );
+        assert_eq!(read_register(&mut serial, DATA), b'x');
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_registers_without_mutation() {
+        let mut serial = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        serial.raw_input(b"keep").unwrap();
+        let original = serial.save_state();
+        let mut invalid = Vec::new();
+        let mut state = original.clone();
+        state.interrupt_enable = 0x80;
+        invalid.push(state);
+        for iir in [0, 3, 5, 7, 0xc1] {
+            let mut state = original.clone();
+            state.interrupt_identification = iir;
+            invalid.push(state);
+        }
+        for lsr in [0, 1, 0x62, 0xe0] {
+            let mut state = original.clone();
+            state.line_status = lsr;
+            invalid.push(state);
+        }
+        let mut state = original.clone();
+        state.modem_status = 0;
+        invalid.push(state);
+        for state in invalid {
+            assert_eq!(
+                state.validate().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                serial.restore_state(&state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(serial.save_state(), original);
+        }
+        assert_eq!(
+            serial.interrupt_evt().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(read_register(&mut serial, DATA), b'k');
+    }
 
     #[test]
     fn test_event_handling_no_in() {
