@@ -33,6 +33,7 @@ pub mod mem;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod persist;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
