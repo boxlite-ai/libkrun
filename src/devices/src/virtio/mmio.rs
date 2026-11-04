@@ -14,6 +14,7 @@ use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 use super::device_status;
+use super::persist::{invalid, MmioTransportState, VirtioDeviceState};
 use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
@@ -163,6 +164,83 @@ impl InterruptTransport {
 }
 
 impl MmioTransport {
+    /// Capture only while the guest and device workers are quiesced. Pending
+    /// host notifications are not serialized; integration must rescan queues on
+    /// resume and restore/reassert the interrupt controller's pending IRQ state.
+    pub fn save_state(&self) -> io::Result<MmioTransportState> {
+        let device = VirtioDeviceState::save(&*self.locked_device())?;
+        if device.activated != self.queues.is_none() {
+            return Err(invalid("queue ownership disagrees with device activation"));
+        }
+        let queues = self
+            .queues
+            .as_ref()
+            .map(|queues| {
+                queues
+                    .iter()
+                    .map(|q| q.save_state(&self.mem, false))
+                    .collect::<io::Result<Vec<_>>>()
+            })
+            .transpose()?;
+        Ok(MmioTransportState {
+            device,
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            shm_region_select: self.shm_region_select,
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst) as u32,
+            queues,
+        })
+    }
+
+    /// Restore into a newly constructed transport with fresh notification FDs.
+    /// For active snapshots, first restore device features and device-specific
+    /// state, then activate its workers *frozen*, using this transport's queue
+    /// events and interrupt handle. This method checks that activation matches;
+    /// it never calls ordinary activate() or resumes a worker.
+    pub fn restore_state(&mut self, state: &MmioTransportState) -> io::Result<()> {
+        let mut device = self.locked_device();
+        state.device.validate(&*device)?;
+        if state.device.activated != device.is_activated()
+            || state.device.activated != state.queues.is_none()
+        {
+            return Err(invalid(
+                "restore requires matching device activation and queues",
+            ));
+        }
+        let queues = state
+            .queues
+            .as_ref()
+            .map(|queues| state.device.restore_queues(queues, &self.mem))
+            .transpose()?;
+        if state.device.activated {
+            if device.acked_features() != state.device.acked_features {
+                return Err(invalid("active device features have not been restored"));
+            }
+        } else {
+            state.device.restore_features(&mut *device)?;
+        }
+        drop(device);
+        self.queues = queues;
+        self.features_select = state.features_select;
+        self.acked_features_select = state.acked_features_select;
+        self.queue_select = state.queue_select;
+        self.device_status = state.device_status;
+        self.config_generation = state.config_generation;
+        self.shm_region_select = state.shm_region_select;
+        self.interrupt
+            .status()
+            .store(state.interrupt_status as usize, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Handle to bind to a device during device-specific frozen restoration.
+    pub fn interrupt_transport(&self) -> InterruptTransport {
+        self.interrupt.clone()
+    }
+
     /// Constructs a new MMIO transport for the given virtio device.
     pub fn new(
         mem: GuestMemoryMmap,
@@ -526,6 +604,10 @@ impl BusDevice for MmioTransport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "mmio_persist_tests.rs"]
+mod persist_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

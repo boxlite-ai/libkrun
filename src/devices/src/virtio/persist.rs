@@ -8,7 +8,8 @@ use std::num::Wrapping;
 
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::Queue;
+use super::{Queue, VirtioDevice};
+use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 pub(crate) fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, reason)
@@ -114,6 +115,94 @@ impl QueueState {
         self.validate(mem, max_size, activated)?;
         Ok(self.queue())
     }
+}
+
+/// Common device identity and negotiation state. Device-specific state and worker
+/// activation are owned by each device's restore implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtioDeviceState {
+    pub device_type: u32,
+    pub avail_features: u64,
+    pub acked_features: u64,
+    pub activated: bool,
+    pub queue_max_sizes: Vec<u16>,
+}
+
+impl VirtioDeviceState {
+    pub fn save(device: &dyn VirtioDevice) -> io::Result<Self> {
+        let state = Self {
+            device_type: device.device_type(),
+            avail_features: device.avail_features(),
+            acked_features: device.acked_features(),
+            activated: device.is_activated(),
+            queue_max_sizes: device.queue_config().iter().map(|q| q.size).collect(),
+        };
+        state.validate(device)?;
+        Ok(state)
+    }
+
+    pub fn validate(&self, device: &dyn VirtioDevice) -> io::Result<()> {
+        if self.device_type != device.device_type()
+            || self.avail_features != device.avail_features()
+            || self.acked_features & !self.avail_features != 0
+            || !self
+                .queue_max_sizes
+                .iter()
+                .copied()
+                .eq(device.queue_config().iter().map(|q| q.size))
+        {
+            return Err(invalid("incompatible virtio device"));
+        }
+        Ok(())
+    }
+
+    /// Apply negotiation before device-specific frozen activation. This never
+    /// calls activate(), starts workers, or changes the destination's lifecycle.
+    pub fn restore_features(&self, device: &mut dyn VirtioDevice) -> io::Result<()> {
+        self.validate(device)?;
+        if device.is_activated() {
+            return Err(invalid("cannot restore features on an active device"));
+        }
+        device.set_acked_features(self.acked_features);
+        Ok(())
+    }
+
+    /// Validate and reconstruct a device's queues, including EVENT_IDX agreement.
+    pub fn restore_queues(
+        &self,
+        states: &[QueueState],
+        mem: &GuestMemoryMmap,
+    ) -> io::Result<Vec<Queue>> {
+        if states.len() != self.queue_max_sizes.len() {
+            return Err(invalid("queue count differs from device"));
+        }
+        let event_idx = self.acked_features & (1 << VIRTIO_RING_F_EVENT_IDX) != 0;
+        states
+            .iter()
+            .zip(&self.queue_max_sizes)
+            .map(|(state, max)| {
+                if self.activated && state.event_idx_enabled != event_idx {
+                    return Err(invalid("queue EVENT_IDX differs from negotiated features"));
+                }
+                state.restore(mem, *max, self.activated)
+            })
+            .collect()
+    }
+}
+
+/// MMIO registers plus queues still owned by an inactive transport. Active
+/// queues belong to device workers and must be captured separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmioTransportState {
+    pub device: VirtioDeviceState,
+    pub features_select: u32,
+    pub acked_features_select: u32,
+    pub queue_select: u32,
+    pub device_status: u32,
+    pub config_generation: u32,
+    pub shm_region_select: u32,
+    pub interrupt_status: u32,
+    pub queues: Option<Vec<QueueState>>,
 }
 
 #[cfg(test)]
