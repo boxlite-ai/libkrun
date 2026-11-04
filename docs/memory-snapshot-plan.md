@@ -5,9 +5,12 @@
 Prepared against `e12b9b3780ffa8df9f3e1797b217d13453479167` (main), using
 `2294eeafde8777c3d7531763452130360ec0a3dd` (origin/x_features) as reference only.
 The checkout is shallow; the investigation uses two-tree diffs, not an assumed
-merge base. No merge, whole-commit cherry-pick, push or remote PR is needed.
+merge base. No merge or whole-commit cherry-pick is needed.
 The local first-PR branch is `lfld287/memory-snapshot`. Keep origin's fetch URL
-at boxlite-ai/libkrun and push URL at lfld287/libkrun.
+at boxlite-ai/libkrun and push URL at lfld287/libkrun. Publish this first PR from
+`lfld287:lfld287/snapshot-01-ram-codec` to `boxlite-ai/libkrun:main`; the fork's existing
+`lfld287/memory-snapshot` branch contains the old large implementation and must
+not be overwritten or merged into this increment.
 
 There is no repository AGENTS.md, CONTRIBUTING file or production-line counting
 rule in this checkout. README.md requires a small VMM and a stable C ABI.
@@ -174,9 +177,10 @@ placeholder, not a working guest or evidence of Linux/HVF VM execution.
 PR 01 checks: `cargo fmt --all -- --check`, `git diff --check`, and with that
 override, `cargo test --locked -p krun-vmm ram_snapshot`,
 `cargo check --locked -p libkrun --features blk,net`, and focused Clippy. Record
-actual results and pre-existing failures in the delivery report. Linux/KVM
-tests and a real Linux-init macOS build remain necessary on suitable hosts;
-later K-marked steps cannot be called runtime-validated on this machine.
+actual results and pre-existing failures in the delivery report. Linux/KVM checks
+must run on a suitable remote host, as recorded below. A real
+Linux-init macOS build remains unverified; later K-marked implementation steps
+will still need their own runtime validation.
 
 ## PR 01 result
 
@@ -194,12 +198,28 @@ Validation on macOS arm64 (2026-11-04):
 
 * PASS: `cargo fmt --all -- --check` and `git diff --check`.
 * PASS: `KRUN_INIT_BINARY_PATH=/dev/null cargo test --locked -p krun-vmm ram_snapshot`
-  — 5 passed, 0 failed, 20 unrelated tests filtered out.
+  — 5 passed; the subsequent full `cargo test --locked -p krun-vmm` also passed
+  all 25 tests, with no ignored tests.
 * PASS: `KRUN_INIT_BINARY_PATH=/dev/null cargo clippy --locked -p krun-vmm --no-deps -- -D warnings`.
 * PASS: `KRUN_INIT_BINARY_PATH=/dev/null cargo check --locked -p libkrun --features blk,net`.
-* Not run: Linux/KVM tests, VM boot/continuation, full feature/platform CI and a
-  macOS build with a real cross-compiled Linux init. The init override above
-  supplies an empty placeholder solely for these host checks.
+* The macOS init override supplies an empty placeholder solely for these checks.
+
+Additional validation on a Linux x86_64 host with readable/writable /dev/kvm,
+Rust 1.99.1 and a real compiled Linux init (no placeholder):
+
+* PASS: `cargo test --locked -p krun-vmm` — 30 passed, 0 failed, 1 ignored
+  (`linux::vstate::tests::test_get_supported_cpuid` already has `#[ignore]` in main).
+  Includes existing KVM memory initialization, vCPU configuration and kick tests.
+* PASS: `cargo check --locked -p libkrun --features blk,net`.
+* Strict `cargo clippy --locked -p krun-vmm --no-deps -- -D warnings` encounters
+  main's existing `clippy::byte_char_slices` at `builder.rs:1186`; this PR does not
+  change that file. The same command with `-A clippy::byte_char_slices` passes.
+* Sources were exported from commit `2982774` into a fresh remote temporary
+  directory; the RAM codec and test file SHA-256 hashes matched the local files.
+  Subsequent changes only update this validation/branch record.
+
+Not run: full feature/platform CI, a macOS build with a real cross-compiled
+Linux init, or VM checkpoint boot/continuation (not implemented by this PR).
 
 Whole-PR count against the baseline above (including this plan):
 
@@ -207,7 +227,7 @@ Whole-PR count against the baseline above (including this plan):
 |---|---:|---:|---:|
 | Production (`lib.rs`, `ram_snapshot.rs`) | 162 | 0 | **124 + 0 = 124** |
 | Tests (`ram_snapshot/tests.rs`) | 162 | 0 | 149 + 0 |
-| Documentation (this file) | 213 | 0 | n/a |
-| Total | 537 | 0 | Production gate: **124 <= 400** |
+| Documentation (this file) | 233 | 0 | n/a |
+| Total | 557 | 0 | Production gate: **124 <= 400** |
 
 No manifest, lockfile, generated artifact or unrelated platform fix changed.
