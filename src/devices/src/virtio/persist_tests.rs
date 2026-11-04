@@ -147,3 +147,29 @@ fn exact_memory_end_is_valid() {
     queue.used_ring = GuestAddress(0x10002 - (6 + 8 * 8));
     assert!(queue.save_state(&mem, true).is_ok());
 }
+
+#[test]
+fn restore_can_consume_last_descriptor_at_memory_end() {
+    let mem = memory();
+    let ring = VirtQueue::new(GuestAddress(0x100), &mem, 8);
+    let mut queue = ring.create_queue();
+    queue.desc_table = GuestAddress(0x10000 - 8 * 16);
+    mem.write_obj(
+        super::super::Descriptor {
+            addr: 0x1000,
+            len: 7,
+            flags: 0,
+            next: 0,
+        },
+        GuestAddress(0x10000 - 16),
+    )
+    .unwrap();
+    ring.avail.ring[0].set(7);
+    ring.avail.idx.set(1);
+    let state = queue.save_state(&mem, true).unwrap();
+    let mut restored = state.restore(&mem, 8, true).unwrap();
+    let chain = restored.pop(&mem).unwrap();
+    assert_eq!(chain.index, 7);
+    restored.add_used(&mem, chain.index, chain.len).unwrap();
+    assert_eq!(ring.used.ring[0].get().len, 7);
+}

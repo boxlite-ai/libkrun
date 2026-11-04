@@ -231,7 +231,9 @@ impl<'a> DescriptorChain<'a> {
         }
 
         let desc_head = mem.checked_offset(desc_table, (index as usize) * 16)?;
-        mem.checked_offset(desc_head, 16)?;
+        if !mem.check_range(desc_head, 16) {
+            return None;
+        }
 
         // These reads can't fail unless Guest memory is hopelessly broken.
         let desc = match mem.read_obj::<Descriptor>(desc_head) {
