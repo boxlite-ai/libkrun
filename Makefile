@@ -192,7 +192,8 @@ BSD_ARCH=$(subst x86_64,amd64,$(subst aarch64,arm64,$(ARCH)))
 $(FREEBSD_BASE_TXZ):
 	@echo "Downloading FreeBSD $(FREEBSD_VERSION) base for $(BSD_ARCH)..."
 	@mkdir -p $(FREEBSD_ROOTFS_DIR)
-	@curl -fL -o $@ https://download.freebsd.org/releases/$(BSD_ARCH)/$(FREEBSD_VERSION)/base.txz
+	@curl -fL -o $@ https://download.freebsd.org/releases/$(BSD_ARCH)/$(FREEBSD_VERSION)/base.txz || \
+		curl -fL -o $@ https://archive.freebsd.org/old-releases/$(BSD_ARCH)/$(FREEBSD_VERSION)/base.txz
 
 clean-sysroot:
 	rm -rf $(ROOTFS_DIR)
