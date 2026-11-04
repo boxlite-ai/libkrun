@@ -29,6 +29,20 @@ checkpoint milestone, not parity with all of x_features. Disk contents remain
 an external dependency and must match the checkpoint; a RAM snapshot is not a
 disk backup. No compatibility promise is made for the old full-image v9 format.
 
+## Byte API and single-file artifact
+
+The codec returns an owned `Vec<u8>` from `save(&GuestMemoryMmap)` and accepts a
+borrowed `&[u8]` in `restore`. It does not open, create, sync or delete files.
+The caller can pass the bytes to another component or persist them as one file.
+Export currently allocates an additional buffer approximately the size of RAM.
+
+The final VM checkpoint must also be **one file**: a versioned envelope holds
+CPU/VM/device metadata and RAM sections together, without metadata sidecars or
+per-region files. A section can be handed to this codec as a borrowed byte
+slice. The embedding application owns file publication and storage policy;
+C bindings will use buffers and lengths with explicit ownership. External disk
+images remain workload dependencies, not extra memory-checkpoint files.
+
 ## Findings that determine the boundaries
 
 * `ram_snapshot.rs` combines a v1 RAM codec, mapping checks, file publication,
@@ -73,7 +87,7 @@ platform builds); do not conflate cross-compilation with runtime tests.
 
 | PR | Goal and production scope | Prerequisites | Budget | Verification |
 |---|---|---|---:|---|
-| 01 | RAM v1 save/restore, checked layout, exclusive output, bounded allocation; `vmm/ram_snapshot.rs` | main | 330 | H: discontiguous/chunked byte round trip, malformed images, mapping refusal, no overwrite |
+| 01 | RAM v1 byte encode/decode, checked layout, bounded restore allocation; `vmm/ram_snapshot.rs` | main | 330 | H: discontiguous byte round trip, borrowed container section, malformed images, mapping refusal |
 | 02 | vCPU pause acknowledgements, bounded requests and terminal timeout handling; existing `linux/vstate.rs` channels | 01 | 280 | K: pause/resume, repeated pause, exit/disconnect/late reply |
 | 03 | Capture/restore existing CPU state on the owning paused thread; `vstate.rs`, new `vstate/snapshot.rs` | 02 | 340 | K: register continuation, running-state refusal, no missed replies |
 | 04 | Dynamic XSAVE sizing, XCRS and partial MSR transfer checks in the existing state methods | 03 | 340 | H: sizes/order; K: extended state, supported MSRs |
@@ -81,8 +95,8 @@ platform builds); do not conflate cross-compilation with runtime tests.
 | 06 | TSC frequency/deadline ordering and multi-vCPU offset synchronization | 05 | 300 | K: two-vCPU time/interrupt continuation; incompatible target refusal |
 | 07 | VM clock/PIT/irqchip state serialization and validation around existing VmState methods | 06 | 280 | H: malformed state; K: timer/interrupt round trip |
 | 08 | Minimal owner of fixed anonymous RAM, Vm and vCPU handles, with paused construction and ordered teardown; `snapshot_vm.rs` | 07 | 340 | K: construct, pause/resume and stop a device-free test guest; repeated failure cleanup |
-| 09 | Versioned CPU/VM metadata envelope and checked RAM export from the paused owner | 08 | 350 | H: lengths/version/metadata limits; K: live export refusal, incomplete export |
-| 10 | Restore envelope into a new paused owner; validate before RAM allocation or KVM mutation | 09 | 350 | K: guest continuation, multi-vCPU round trip, failure keeps guest stopped |
+| 09 | Single-buffer versioned CPU/VM metadata + RAM envelope exported from the paused owner | 08 | 350 | H: lengths/version/metadata limits; K: live export refusal, incomplete export |
+| 10 | Restore a borrowed envelope byte slice into a new paused owner; validate before RAM allocation or KVM mutation | 09 | 350 | K: guest continuation, multi-vCPU round trip, failure keeps guest stopped |
 | 11 | Virtqueue save/restore with ring cursor, range and wrapping validation; `virtio/persist.rs`, `queue.rs` | 10 | 300 | H: real rings, u16 wrap, invalid ranges, inactive queues |
 | 12 | Common virtio device and MMIO save/restore, preserving selectors/interrupt status; `persist.rs`, `mmio.rs` | 11 | 320 | H: transport round trip without renegotiation |
 | 13 | Bounded worker control plus block worker freeze/flush/resume; `virtio/control.rs`, `block/worker.rs` | 12 | 350 | H: outstanding I/O, flush errors, timeout/late reply, frozen start |
@@ -98,8 +112,8 @@ platform builds); do not conflate cross-compilation with runtime tests.
 | 23 | Restricted Linux payload preparation using existing builder helpers; `builder.rs`, snapshot boot module | 22 | 340 | H: reject excluded devices/TEE/Nitro/nested configs before opening resources; K: initramfs boot |
 | 24 | Boot/restore routing and lifecycle facade on the owner; `snapshot_vm.rs` | 23 | 330 | K: boot → pause → export → stop → import → resume, exit status, multi-vCPU |
 | 25 | C context opt-in plus working pause/resume/state/stop routing; `libkrun/snapshot/control.rs`, `lib.rs`, header | 24 | 350 | H/K + F: context races, errno, unsupported platforms return ENOTSUP |
-| 26 | C descriptor-based export with explicit external disk binding/ownership; snapshot descriptor module and header | 25 | 350 | H/K: FD lifetime/duplication, failure ownership, C ABI consumer |
-| 27 | C import setup and start-enter routing into paused restore; libkrun snapshot module | 26 | 350 | K + F: C boot/export/import/continue, no payload reload during import |
+| 26 | C buffer/length export with explicit allocation/release and external disk binding; snapshot module and header | 25 | 350 | H/K: buffer lifetime/release, failure ownership, C ABI consumer |
+| 27 | C buffer/length import setup and start-enter routing into paused restore; libkrun snapshot module | 26 | 350 | K + F: C boot/export/import/continue, input lifetime, no payload reload during import |
 
 PRs 20–24 need particular care: the old console/boot code includes broader
 device support. Preserve the restricted milestone and reuse existing helpers;
@@ -154,21 +168,21 @@ later K-marked steps cannot be called runtime-validated on this machine.
 
 ## PR 01 result
 
-Implemented `ram_snapshot::save` and `restore` with the reference RAM v1 layout,
-64 KiB bounded copying, ordered/nonoverlapping 4 KiB guest regions, checked
-arithmetic, exact file length and caller-supplied region/memory limits before
-RAM allocation. Save accepts only owned private anonymous mappings, creates a
-new 0600 file and writes the completion magic last. Failed writes use best-effort
-invalidation/unlink. Callers must quiesce all RAM writers and exclusively own
-the output path; restore requires a stable input file. This format has no payload
-checksum or directory crash-durability guarantee. No production lifecycle,
-kernel mapping exception, device snapshot or C entry point was added.
+Implemented `ram_snapshot::save(&GuestMemoryMmap) -> io::Result<Vec<u8>>` and
+`restore(&[u8], max_regions, max_memory_bytes)` with the reference RAM v1 layout,
+ordered/nonoverlapping 4 KiB guest regions, checked arithmetic, exact image
+length and caller-supplied region/memory limits before RAM allocation. Save
+accepts only owned private anonymous mappings and returns the complete image;
+restore copies the borrowed payload into independent guest RAM. Callers must
+quiesce all RAM writers during export. The codec has no filesystem operations
+or payload checksum. No production lifecycle, kernel mapping exception, device
+snapshot or C entry point was added.
 
 Validation on macOS arm64 (2026-11-04):
 
 * PASS: `cargo fmt --all -- --check` and `git diff --check`.
 * PASS: `KRUN_INIT_BINARY_PATH=/dev/null cargo test --locked -p krun-vmm ram_snapshot`
-  — 7 passed, 0 failed, 20 unrelated tests filtered out.
+  — 5 passed, 0 failed, 20 unrelated tests filtered out.
 * PASS: `KRUN_INIT_BINARY_PATH=/dev/null cargo clippy --locked -p krun-vmm --no-deps -- -D warnings`.
 * PASS: `KRUN_INIT_BINARY_PATH=/dev/null cargo check --locked -p libkrun --features blk,net`.
 * Not run: Linux/KVM tests, VM boot/continuation, full feature/platform CI and a
@@ -179,9 +193,9 @@ Whole-PR count against the baseline above (including this plan):
 
 | Category | Raw additions | Raw deletions | Nonblank, non-comment code additions + deletions |
 |---|---:|---:|---:|
-| Production (`lib.rs`, `ram_snapshot.rs`) | 248 | 0 | **211 + 0 = 211** |
-| Tests (`ram_snapshot/tests.rs`) | 196 | 0 | 184 + 0 |
-| Documentation (this file) | 187 | 0 | n/a |
-| Total | 631 | 0 | Production gate: **211 <= 400** |
+| Production (`lib.rs`, `ram_snapshot.rs`) | 192 | 0 | **161 + 0 = 161** |
+| Tests (`ram_snapshot/tests.rs`) | 146 | 0 | 135 + 0 |
+| Documentation (this file) | 201 | 0 | n/a |
+| Total | 539 | 0 | Production gate: **161 <= 400** |
 
 No manifest, lockfile, generated artifact or unrelated platform fix changed.

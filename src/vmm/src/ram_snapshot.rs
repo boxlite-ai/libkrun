@@ -6,10 +6,7 @@
 //! for the entire save. Only owned, private anonymous RAM is supported. This
 //! codec neither discovers mappings outside `memory` nor freezes their owners.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
 
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
@@ -18,7 +15,6 @@ const VERSION: u32 = 1;
 const HEADER_LEN: u64 = 16;
 const REGION_LEN: u64 = 24;
 const PAGE_SIZE: u64 = 4096;
-const CHUNK_SIZE: usize = 64 * 1024;
 
 struct Region {
     gpa: u64,
@@ -94,93 +90,45 @@ fn memory_regions(memory: &GuestMemoryMmap) -> io::Result<Vec<Region>> {
         .collect()
 }
 
-struct PendingImage {
-    file: File,
-    path: PathBuf,
-    complete: bool,
-}
-
-impl PendingImage {
-    fn create(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            file: OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?,
-            path: path.to_owned(),
-            complete: false,
-        })
-    }
-
-    fn finish(mut self) -> io::Result<()> {
-        self.file.sync_all()?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(MAGIC)?;
-        self.file.sync_all()?;
-        self.complete = true;
-        Ok(())
-    }
-}
-
-impl Drop for PendingImage {
-    fn drop(&mut self) {
-        if !self.complete {
-            // Invalidate even a partially failed finalization before unlinking.
-            let _ = self.file.seek(SeekFrom::Start(0));
-            let _ = self.file.write_all(&[0; 8]);
-            let _ = self.file.sync_all();
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Save quiescent RAM to a new mode-0600 file; never overwrite an existing path.
+/// Encode quiescent RAM as one contiguous image owned by the caller.
 ///
-/// The caller must keep the destination path exclusively owned during this
-/// operation. Ordinary I/O failures trigger best-effort invalidation/removal.
-/// The magic is written last, after the table and payload have been synced.
-/// This does not provide directory crash durability or payload checksums.
-pub fn save(path: &Path, memory: &GuestMemoryMmap) -> io::Result<()> {
+/// The returned bytes include the header, region table and RAM payload. Storage
+/// and publication belong to the caller. This allocates an image roughly as large
+/// as guest RAM; all RAM writers must stay stopped until the copy completes.
+pub fn save(memory: &GuestMemoryMmap) -> io::Result<Vec<u8>> {
     let regions = memory_regions(memory)?;
-    validate_regions(&regions, regions.len(), u64::MAX)?;
-    let mut pending = PendingImage::create(path)?;
-    let file = &mut pending.file;
-    file.write_all(&[0; 8])?;
-    file.write_all(&VERSION.to_le_bytes())?;
-    file.write_all(&(regions.len() as u32).to_le_bytes())?;
+    let len = validate_regions(&regions, regions.len(), u64::MAX)?;
+    let len = usize::try_from(len).map_err(|_| invalid("RAM image exceeds host address space"))?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(len).map_err(io::Error::other)?;
+    image.extend_from_slice(MAGIC);
+    image.extend_from_slice(&VERSION.to_le_bytes());
+    image.extend_from_slice(&(regions.len() as u32).to_le_bytes());
     for region in &regions {
-        file.write_all(&region.gpa.to_le_bytes())?;
-        file.write_all(&region.len.to_le_bytes())?;
-        file.write_all(&region.attributes.to_le_bytes())?;
+        image.extend_from_slice(&region.gpa.to_le_bytes());
+        image.extend_from_slice(&region.len.to_le_bytes());
+        image.extend_from_slice(&region.attributes.to_le_bytes());
     }
-    let mut buffer = [0; CHUNK_SIZE];
+    let mut offset = image.len();
+    image.resize(len, 0);
     for region in &regions {
-        let mut offset = 0;
-        while offset < region.len {
-            let count = (region.len - offset).min(CHUNK_SIZE as u64) as usize;
-            memory
-                .read_slice(&mut buffer[..count], GuestAddress(region.gpa + offset))
-                .map_err(io::Error::other)?;
-            file.write_all(&buffer[..count])?;
-            offset += count as u64;
-        }
+        let end = offset + region.len as usize;
+        memory
+            .read_slice(&mut image[offset..end], GuestAddress(region.gpa))
+            .map_err(io::Error::other)?;
+        offset = end;
     }
-    pending.finish()
+    Ok(image)
 }
 
 fn read_regions(
-    file: &mut File,
+    image: &[u8],
     max_regions: usize,
     max_memory_bytes: u64,
 ) -> io::Result<Vec<Region>> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(invalid("RAM image must be a regular file"));
-    }
-    file.seek(SeekFrom::Start(0))?;
+    let mut reader = image;
     let mut header = [0; HEADER_LEN as usize];
-    file.read_exact(&mut header)?;
+    reader.read_exact(&mut header)?;
     if &header[..8] != MAGIC {
         return Err(invalid("invalid or incomplete RAM image"));
     }
@@ -191,20 +139,20 @@ fn read_regions(
     if count == 0 || count > max_regions {
         return Err(invalid("RAM region count exceeds target limit or is zero"));
     }
-    if HEADER_LEN + count as u64 * REGION_LEN > metadata.len() {
+    if HEADER_LEN + count as u64 * REGION_LEN > image.len() as u64 {
         return Err(invalid("truncated RAM region table"));
     }
     let mut regions = Vec::with_capacity(count);
     for _ in 0..count {
         let mut entry = [0; REGION_LEN as usize];
-        file.read_exact(&mut entry)?;
+        reader.read_exact(&mut entry)?;
         regions.push(Region {
             gpa: u64::from_le_bytes(entry[..8].try_into().unwrap()),
             len: u64::from_le_bytes(entry[8..16].try_into().unwrap()),
             attributes: u64::from_le_bytes(entry[16..24].try_into().unwrap()),
         });
     }
-    if validate_regions(&regions, max_regions, max_memory_bytes)? != metadata.len() {
+    if validate_regions(&regions, max_regions, max_memory_bytes)? != image.len() as u64 {
         return Err(invalid("RAM image length differs from region table"));
     }
     Ok(regions)
@@ -213,31 +161,27 @@ fn read_regions(
 /// Load independent anonymous RAM, checking the entire layout before allocation.
 ///
 /// `max_regions` and `max_memory_bytes` are caller-supplied resource limits,
-/// not values trusted from the image. The caller must prevent file mutation
-/// during restore. Reading starts at offset zero and advances the file cursor.
-/// No CPU/device state is restored and no guest execution is started.
+/// not values trusted from the image. The borrowed image is copied into new
+/// guest RAM and can be released after this call. No CPU/device state is
+/// restored and no guest execution is started.
 pub fn restore(
-    file: &mut File,
+    image: &[u8],
     max_regions: usize,
     max_memory_bytes: u64,
 ) -> io::Result<GuestMemoryMmap> {
-    let regions = read_regions(file, max_regions, max_memory_bytes)?;
+    let regions = read_regions(image, max_regions, max_memory_bytes)?;
     let ranges: Vec<_> = regions
         .iter()
         .map(|r| (GuestAddress(r.gpa), r.len as usize))
         .collect();
     let memory = GuestMemoryMmap::from_ranges(&ranges).map_err(io::Error::other)?;
-    let mut buffer = [0; CHUNK_SIZE];
+    let mut payload = &image[HEADER_LEN as usize + regions.len() * REGION_LEN as usize..];
     for region in &regions {
-        let mut offset = 0;
-        while offset < region.len {
-            let count = (region.len - offset).min(CHUNK_SIZE as u64) as usize;
-            file.read_exact(&mut buffer[..count])?;
-            memory
-                .write_slice(&buffer[..count], GuestAddress(region.gpa + offset))
-                .map_err(io::Error::other)?;
-            offset += count as u64;
-        }
+        let (bytes, remaining) = payload.split_at(region.len as usize);
+        memory
+            .write_slice(bytes, GuestAddress(region.gpa))
+            .map_err(io::Error::other)?;
+        payload = remaining;
     }
     Ok(memory)
 }

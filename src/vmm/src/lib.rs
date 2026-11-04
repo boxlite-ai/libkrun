@@ -16,7 +16,7 @@ extern crate log;
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
-/// RAM-only image I/O, independent of VM execution state.
+/// RAM-only byte image encoding, independent of VM execution state.
 pub mod ram_snapshot;
 /// Resource store for configured microVM resources.
 pub mod resources;
