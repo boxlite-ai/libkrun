@@ -51,17 +51,16 @@ impl HotplugRegion {
         let offset = slot as u64 * SLOT_SIZE;
         // The checked slot index is derived from a validated device block range.
         let host = unsafe { self.memory.as_ptr().add(offset as usize) };
-        if plug {
-            if unsafe {
+        if plug
+            && unsafe {
                 libc::mprotect(
                     host.cast(),
                     SLOT_SIZE as usize,
                     libc::PROT_READ | libc::PROT_WRITE,
                 )
             } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
+        {
+            return Err(io::Error::last_os_error());
         }
         let region = kvm_userspace_memory_region {
             slot: self.first_slot + slot as u32,

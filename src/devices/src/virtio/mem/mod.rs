@@ -177,10 +177,7 @@ impl Mem {
             return;
         };
         let mem = mem.clone();
-        loop {
-            let Some(head) = self.queue.as_mut().unwrap().queue.pop(&mem) else {
-                break;
-            };
+        while let Some(head) = self.queue.as_mut().unwrap().queue.pop(&mem) {
             let index = head.index;
             let mut request = [0u8; 24];
             let mut used = 0;
@@ -312,10 +309,9 @@ impl Subscriber for Mem {
             .queue
             .as_ref()
             .is_some_and(|q| q.event.as_raw_fd() == fd)
+            && self.queue.as_ref().unwrap().event.read().is_ok()
         {
-            if self.queue.as_ref().unwrap().event.read().is_ok() {
-                self.process_queue();
-            }
+            self.process_queue();
         }
     }
 }

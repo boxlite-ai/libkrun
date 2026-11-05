@@ -30,7 +30,7 @@ pub struct MemoryControl {
 
 impl MemoryControl {
     pub fn new(initial_mib: u32, max_mib: u32) -> io::Result<Self> {
-        if max_mib <= initial_mib || (max_mib - initial_mib) % SLOT_MIB != 0 {
+        if max_mib <= initial_mib || !(max_mib - initial_mib).is_multiple_of(SLOT_MIB) {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
         Ok(Self {
@@ -57,7 +57,7 @@ impl MemoryControl {
         }
         if total_mib < state.requested_mib
             || total_mib > state.max_mib
-            || (total_mib - self.initial_mib) % SLOT_MIB != 0
+            || !(total_mib - self.initial_mib).is_multiple_of(SLOT_MIB)
         {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }

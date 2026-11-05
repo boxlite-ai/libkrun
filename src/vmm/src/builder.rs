@@ -1457,7 +1457,7 @@ fn prepare_memory_hotplug(
     #[cfg(target_arch = "x86_64")]
     let addr = addr.max(arch::x86_64::layout::FIRST_ADDR_PAST_32BITS);
     #[cfg(target_arch = "x86_64")]
-    let address_bits = unsafe { std::arch::x86_64::__cpuid(0x80000008).eax & 0xff }.min(52);
+    let address_bits = (std::arch::x86_64::__cpuid(0x80000008).eax & 0xff).min(52);
     #[cfg(not(target_arch = "x86_64"))]
     let address_bits = 40;
     let address_slots = (1u64 << address_bits).saturating_sub(addr) / SLOT_SIZE;
