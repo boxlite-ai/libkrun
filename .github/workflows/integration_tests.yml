@@ -55,7 +55,18 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-x86_64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-x86_64.tgz -C tmp && sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
+        run: |
+          tag=$(curl -fsSL https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -er .tag_name)
+          fw_dir=$(mktemp -d)
+          trap 'rm -rf "$fw_dir"' EXIT
+          curl -fL --retry 3 -o "$fw_dir/firmware.tgz" "https://github.com/containers/libkrunfw/releases/download/$tag/libkrunfw-x86_64.tgz"
+          tar xf "$fw_dir/firmware.tgz" -C "$fw_dir"
+          lib_dir="$fw_dir/lib/x86_64-linux-gnu"
+          if [ ! -d "$lib_dir" ]; then
+            lib_dir="$fw_dir/lib64"
+          fi
+          sudo cp -a "$lib_dir"/libkrunfw.so* /lib/x86_64-linux-gnu/
+          sudo ldconfig
       
       - name: Integration tests
         run: KRUN_ENOMEM_WORKAROUND=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test NET=1 IPERF_DURATION=3 TEST_FLAGS="--keep-all --github-summary"
@@ -117,7 +128,18 @@ jobs:
           sudo make install
       
       - name: Install libkrunfw
-        run: TAG=`curl -sL https://api.github.com/repos/containers/libkrunfw/releases/latest |jq -r .tag_name` && curl -L -o /tmp/libkrunfw-aarch64.tgz https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-aarch64.tgz && mkdir tmp && tar xf /tmp/libkrunfw-aarch64.tgz -C tmp && sudo mv tmp/lib64/* /lib/aarch64-linux-gnu
+        run: |
+          tag=$(curl -fsSL https://api.github.com/repos/containers/libkrunfw/releases/latest | jq -er .tag_name)
+          fw_dir=$(mktemp -d)
+          trap 'rm -rf "$fw_dir"' EXIT
+          curl -fL --retry 3 -o "$fw_dir/firmware.tgz" "https://github.com/containers/libkrunfw/releases/download/$tag/libkrunfw-aarch64.tgz"
+          tar xf "$fw_dir/firmware.tgz" -C "$fw_dir"
+          lib_dir="$fw_dir/lib/aarch64-linux-gnu"
+          if [ ! -d "$lib_dir" ]; then
+            lib_dir="$fw_dir/lib64"
+          fi
+          sudo cp -a "$lib_dir"/libkrunfw.so* /lib/aarch64-linux-gnu/
+          sudo ldconfig
 
       - name: Clean up tests directory
         run: rm -fr /tmp/libkrun-tests
