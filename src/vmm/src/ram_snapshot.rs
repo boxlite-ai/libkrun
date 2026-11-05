@@ -108,7 +108,8 @@ pub fn get_metadata(image: &[u8]) -> io::Result<Metadata> {
     if HEADER_LEN + count as u64 * REGION_LEN > image.len() as u64 {
         return Err(invalid("truncated RAM region table"));
     }
-    let mut regions = Vec::with_capacity(count);
+    let mut regions = Vec::new();
+    regions.try_reserve_exact(count).map_err(io::Error::other)?;
     for _ in 0..count {
         let mut entry = [0; REGION_LEN as usize];
         reader.read_exact(&mut entry)?;

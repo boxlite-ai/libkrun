@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::os::unix::fs::FileExt;
 use utils::tempfile::TempFile;
 use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::{FileOffset, GuestRegionMmap};
@@ -133,7 +134,6 @@ fn readable_mappings_are_copied_to_anonymous_ram() {
             libc::MAP_ANONYMOUS | libc::MAP_SHARED,
             libc::PROT_READ | libc::PROT_WRITE,
         ),
-        (libc::MAP_ANONYMOUS | libc::MAP_PRIVATE, libc::PROT_READ),
         (libc::MAP_ANONYMOUS | libc::MAP_PRIVATE, libc::PROT_NONE),
     ] {
         let mapping = MmapRegionBuilder::new(4096)
@@ -159,4 +159,28 @@ fn readable_mappings_are_copied_to_anonymous_ram() {
             );
         }
     }
+}
+
+#[test]
+fn read_only_mapping_preserves_nonzero_contents() {
+    let backing = TempFile::new().unwrap();
+    let expected: Vec<_> = (0..4096).map(|i| (i % 251 + 1) as u8).collect();
+    backing.as_file().write_all_at(&expected, 0).unwrap();
+    // Populate the backing file before creating a mapping that is always read-only.
+    let mapping = MmapRegionBuilder::new(expected.len())
+        .with_file_offset(FileOffset::new(backing.as_file().try_clone().unwrap(), 0))
+        .with_mmap_flags(libc::MAP_PRIVATE)
+        .with_mmap_prot(libc::PROT_READ)
+        .build()
+        .unwrap();
+    let memory =
+        GuestMemoryMmap::from_regions(
+            vec![GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap()],
+        )
+        .unwrap();
+    let restored = restore(&save(&memory).unwrap()).unwrap();
+    let mut actual = vec![0; expected.len()];
+    restored.read_slice(&mut actual, GuestAddress(0)).unwrap();
+    assert_eq!(actual, expected);
+    assert!(restored.iter().next().unwrap().file_offset().is_none());
 }
