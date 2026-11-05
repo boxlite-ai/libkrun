@@ -81,12 +81,15 @@ pub fn arch_memory_regions(
                         panic!("Kernel doesn't fit in RAM");
                     }
 
-                    let ram_last_addr = kernel_load_addr + kernel_size as u64 + size as u64;
+                    // The kernel's injected mapping is part of the configured
+                    // RAM budget, just as it is in the above-MMIO-gap layout.
+                    let kernel_end = kernel_load_addr as usize + kernel_size;
+                    let ram_last_addr = size as u64;
                     (
                         ram_last_addr,
                         vec![
                             (GuestAddress(0), kernel_load_addr as usize),
-                            (GuestAddress(kernel_load_addr + kernel_size as u64), size),
+                            (GuestAddress(kernel_end as u64), size - kernel_end),
                         ],
                     )
                 } else {
@@ -302,7 +305,7 @@ pub fn configure_system(
             himem_start.raw_value(),
             // it's safe to use unchecked_offset_from because
             // mem_end > himem_start
-            last_addr.unchecked_offset_from(himem_start) + 1,
+            last_addr.unchecked_offset_from(himem_start),
             E820_RAM,
         )?;
     } else {
@@ -321,7 +324,7 @@ pub fn configure_system(
                 first_addr_past_32bits.raw_value(),
                 // it's safe to use unchecked_offset_from because
                 // mem_end > first_addr_past_32bits
-                last_addr.unchecked_offset_from(first_addr_past_32bits) + 1,
+                last_addr.unchecked_offset_from(first_addr_past_32bits),
                 E820_RAM,
             )?;
         }
@@ -374,7 +377,44 @@ mod tests {
             GuestAddress(KERNEL_LOAD_ADDR + KERNEL_SIZE as u64),
             regions[1].0
         );
-        assert_eq!(1usize << 29, regions[1].1);
+        assert_eq!(
+            (1usize << 29) - KERNEL_LOAD_ADDR as usize - KERNEL_SIZE,
+            regions[1].1
+        );
+    }
+
+    #[test]
+    fn boot_memory_budget_includes_the_bundled_kernel() {
+        for mib in [128, 256, 512, 3328, 3330, 4096] {
+            let size = mib << 20;
+            let (_, regions) =
+                arch_memory_regions(size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+            let mapped = regions.iter().map(|(_, len)| len).sum::<usize>() + KERNEL_SIZE;
+            assert_eq!(mapped, size, "{mib} MiB must include the kernel mapping");
+        }
+    }
+
+    #[test]
+    fn boot_memory_map_never_advertises_bytes_outside_ram() {
+        for mib in [128, 3328, 3330, 4096] {
+            let (info, regions) =
+                arch_memory_regions(mib << 20, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+            let mem = GuestMemoryMmap::from_ranges(&regions).unwrap();
+            configure_system(&mem, &info, GuestAddress(0), 0, &None, 1).unwrap();
+            let params: BootParamsWrapper =
+                mem.read_obj(GuestAddress(layout::ZERO_PAGE_START)).unwrap();
+            for entry in &params.0.e820_map[..usize::from(params.0.e820_entries)] {
+                if entry.type_ == E820_RAM {
+                    let last = entry.addr + entry.size - 1;
+                    assert!(
+                        regions
+                            .iter()
+                            .any(|(addr, len)| (addr.0..addr.0 + *len as u64).contains(&last)),
+                        "E820 advertises unmapped byte {last:#x} for {mib} MiB"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
