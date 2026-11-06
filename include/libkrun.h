@@ -1397,7 +1397,8 @@ int32_t krun_snapshot_get_state(uint32_t ctx_id, uint32_t *state, int32_t *exit_
 int32_t krun_snapshot_get_restored_share(uint32_t ctx_id, const char *tag,
                                          char *path, size_t path_len);
 
-/* Version-9 capabilities (zero on unsupported platforms/builds without blk). */
+/* Descriptor API capabilities (zero on unsupported platforms/builds without
+ * blk). MEMORY_V9 retains its ABI name; readers accept v9/v10, exports use v10. */
 #define KRUN_SNAPSHOT_CAP_MEMORY_V9 (1ull << 0)
 #define KRUN_SNAPSHOT_CAP_CAPTURE_RESERVATION (1ull << 1)
 #define KRUN_SNAPSHOT_CAP_EXTERNAL_FDS (1ull << 2)
@@ -1408,8 +1409,9 @@ int32_t krun_snapshot_get_restored_share(uint32_t ctx_id, const char *tag,
 uint64_t krun_snapshot_capabilities(void);
 
 /* All input FDs are borrowed and duplicated CLOEXEC. JSON is UTF-8, at most
- * 16 MiB; output lengths exclude NUL. Inspection validates v9 header, full
- * metadata/payload checksums and extents without KVM/resources. It returns
+ * 16 MiB; output lengths exclude NUL. Inspection validates v9/v10 headers,
+ * lengths and metadata/payload extents without KVM/resources. Content checksums
+ * are not verified, including for v9 images. It returns
  * metadata including application, disk dependencies and FUSE object references.
  * -ENOBUFS sets required length without transferring any FDs. */
 int32_t krun_snapshot_inspect_fd(int32_t memory_fd, uint8_t *json, size_t *length);

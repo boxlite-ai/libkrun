@@ -147,7 +147,9 @@ fn snapshot_v9_kvm_memory_external_pair_continues_and_reexports() {
     let dependencies: serde_json::Value = serde_json::from_slice(&inspected).unwrap();
     let mut missing_memory = dependencies.clone();
     missing_memory.as_object_mut().unwrap().remove("memory");
-    let error = serde_json::from_value::<Metadata>(missing_memory).err().expect("required nullable memory section");
+    let error = serde_json::from_value::<Metadata>(missing_memory)
+        .err()
+        .expect("required nullable memory section");
     assert!(error.to_string().contains("missing field `memory`"));
     assert_eq!(
         dependencies["disk_dependencies"][1]["external_readonly_boot"]["length"],
@@ -213,7 +215,7 @@ fn snapshot_v9_kvm_memory_external_pair_continues_and_reexports() {
 }
 
 #[test]
-fn snapshot_v9_external_disk_integrity_and_role_refusals() {
+fn snapshot_v10_external_disk_lengths_and_role_refusals() {
     let f = Fixture::new();
     let qcow = f.qcow2("disk.qcow2");
     let boot = f.writable("boot");
@@ -223,7 +225,6 @@ fn snapshot_v9_external_disk_integrity_and_role_refusals() {
         metadata: vec![],
         payload: 0,
         disk_len: qcow.metadata().unwrap().len(),
-        disk_hash: format::digest(&qcow, 0, qcow.metadata().unwrap().len()).unwrap(),
     };
     let deps = [
         DiskDependency::ContainerQcow2,
@@ -238,6 +239,22 @@ fn snapshot_v9_external_disk_integrity_and_role_refusals() {
         &envelope,
     )
     .unwrap();
+    // Same-length disk content changes are deliberately not verified.
+    qcow.write_all_at(&[17], envelope.disk_len - 1).unwrap();
+    verify_disks(
+        &deps,
+        &[qcow.try_clone().unwrap(), boot.try_clone().unwrap()],
+        &envelope,
+    )
+    .unwrap();
+    qcow.set_len(envelope.disk_len + 1).unwrap();
+    assert!(verify_disks(
+        &deps,
+        &[qcow.try_clone().unwrap(), boot.try_clone().unwrap()],
+        &envelope,
+    )
+    .is_err());
+    qcow.set_len(envelope.disk_len).unwrap();
     assert!(verify_disks(
         &deps,
         &[
@@ -249,6 +266,16 @@ fn snapshot_v9_external_disk_integrity_and_role_refusals() {
     .is_err());
     let wrong = f.writable("wrong");
     wrong.write_all_at(b"wrong boot", 0).unwrap();
+    assert!(verify_disks(
+        &deps,
+        &[
+            qcow.try_clone().unwrap(),
+            File::open(f.path("wrong")).unwrap()
+        ],
+        &envelope
+    )
+    .is_ok());
+    wrong.set_len(9).unwrap();
     assert!(verify_disks(
         &deps,
         &[

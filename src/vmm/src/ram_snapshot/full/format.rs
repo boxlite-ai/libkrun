@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Version-9 memory-file envelope. Offsets never depend on a shared FD cursor.
+//! Version-10 memory envelope, with v9 read support and no payload checksums.
 
 use super::*;
 use sha2::{Digest, Sha256};
@@ -13,7 +13,6 @@ pub(super) struct Envelope {
     pub metadata: Vec<u8>,
     pub payload: u64,
     pub disk_len: u64,
-    pub disk_hash: [u8; 32],
 }
 
 pub(super) fn digest(file: &File, offset: u64, len: u64) -> Result<[u8; 32]> {
@@ -45,15 +44,17 @@ pub(super) fn read(file: &File) -> Result<Envelope> {
     if &prefix[..8] != FULL_MAGIC {
         return Err(Error::Invalid("invalid/incomplete full snapshot"));
     }
-    if u32::from_le_bytes(prefix[8..12].try_into().unwrap()) != FULL_VERSION {
+    let version = u32::from_le_bytes(prefix[8..12].try_into().unwrap());
+    if !matches!(version, 9 | FULL_VERSION) {
         return Err(Error::Invalid(
-            "unsupported full snapshot version; version 9 required",
+            "unsupported full snapshot version; version 9 or 10 required",
         ));
     }
     let mut header = [0; HEADER as usize];
     file.read_exact_at(&mut header, 0)?;
     if u32::from_le_bytes(header[12..16].try_into().unwrap()) != HEADER as u32
         || header[144..].iter().any(|&byte| byte != 0)
+        || (version == FULL_VERSION && header[80..144].iter().any(|&byte| byte != 0))
     {
         return Err(Error::Invalid(
             "unsupported memory header length or reserved fields",
@@ -74,28 +75,16 @@ pub(super) fn read(file: &File) -> Result<Envelope> {
             "memory file length or metadata bound mismatch",
         ));
     }
-    if digest(file, HEADER, meta_len)? != header[48..80]
-        || digest(file, HEADER + meta_len, payload)? != header[80..112]
-    {
-        return Err(Error::Invalid("memory file checksum mismatch"));
-    }
     let mut metadata = vec![0; meta_len as usize];
     file.read_exact_at(&mut metadata, HEADER)?;
     Ok(Envelope {
         metadata,
         payload,
         disk_len: number(&header, 40),
-        disk_hash: header[112..144].try_into().unwrap(),
     })
 }
 
-pub(super) fn seal(
-    file: &File,
-    metadata_len: u64,
-    payload: u64,
-    disk_len: u64,
-    disk_hash: [u8; 32],
-) -> Result<()> {
+pub(super) fn seal(file: &File, metadata_len: u64, payload: u64, disk_len: u64) -> Result<()> {
     let total = HEADER
         .checked_add(metadata_len)
         .and_then(|n| n.checked_add(payload))
@@ -115,9 +104,8 @@ pub(super) fn seal(
     ] {
         header[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
-    header[48..80].copy_from_slice(&digest(file, HEADER, metadata_len)?);
-    header[80..112].copy_from_slice(&digest(file, HEADER + metadata_len, payload)?);
-    header[112..144].copy_from_slice(&disk_hash);
+    // Distinguish captures for catalog replay without scanning their payloads.
+    File::open("/dev/urandom")?.read_exact(&mut header[48..80])?;
     file.sync_all()?;
     file.write_all_at(&header, 0)?;
     file.sync_all()?;
@@ -137,27 +125,50 @@ mod tests {
         file.set_len(HEADER + 3 + 7).unwrap();
         file.write_all_at(b"{}\n", HEADER).unwrap();
         file.write_all_at(b"payload", HEADER + 3).unwrap();
-        seal(&file, 3, 7, 1234, [17; 32]).unwrap();
+        seal(&file, 3, 7, 1234).unwrap();
         file
     }
     #[test]
-    fn snapshot_v9_envelope_integrity() {
+    fn snapshot_v10_envelope_omits_payload_checksums() {
         let file = image();
         let decoded = read(&file).unwrap();
+        let mut header = [0; HEADER as usize];
+        file.read_exact_at(&mut header, 0).unwrap();
+        assert_eq!(u32::from_le_bytes(header[8..12].try_into().unwrap()), 10);
+        assert_eq!(&header[80..], &[0; 80]);
+        let mut next = [0; HEADER as usize];
+        image().read_exact_at(&mut next, 0).unwrap();
+        assert_ne!(&header[48..80], &next[48..80]);
         assert_eq!(decoded.metadata, b"{}\n");
-        assert_eq!(
-            (decoded.payload, decoded.disk_len, decoded.disk_hash),
-            (7, 1234, [17; 32])
-        );
+        assert_eq!((decoded.payload, decoded.disk_len), (7, 1234));
         for offset in [HEADER, HEADER + 3] {
             let file = image();
             file.write_all_at(b"!", offset).unwrap();
-            assert!(read(&file).unwrap_err().to_string().contains("checksum"));
+            assert!(read(&file).is_ok());
         }
     }
     #[test]
-    fn snapshot_v9_envelope_bounds_and_old_versions() {
-        for version in [1u32, 7, 8, 10] {
+    fn snapshot_v9_envelope_reads_legacy_hash_fields_without_verifying_them() {
+        let legacy = image();
+        legacy.write_all_at(&9u32.to_le_bytes(), 8).unwrap();
+        // Reproduce the v9 layout, including nonzero payload and disk hashes.
+        legacy
+            .write_all_at(&digest(&legacy, HEADER, 3).unwrap(), 48)
+            .unwrap();
+        legacy
+            .write_all_at(&digest(&legacy, HEADER + 3, 7).unwrap(), 80)
+            .unwrap();
+        legacy.write_all_at(&[17; 32], 112).unwrap();
+        let decoded = read(&legacy).unwrap();
+        assert_eq!(decoded.metadata, b"{}\n");
+        assert_eq!((decoded.payload, decoded.disk_len), (7, 1234));
+        legacy.write_all_at(b"!", HEADER + 3).unwrap();
+        legacy.write_all_at(b"[]\n", HEADER).unwrap();
+        assert_eq!(read(&legacy).unwrap().metadata, b"[]\n");
+    }
+    #[test]
+    fn snapshot_v10_envelope_bounds_and_old_versions() {
+        for version in [1u32, 7, 8, 11] {
             let file = image();
             file.write_all_at(&version.to_le_bytes(), 8).unwrap();
             assert!(read(&file).unwrap_err().to_string().contains("version"));
@@ -170,5 +181,16 @@ mod tests {
         let file = image();
         file.set_len(file.metadata().unwrap().len() + 1).unwrap();
         assert!(read(&file).is_err());
+        let file = image();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        assert!(read(&file).is_err());
+        for (version, offsets) in [(9u32, vec![144, 159]), (10, vec![80, 112, 144, 159])] {
+            for offset in offsets {
+                let file = image();
+                file.write_all_at(&version.to_le_bytes(), 8).unwrap();
+                file.write_all_at(&[1], offset).unwrap();
+                assert!(read(&file).unwrap_err().to_string().contains("reserved"));
+            }
+        }
     }
 }

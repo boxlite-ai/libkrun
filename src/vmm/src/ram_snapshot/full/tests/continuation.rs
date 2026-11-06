@@ -595,7 +595,6 @@ fn rewrite_metadata_and_payload(
         encoded.len() as u64,
         envelope.payload + extra.len() as u64,
         envelope.disk_len,
-        envelope.disk_hash,
     )
     .unwrap();
     fs::copy(
