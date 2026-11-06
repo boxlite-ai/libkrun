@@ -7,6 +7,8 @@
 #[cfg(target_os = "macos")]
 pub(crate) mod hvf;
 mod restore;
+#[cfg(test)]
+mod tests;
 #[cfg(target_os = "macos")]
 use hvf::LegacyState;
 #[cfg(target_os = "linux")]
@@ -809,9 +811,10 @@ fn validate_disk(file: &File, format: u32, state: &BlockState) -> io::Result<()>
     Ok(())
 }
 fn open_file(path: &Path) -> io::Result<File> {
+    // Reject FIFOs by descriptor without waiting for a peer during open.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(invalid("checkpoint artifact is not a regular file"));

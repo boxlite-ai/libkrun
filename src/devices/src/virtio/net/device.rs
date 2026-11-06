@@ -78,12 +78,6 @@ impl VirtioNetConfig {
     }
 }
 
-/// The guest-visible config bytes `Net::new` exposes for `mac`: single
-/// source of truth for snapshot validation.
-pub fn config_bytes_for(mac: [u8; 6]) -> Vec<u8> {
-    VirtioNetConfig::for_mac(mac).as_slice().to_vec()
-}
-
 #[derive(Clone)]
 pub enum VirtioNetBackend {
     UnixstreamFd(RawFd),
@@ -218,18 +212,14 @@ impl Net {
         Ok(())
     }
 
-    /// Provides the virtio-net backend of this net device.
-    pub fn backend(&self) -> &VirtioNetBackend {
-        &self.cfg_backend
-    }
-
     /// The complete guest-visible device configuration, byte-exact.
     pub fn config_bytes(&self) -> Vec<u8> {
         self.config.as_slice().to_vec()
     }
 
     /// Snapshot control handle for the activated worker, if any.
-    pub fn worker_control(&self) -> Option<&NetWorkerHandle> {
+    #[cfg(test)]
+    pub(super) fn worker_control(&self) -> Option<&NetWorkerHandle> {
         self.worker_control.as_ref()
     }
 
