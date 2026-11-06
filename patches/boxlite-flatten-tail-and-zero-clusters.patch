@@ -1,0 +1,53 @@
+--- a/src/boxlite/src/disk/qcow2.rs
++++ b/src/boxlite/src/disk/qcow2.rs
+@@ -1339,0 +1340,5 @@
++                // A zero cluster masks backing data, including when it has
++                // a preallocated physical cluster. It must not fall through.
++                if l2_entry & 1 != 0 {
++                    return Ok(Some(vec![0; cs as usize]));
++                }
+@@ -1347,2 +1352,5 @@
+-                let mut buf = vec![0u8; cs as usize];
+-                file.read_exact(&mut buf)
++                // imago can extend the last data cluster only through the
++                // bytes written. Its file backend reads the tail beyond EOF
++                // as zero; preserve those same guest-visible bytes here.
++                let mut buf = Vec::with_capacity(cs as usize);
++                (&mut *file).take(cs).read_to_end(&mut buf)
+@@ -1349,0 +1358 @@
++                buf.resize(cs as usize, 0);
+@@ -1782,0 +1792,34 @@
++    fn test_flatten_short_tail_and_zero_cluster_override() {
++        use std::io::{Read, Seek, SeekFrom};
++        let dir = TempDir::new().unwrap();
++        let cs = 1u64 << CLUSTER_BITS;
++        let base = dir.path().join("base.raw");
++        write_raw_disk(&base, cs);
++        for zero in [false, true] {
++            let child = dir.path().join(format!("child-{zero}.qcow2"));
++            let _disk = Qcow2Helper::create_cow_child_disk(
++                &base, BackingFormat::Raw, &child, cs,
++            ).unwrap();
++            let mut file = OpenOptions::new().read(true).write(true).open(&child).unwrap();
++            let mut header = [0; 48];
++            file.read_exact(&mut header).unwrap();
++            let l1_offset = u64::from_be_bytes(header[40..48].try_into().unwrap());
++            file.seek(SeekFrom::Start(l1_offset)).unwrap();
++            file.write_all(&(10 * cs).to_be_bytes()).unwrap();
++            file.seek(SeekFrom::Start(10 * cs)).unwrap();
++            let entry = (1u64 << 63) | (11 * cs) | u64::from(zero);
++            file.write_all(&entry.to_be_bytes()).unwrap();
++            file.seek(SeekFrom::Start(11 * cs)).unwrap();
++            file.write_all(&[0x5a; 512]).unwrap();
++            file.sync_all().unwrap();
++            let flat = dir.path().join(format!("flat-{zero}.qcow2"));
++            Qcow2Helper::flatten(&child, &flat).unwrap();
++            let mut chain = Qcow2Helper::open_flatten_chain(&flat).unwrap();
++            assert_eq!(chain.len(), 1);
++            let data = chain[0].read_cluster(0, cs).unwrap().unwrap_or(vec![0; cs as usize]);
++            assert!(data[..512].iter().all(|&b| b == if zero { 0 } else { 0x5a }));
++            assert!(data[512..].iter().all(|&b| b == 0));
++        }
++    }
++
++    #[test]

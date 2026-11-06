@@ -26,6 +26,42 @@ int32_t krun_set_memory_hotplug(uint32_t ctx_id, uint32_t max_mib);
 int32_t krun_request_memory(uint32_t ctx_id, uint32_t total_mib);
 int32_t krun_get_memory_status(uint32_t ctx_id, struct krun_memory_status *status);
 
+/* Experimental checkpoint container version 1, Linux x86_64/KVM.
+ * Configure before start_enter. Checkpoint mode owns the kernel's RAM and uses
+ * ordinary virtio-fs I/O instead of a DAX window. Unsupported platforms return
+ * -ENOTSUP. External virtio-fs contents are live; missing/replaced objects yield
+ * guest I/O errors on subsequent FUSE requests rather than binding replacements.
+ */
+int32_t krun_set_checkpointing(uint32_t ctx_id, bool enabled);
+/* Restore uses start_enter with the existing ctx lifecycle, bypassing all boot
+ * loaders. Bind the original fs roots and fresh console endpoints in ctx first.
+ * Configure a boot RAM budget at least as large as the saved boot RAM; hotplug
+ * configuration must also match. Disks come from the checkpoint's independent
+ * images and are copied to private writable working files on restore. A block
+ * rootfs's retired bootstrap share is recreated internally. Network endpoints
+ * must be fresh; stream sessions are disconnected and UDP may lose packets.
+ */
+int32_t krun_set_checkpoint_restore(uint32_t ctx_id, const char *directory);
+/* Application's existing flatten implementation. format: 0=raw, 1=QCOW2.
+ * Write a standalone image of the same format at destination, with no backing
+ * chain. Source is flushed and frozen for the entire callback. Return 0 or a
+ * negative errno. Do not modify source or reenter VM control from this callback.
+ */
+typedef int32_t (*krun_checkpoint_flatten_fn)(const char *id, const char *source,
+    const char *destination, uint32_t format, void *opaque);
+/* Call from a separate host thread after start_enter consumed ctx. ctx_id stays
+ * valid for online checkpoint requests. This call blocks until all callbacks
+ * finish; opaque must remain valid until return. NULL flatten copies raw images
+ * and returns -ENOTSUP for QCOW2. Existing destination directories are refused.
+ * On success the original VM continues. A storage error after a confirmed
+ * freeze also resumes it; uncertain worker/CPU outcomes disable the VM instead.
+ * -ESHUTDOWN means the VM is permanently stopped and the owner must tear down
+ * its process; subsequent requests cannot resume it. Other errors leave a
+ * running source VM usable. Network streams may be disconnected by the attempt.
+ */
+int32_t krun_save_checkpoint(uint32_t ctx_id, const char *directory,
+    krun_checkpoint_flatten_fn flatten, void *opaque);
+
 /**
  * Sets the log level for the library.
  *

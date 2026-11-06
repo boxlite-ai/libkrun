@@ -16,6 +16,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use caps::{has_cap, CapSet, Capability};
+
+pub mod checkpoint;
 use nix::{request_code_none, request_code_read};
 
 use vm_memory::ByteValued;

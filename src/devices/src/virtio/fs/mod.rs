@@ -6,7 +6,11 @@ pub mod fuse;
 mod multikey;
 mod read_only;
 mod server;
+#[cfg(target_os = "linux")]
+mod snapshot;
 mod worker;
+#[cfg(target_os = "linux")]
+pub use snapshot::FsDeviceState;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

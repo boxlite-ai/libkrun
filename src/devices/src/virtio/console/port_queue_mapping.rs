@@ -33,7 +33,7 @@ pub(crate) fn queue_idx_to_port_id(queue_index: usize) -> (QueueDirection, usize
     (direction, port_id)
 }
 
-pub(crate) fn num_queues(num_ports: usize) -> usize {
+pub fn num_queues(num_ports: usize) -> usize {
     // 2 control queues and then an rx and tx queue for each port
     2 + 2 * num_ports
 }

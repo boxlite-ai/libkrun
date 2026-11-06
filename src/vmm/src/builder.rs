@@ -102,6 +102,7 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    UnsupportedCheckpointConfiguration,
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     #[cfg(target_os = "macos")]
@@ -234,6 +235,7 @@ impl Display for StartMicrovmError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         use self::StartMicrovmError::*;
         match *self {
+            UnsupportedCheckpointConfiguration => write!(f, "Checkpointing requires Linux x86_64 KVM without nested virtualization or split irqchip"),
             AttachBlockDevice(ref err) => {
                 write!(f, "Unable to attach block device to Vmm. Error: {err}")
             }
@@ -564,6 +566,16 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    if vm_resources.checkpoint_enabled
+        && (!cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee")
+        )) || vm_resources.nested_enabled
+            || vm_resources.split_irqchip)
+    {
+        return Err(StartMicrovmError::UnsupportedCheckpointConfiguration);
+    }
     let payload = choose_payload(vm_resources)?;
 
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
@@ -958,6 +970,14 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        checkpoint_enabled: vm_resources.checkpoint_enabled,
+        checkpoint_files: Vec::new(),
+        checkpoint_dirs: Vec::new(),
+        #[cfg(target_os = "linux")]
+        vcpus_paused: true,
+        #[cfg(target_os = "linux")]
+        vcpus_failed: false,
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
@@ -1344,9 +1364,25 @@ fn load_payload(
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
 
-            let kernel_region = unsafe {
-                MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
-                    .map_err(StartMicrovmError::InvalidKernelBundle)?
+            let kernel_region = if _vm_resources.checkpoint_enabled {
+                let region =
+                    MmapRegion::new(kernel_size).map_err(StartMicrovmError::InvalidKernelBundle)?;
+                // The bundle is readable for kernel_size bytes, as in the
+                // existing borrowed mapping. The new anonymous region is owned
+                // exclusively by this VM and cannot alias libkrunfw globals.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        kernel_host_addr as *const u8,
+                        region.as_ptr(),
+                        kernel_size,
+                    );
+                }
+                region
+            } else {
+                unsafe {
+                    MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
+                        .map_err(StartMicrovmError::InvalidKernelBundle)?
+                }
             };
 
             Ok((
@@ -1540,6 +1576,9 @@ pub fn create_guest_memory(
 
     #[cfg(not(feature = "tee"))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
+        if vm_resources.checkpoint_enabled {
+            continue;
+        }
         if let Some(shm_size) = fs.shm_size {
             shm_manager
                 .create_fs_region(index, shm_size)
@@ -1667,7 +1706,7 @@ pub fn setup_serial_device(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn attach_legacy_devices(
+pub(crate) fn attach_legacy_devices(
     vm: &Vm,
     split_irqchip: bool,
     pio_device_manager: &mut PortIODeviceManager,
@@ -1980,7 +2019,7 @@ fn attach_fs_devices(
     Ok(())
 }
 
-fn autoconfigure_console_ports(
+pub(crate) fn autoconfigure_console_ports(
     vmm: &mut Vmm,
     vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
@@ -2119,7 +2158,7 @@ fn setup_terminal_raw_mode(
     }
 }
 
-fn create_explicit_ports(
+pub(crate) fn create_explicit_ports(
     vmm: &mut Vmm,
     port_configs: &[PortConfig],
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
@@ -2235,6 +2274,12 @@ fn attach_unixsock_vsock_device(
         .map_err(RegisterEvent)?;
 
     let id = String::from(unix_vsock.lock().unwrap().id());
+    unix_vsock.lock().unwrap().set_failure_notifier(
+        vmm.exit_evt
+            .try_clone()
+            .map_err(Error::EventFd)
+            .map_err(Internal)?,
+    );
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;

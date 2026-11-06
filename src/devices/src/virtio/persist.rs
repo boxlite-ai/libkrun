@@ -16,7 +16,8 @@ pub(crate) fn invalid(reason: &'static str) -> io::Error {
 }
 
 /// Queue registers plus host cursors absent from the RAM image.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueState {
     pub max_size: u16,
     pub size: u16,
@@ -34,24 +35,35 @@ impl Queue {
     /// Capture against quiesced RAM. `activated` describes the owning device,
     /// not QueueReady: a guest can set QueueReady before finishing negotiation.
     pub fn save_state(&self, mem: &GuestMemoryMmap, activated: bool) -> io::Result<QueueState> {
-        let state = QueueState {
-            max_size: self.max_size,
-            size: self.size,
-            ready: self.ready,
-            desc_table: self.desc_table.raw_value(),
-            avail_ring: self.avail_ring.raw_value(),
-            used_ring: self.used_ring.raw_value(),
-            next_avail: self.next_avail.0,
-            next_used: self.next_used.0,
-            event_idx_enabled: self.event_idx_enabled,
-            num_added: self.num_added.0,
-        };
+        let state = QueueState::from_queue(self);
         state.validate(mem, self.max_size, activated)?;
         Ok(state)
     }
 }
 
 impl QueueState {
+    /// Capture registers without touching RAM. The owner must validate the
+    /// result against an accessible, frozen memory view before persistence.
+    pub(crate) fn from_queue(queue: &Queue) -> Self {
+        Self {
+            max_size: queue.max_size,
+            size: queue.size,
+            ready: queue.ready,
+            desc_table: queue.desc_table.raw_value(),
+            avail_ring: queue.avail_ring.raw_value(),
+            used_ring: queue.used_ring.raw_value(),
+            next_avail: queue.next_avail.0,
+            next_used: queue.next_used.0,
+            event_idx_enabled: queue.event_idx_enabled,
+            num_added: queue.num_added.0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_queue(&self) -> Queue {
+        self.queue()
+    }
+
     fn queue(&self) -> Queue {
         Queue {
             max_size: self.max_size,
@@ -119,13 +131,24 @@ impl QueueState {
 
 /// Common device identity and negotiation state. Device-specific state and worker
 /// activation are owned by each device's restore implementation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VirtioDeviceState {
     pub device_type: u32,
     pub avail_features: u64,
     pub acked_features: u64,
     pub activated: bool,
     pub queue_max_sizes: Vec<u16>,
+}
+
+/// State for devices whose only writer is the event-loop thread (RNG and
+/// balloon). Capture and restore still require the owner's event-loop barrier.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventDeviceState {
+    pub device: VirtioDeviceState,
+    pub config: Vec<u8>,
+    pub queues: Option<Vec<QueueState>>,
 }
 
 impl VirtioDeviceState {
@@ -192,7 +215,8 @@ impl VirtioDeviceState {
 
 /// MMIO registers plus queues still owned by an inactive transport. Active
 /// queues belong to device workers and must be captured separately.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MmioTransportState {
     pub device: VirtioDeviceState,
     pub features_select: u32,

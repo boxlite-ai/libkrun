@@ -15,6 +15,8 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+pub mod checkpoint;
 pub(crate) mod device_manager;
 /// RAM-only byte image encoding, independent of VM execution state.
 pub mod ram_snapshot;
@@ -44,13 +46,11 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "linux")]
-use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
@@ -202,6 +202,14 @@ pub struct Vmm {
     kernel_cmdline: KernelCmdline,
 
     vcpus_handles: Vec<VcpuHandle>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    checkpoint_enabled: bool,
+    checkpoint_files: Vec<utils::tempfile::TempFile>,
+    checkpoint_dirs: Vec<utils::tempdir::TempDir>,
+    #[cfg(target_os = "linux")]
+    vcpus_paused: bool,
+    #[cfg(target_os = "linux")]
+    vcpus_failed: bool,
     exit_evt: EventFd,
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
@@ -224,7 +232,19 @@ impl Vmm {
     }
 
     /// Starts the microVM vcpus.
-    pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+    pub fn start_vcpus(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.spawn_vcpus(vcpus)?;
+        self.resume_vcpus()
+    }
+
+    /// Build vCPU threads without allowing KVM_RUN. Restore builders must finish
+    /// RAM, devices, interrupt controller and CPU state before resuming them.
+    #[cfg(target_os = "linux")]
+    pub fn start_vcpus_paused(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.spawn_vcpus(vcpus)
+    }
+
+    fn spawn_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
 
         Vcpu::register_kick_signal_handler();
@@ -238,30 +258,60 @@ impl Vmm {
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
         }
 
-        // The vcpus start off in the `Paused` state, let them run.
-        self.resume_vcpus()?;
-
+        #[cfg(target_os = "linux")]
+        {
+            self.vcpus_paused = true;
+        }
         Ok(())
     }
 
     /// Sends a resume command to the vcpus.
     #[cfg(target_os = "linux")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
-        for handle in self.vcpus_handles.iter() {
-            handle
-                .send_event(VcpuEvent::Resume)
-                .map_err(Error::VcpuEvent)?;
+        self.transition_vcpus(false, Instant::now() + Duration::from_secs(1))
+    }
+
+    /// CPU barrier only. The event loop and device/host writers must still be
+    /// frozen separately before capturing memory or interrupt-controller state.
+    #[cfg(target_os = "linux")]
+    pub fn pause_vcpus(&mut self, deadline: Instant) -> Result<()> {
+        self.transition_vcpus(true, deadline)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transition_vcpus(&mut self, pause: bool, deadline: Instant) -> Result<()> {
+        use vstate::control::Command;
+        if self.vcpus_failed {
+            return Err(Error::VcpuResume);
         }
-        for handle in self.vcpus_handles.iter() {
-            match handle
-                .response_receiver()
-                .recv_timeout(Duration::from_millis(1000))
-            {
-                Ok(VcpuResponse::Resumed) => (),
-                _ => return Err(Error::VcpuResume),
+        for handle in &mut self.vcpus_handles {
+            let command = if pause {
+                Command::Pause
+            } else {
+                Command::Resume
+            };
+            if let Err(error) = handle.control(command, deadline) {
+                self.vcpus_failed = true;
+                // A partial transition is never rolled back into execution.
+                // Keep the VMM/resources owned even if stopping also times out.
+                let _ = self.stop_vcpus(Instant::now() + Duration::from_secs(1));
+                return Err(Error::Vcpu(error));
             }
         }
+        self.vcpus_paused = pause;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn stop_vcpus(&mut self, deadline: Instant) -> Result<()> {
+        self.vcpus_failed = true;
+        let mut result = Ok(());
+        for handle in &mut self.vcpus_handles {
+            if let Err(error) = handle.stop(deadline) {
+                result = Err(Error::Vcpu(error));
+            }
+        }
+        result
     }
 
     #[cfg(target_os = "macos")]
@@ -367,6 +417,9 @@ impl Vmm {
                 .expect("Poisoned mutex for exit observer")
                 .on_vmm_exit();
         }
+
+        self.checkpoint_files.clear();
+        self.checkpoint_dirs.clear();
 
         // Exit from Firecracker using the provided exit code. Safe because we're terminating
         // the process anyway.

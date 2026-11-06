@@ -26,7 +26,7 @@ impl Console {
         true
     }
 
-    fn notify_port_queue_event(&mut self, queue_index: usize) {
+    pub(crate) fn notify_port_queue_event(&mut self, queue_index: usize) {
         let (direction, port_id) = queue_idx_to_port_id(queue_index);
         match direction {
             QueueDirection::Rx => {
@@ -88,12 +88,12 @@ impl Console {
             error!("Failed to read the sigwinch event: {e:?}");
         }
 
-        for i in 0..self.ports.len() {
-            if let Some(term) = self.ports[i].terminal() {
-                let (cols, rows) = term.get_win_size();
-                self.update_console_size(i as u32, cols, rows);
-            }
+        // A frozen device queues no control message; resume reports it.
+        if self.snapshot_frozen {
+            self.sigwinch_deferred = true;
+            return;
         }
+        self.update_terminal_sizes();
     }
 
     fn read_control_queue_event(&mut self, event: &EpollEvent) {
@@ -126,15 +126,22 @@ impl Subscriber for Console {
             let control_rxq_control = self.control.queue_evt().as_raw_fd();
 
             let mut raise_irq = false;
+            // While frozen, events are drained only: no ring is touched and
+            // no interrupt raised; resume examines the queues itself.
+            let live = !self.snapshot_frozen;
 
             if source == control_txq {
-                raise_irq |=
-                    self.read_queue_event(CONTROL_TXQ_INDEX, event) && self.process_control_tx()
+                raise_irq |= self.read_queue_event(CONTROL_TXQ_INDEX, event)
+                    && live
+                    && self.process_control_tx()
             } else if source == control_rxq_control {
                 self.read_control_queue_event(event);
-                raise_irq |= self.process_control_rx();
+                raise_irq |= live && self.process_control_rx();
             } else if source == control_rxq {
+                // New buffers may take messages queued while none was free.
                 raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
+                    && live
+                    && self.process_control_rx()
             }
             /* Guest signaled input/output on port */
             else if let Some(queue_index) = self
@@ -142,7 +149,7 @@ impl Subscriber for Console {
                 .iter()
                 .position(|fd| fd.as_raw_fd() == source)
             {
-                raise_irq |= self.read_queue_event(queue_index, event);
+                raise_irq |= self.read_queue_event(queue_index, event) && live;
                 self.notify_port_queue_event(queue_index);
             } else if source == activate_evt {
                 self.handle_activate_event(event_manager);

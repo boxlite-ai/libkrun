@@ -71,6 +71,23 @@ pub struct Server<F: FileSystem + Sync> {
 }
 
 impl<F: FileSystem + Sync> Server<F> {
+    #[cfg(target_os = "linux")]
+    pub(super) fn checkpoint_parts(&self) -> (&F, u64) {
+        (&self.fs, self.options.load(Ordering::Acquire))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn restore_options(&mut self, options: u64) -> io::Result<&mut F> {
+        if FsOptions::from_bits(options).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid saved FUSE options",
+            ));
+        }
+        self.options.store(options, Ordering::Release);
+        Ok(&mut self.fs)
+    }
+
     pub fn new(fs: F) -> Server<F> {
         Server {
             fs,

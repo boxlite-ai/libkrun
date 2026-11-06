@@ -29,11 +29,14 @@ use virtio_bindings::{
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+use super::snapshot::WorkerCheckpoint;
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
+use crate::virtio::control::{self, WorkerController};
+use crate::virtio::persist::QueueState;
 
 use crate::virtio::{
     block::{ImageType, SyncMode},
@@ -179,7 +182,7 @@ struct VirtioBlkTopology {
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
-struct VirtioBlkConfig {
+pub(super) struct VirtioBlkConfig {
     capacity: u64,
     size_max: u32,
     seg_max: u32,
@@ -203,17 +206,23 @@ unsafe impl ByteValued for VirtioBlkConfig {}
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
     // Host file and properties.
-    disk: Option<DiskProperties>,
+    pub(super) disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
-    disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
-    worker_stopfd: EventFd,
+    pub(super) disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(super) disk_image_id: Vec<u8>,
+    pub(super) worker_thread: Option<JoinHandle<()>>,
+    pub(super) worker_stopfd: EventFd,
+    pub(super) worker_control: Option<WorkerController>,
+    pub(super) snapshot_queue: Arc<Mutex<Option<QueueState>>>,
+    pub(super) frozen: bool,
+    pub(super) snapshot_failed: bool,
+    checkpoint_source: String,
+    checkpoint_format: ImageType,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
-    config: VirtioBlkConfig,
+    pub(super) config: VirtioBlkConfig,
 
     // Transport related fields.
     pub(crate) device_state: DeviceState,
@@ -238,6 +247,8 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
     ) -> io::Result<Block> {
+        let checkpoint_source = disk_image_path.clone();
+        let checkpoint_format = disk_image_format.clone();
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
@@ -315,6 +326,8 @@ impl Block {
         };
 
         Ok(Block {
+            checkpoint_source,
+            checkpoint_format,
             id,
             partuuid,
             config,
@@ -327,12 +340,20 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_control: None,
+            snapshot_queue: Arc::new(Mutex::new(None)),
+            frozen: false,
+            snapshot_failed: false,
         })
     }
 
     /// Provides the ID of this block device.
     pub fn id(&self) -> &String {
         &self.id
+    }
+
+    pub fn checkpoint_source(&self) -> (&str, &ImageType) {
+        (&self.checkpoint_source, &self.checkpoint_format)
     }
 
     /// Provides the PARTUUID of this block device.
@@ -347,6 +368,17 @@ impl Block {
 }
 
 impl VirtioDevice for Block {
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        if !self.frozen || self.snapshot_failed {
+            return Err(ActivateError::BadActivate);
+        }
+        self.activate(mem, interrupt, queues)
+    }
     fn device_type(&self) -> u32 {
         TYPE_BLOCK
     }
@@ -408,6 +440,19 @@ impl VirtioDevice for Block {
             ActivateError::BadActivate
         })?;
 
+        if self.snapshot_failed {
+            return Err(ActivateError::BadActivate);
+        }
+        if let Some(saved) = self.snapshot_queue.lock().unwrap().as_ref() {
+            let actual = blk_q
+                .queue
+                .save_state(&mem, true)
+                .map_err(|_| ActivateError::BadActivate)?;
+            if !self.frozen || &actual != saved {
+                return Err(ActivateError::BadActivate);
+            }
+        }
+
         let disk = match self.disk.take() {
             Some(d) => d,
             None => DiskProperties::new(
@@ -418,14 +463,23 @@ impl VirtioDevice for Block {
             .map_err(|_| ActivateError::BadActivate)?,
         };
 
+        let (controller, control) = control::channel().map_err(|_| ActivateError::BadActivate)?;
         let worker = BlockWorker::new(
             blk_q,
             interrupt.clone(),
             mem.clone(),
             disk,
-            self.worker_stopfd.try_clone().unwrap(),
+            self.worker_stopfd
+                .try_clone()
+                .map_err(|_| ActivateError::BadActivate)?,
+            WorkerCheckpoint {
+                control,
+                queue: self.snapshot_queue.clone(),
+                frozen: self.frozen,
+            },
         );
-        self.worker_thread = Some(worker.run());
+        self.worker_thread = Some(worker.run().map_err(|_| ActivateError::BadActivate)?);
+        self.worker_control = Some(controller);
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
@@ -438,6 +492,10 @@ impl VirtioDevice for Block {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.worker_control = None;
+        self.frozen = false;
+        self.snapshot_failed = false;
+        *self.snapshot_queue.lock().unwrap() = None;
         self.device_state = DeviceState::Inactive;
         true
     }

@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate log;
 
+mod checkpoint;
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
 mod memory_hotplug;
 
@@ -135,6 +136,7 @@ enum LegacyNetworkConfig {
 
 #[derive(Default)]
 struct ContextConfig {
+    checkpoint_restore: Option<PathBuf>,
     krunfw: Option<KrunfwBindings>,
     vmr: VmResources,
     workdir: Option<String>,
@@ -2599,6 +2601,49 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+fn configure_vsock(ctx_cfg: &mut ContextConfig) {
+    match &ctx_cfg.vsock_config {
+        VsockConfig::Disabled => (),
+        VsockConfig::Explicit { tsi_flags } => {
+            let vsock_device_config = VsockDeviceConfig {
+                vsock_id: "vsock0".to_string(),
+                guest_cid: 3,
+                host_port_map: ctx_cfg.tsi_port_map.clone(),
+                unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                tsi_flags: *tsi_flags,
+            };
+            ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+        }
+        VsockConfig::Implicit => {
+            // Implicit vsock configuration - use heuristics
+            // Check if TSI should be enabled based on network configuration
+            #[cfg(feature = "net")]
+            let enable_tsi = ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
+            #[cfg(not(feature = "net"))]
+            let enable_tsi = true;
+
+            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
+
+            if enable_tsi || has_ipc_map {
+                let (tsi_flags, host_port_map) = if enable_tsi {
+                    (TsiFlags::HIJACK_INET, ctx_cfg.tsi_port_map.clone())
+                } else {
+                    (TsiFlags::empty(), None)
+                };
+
+                let vsock_device_config = VsockDeviceConfig {
+                    vsock_id: "vsock0".to_string(),
+                    guest_cid: 3,
+                    host_port_map,
+                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                    tsi_flags,
+                };
+                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+            }
+        }
+    }
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2626,6 +2671,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if let Some(path) = ctx_cfg.checkpoint_restore.take() {
+        return checkpoint::runtime::start_restore(ctx_id, ctx_cfg, &path, &mut event_manager);
+    }
 
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()
@@ -2703,46 +2753,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
-    match &ctx_cfg.vsock_config {
-        VsockConfig::Disabled => (),
-        VsockConfig::Explicit { tsi_flags } => {
-            let vsock_device_config = VsockDeviceConfig {
-                vsock_id: "vsock0".to_string(),
-                guest_cid: 3,
-                host_port_map: ctx_cfg.tsi_port_map,
-                unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                tsi_flags: *tsi_flags,
-            };
-            ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-        }
-        VsockConfig::Implicit => {
-            // Implicit vsock configuration - use heuristics
-            // Check if TSI should be enabled based on network configuration
-            #[cfg(feature = "net")]
-            let enable_tsi = ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
-            #[cfg(not(feature = "net"))]
-            let enable_tsi = true;
-
-            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
-
-            if enable_tsi || has_ipc_map {
-                let (tsi_flags, host_port_map) = if enable_tsi {
-                    (TsiFlags::HIJACK_INET, ctx_cfg.tsi_port_map)
-                } else {
-                    (TsiFlags::empty(), None)
-                };
-
-                let vsock_device_config = VsockDeviceConfig {
-                    vsock_id: "vsock0".to_string(),
-                    guest_cid: 3,
-                    host_port_map,
-                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                    tsi_flags,
-                };
-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-            }
-        }
-    }
+    configure_vsock(&mut ctx_cfg);
 
     if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
         ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
@@ -2774,6 +2785,19 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let checkpoint_runtime = if ctx_cfg.vmr.checkpoint_enabled {
+        match checkpoint::runtime::prepare(&mut event_manager, &ctx_cfg.vmr) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                error!("Checkpoint control setup failed: {error}");
+                return -libc::EIO;
+            }
+        }
+    } else {
+        None
+    };
+
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
@@ -2786,6 +2810,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if let Some(runtime) = checkpoint_runtime {
+        runtime.attach(ctx_id, _vmm.clone());
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
@@ -2805,6 +2834,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             Ok(_) => {}
             Err(e) => {
                 error!("Error in EventManager loop: {e:?}");
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                checkpoint::runtime::unregister(ctx_id);
                 return -libc::EINVAL;
             }
         }

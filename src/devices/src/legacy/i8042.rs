@@ -71,7 +71,7 @@ const BUF_SIZE: usize = 16;
 
 /// Registers and unread bytes in guest read order. Ring cursors are normalized,
 /// so this in-memory state does not depend on the host's usize width.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct I8042State {
     pub status: u8,
     pub control: u8,

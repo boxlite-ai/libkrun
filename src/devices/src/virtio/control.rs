@@ -1,16 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded worker requests for later device integration. No production device
-//! consumes these yet. A Freeze reply means success only if the worker has
+//! Bounded worker requests. A Freeze reply means success only if the worker has
 //! stopped all RAM writers and settled its I/O; this channel cannot do that.
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender, TryRecvError};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
+
+/// Typed worker replies use the same deadline and terminal-unknown-outcome
+/// contract as WorkerController. The atomic also excludes concurrent requests.
+pub(crate) fn request_reply<T, M, E: fmt::Display>(
+    sender: &Sender<M>,
+    wake: &EventFd,
+    unusable: &AtomicBool,
+    deadline: Instant,
+    make: impl FnOnce(Instant, Sender<Result<T, E>>) -> M,
+) -> Result<T, ControlError> {
+    if Instant::now() >= deadline {
+        return Err(ControlError::Deadline);
+    }
+    if unusable
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(ControlError::Unusable);
+    }
+    let (reply, result) = bounded(1);
+    if let Err(error) = sender.send_deadline(make(deadline, reply), deadline) {
+        return Err(match error {
+            SendTimeoutError::Timeout(_) => {
+                unusable.store(false, Ordering::Release);
+                ControlError::Deadline
+            }
+            SendTimeoutError::Disconnected(_) => ControlError::Disconnected,
+        });
+    }
+    wake.write(1).map_err(ControlError::Wake)?;
+    match result.recv_deadline(deadline) {
+        Ok(Ok(value)) if Instant::now() < deadline => {
+            unusable.store(false, Ordering::Release);
+            Ok(value)
+        }
+        Ok(Err(error)) => Err(ControlError::Worker(io::Error::other(error.to_string()))),
+        _ => Err(ControlError::OutcomeUnknown),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {

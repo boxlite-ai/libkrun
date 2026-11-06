@@ -55,6 +55,9 @@ impl Rng {
 
 impl Subscriber for Rng {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        if self.frozen {
+            return;
+        }
         let source = event.fd();
         let activate_evt = self.activate_evt.as_raw_fd();
         if source == activate_evt {

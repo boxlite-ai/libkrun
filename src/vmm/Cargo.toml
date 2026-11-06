@@ -10,8 +10,8 @@ repository = "https://github.com/containers/libkrun"
 
 [features]
 tee = ["devices/tee", "arch/tee"]
-amd-sev = ["blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "serde", "serde_json", "devices/amd-sev", "arch/amd-sev"]
-tdx = ["blk", "tee", "kbs-types", "serde", "serde_json", "dep:tdx", "devices/tdx", "arch/tdx", "cpuid/tdx"]
+amd-sev = ["blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "devices/amd-sev", "arch/amd-sev"]
+tdx = ["blk", "tee", "kbs-types", "dep:tdx", "devices/tdx", "arch/tdx", "cpuid/tdx"]
 net = ["devices/net"]
 blk = ["devices/blk"]
 gpu = ["devices/gpu", "krun_display"]
@@ -21,13 +21,14 @@ aws-nitro = []
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"
+sha2 = "0.10"
 flate2 = "1.0.35"
 libc = ">=0.2.39"
 linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
 nix = { version = "0.30.1", features = ["fs", "term"] }
 vm-memory = { version = "0.17.0", features = ["backend-mmap"] }
-vmm-sys-util = "0.14"
+vmm-sys-util = { version = "0.14", features = ["with-serde"] }
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
 
@@ -40,8 +41,8 @@ polly = { package = "krun-polly", version = "=0.1.0-1.18.0", path = "../polly" }
 
 # Dependencies for amd-sev
 kbs-types = { version = "0.13.0", optional = true }
-serde = { version = "1.0.125", optional = true }
-serde_json = { version = "1.0.64", optional = true }
+serde = { version = "1.0.125", features = ["derive"] }
+serde_json = "1.0.64"
 iocuddle = { version = "0.1.1", optional = true }
 bitfield = { version = "0.19.4", optional = true }
 bitflags = { version = "2.10.0", optional = true }
@@ -53,7 +54,7 @@ zstd = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tdx = { version = "0.1.0", optional = true }
-kvm-bindings = { version = "0.12", features = ["fam-wrappers"] }
+kvm-bindings = { version = "0.12", features = ["fam-wrappers", "serde"] }
 kvm-ioctls = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]

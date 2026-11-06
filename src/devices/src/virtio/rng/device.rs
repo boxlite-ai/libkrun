@@ -6,7 +6,9 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
 };
 use super::{defs, defs::uapi};
+use crate::virtio::persist::{invalid, EventDeviceState, QueueState, VirtioDeviceState};
 use crate::virtio::InterruptTransport;
+use std::io;
 
 // Request queue.
 pub(crate) const REQ_INDEX: usize = 0;
@@ -20,6 +22,7 @@ pub struct Rng {
     pub(crate) acked_features: u64,
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+    pub(crate) frozen: bool,
 }
 
 impl Rng {
@@ -34,7 +37,60 @@ impl Rng {
             acked_features: 0,
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(RngError::EventFd)?,
             device_state: DeviceState::Inactive,
+            frozen: false,
         })
+    }
+
+    pub fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
+    pub fn save_state(&self) -> io::Result<EventDeviceState> {
+        if !self.frozen {
+            return Err(invalid("rng capture requires freeze"));
+        }
+        Ok(EventDeviceState {
+            device: VirtioDeviceState::save(self)?,
+            config: Vec::new(),
+            queues: self.queues.as_ref().map(|queues| {
+                queues
+                    .iter()
+                    .map(|q| QueueState::from_queue(&q.queue))
+                    .collect()
+            }),
+        })
+    }
+
+    pub fn restore_state(&mut self, state: &EventDeviceState) -> io::Result<()> {
+        state.device.validate(self)?;
+        if self.is_activated()
+            || state.device.activated != state.queues.is_some()
+            || state
+                .queues
+                .as_ref()
+                .is_some_and(|q| q.len() != self.queue_config().len())
+        {
+            return Err(invalid("invalid rng checkpoint"));
+        }
+        if !state.config.is_empty() {
+            return Err(invalid("RNG has no configuration space"));
+        }
+        state.device.restore_features(self)?;
+        self.frozen = true;
+        Ok(())
+    }
+
+    pub fn resume(&mut self) -> io::Result<()> {
+        if !self.frozen {
+            return Err(invalid("event device is not frozen"));
+        }
+        if let Some(queues) = &self.queues {
+            for queue in queues {
+                queue.event.write(1)?;
+            }
+        }
+        self.frozen = false;
+        Ok(())
     }
 
     pub fn id(&self) -> &str {
@@ -42,6 +98,9 @@ impl Rng {
     }
 
     pub fn process_req(&mut self) -> bool {
+        if self.frozen {
+            return false;
+        }
         debug!("rng: process_req()");
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem,
@@ -54,6 +113,10 @@ impl Rng {
             .as_mut()
             .expect("queues should exist when activated");
         let mut have_used = false;
+
+        if !queues[REQ_INDEX].queue.ready {
+            return false;
+        }
 
         while let Some(head) = queues[REQ_INDEX].queue.pop(mem) {
             let index = head.index;
@@ -120,6 +183,16 @@ impl VirtioDevice for Rng {
         );
     }
 
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.frozen = true;
+        self.activate(mem, interrupt, queues)
+    }
+
     fn activate(
         &mut self,
         mem: GuestMemoryMmap,
@@ -153,6 +226,7 @@ impl VirtioDevice for Rng {
     fn reset(&mut self) -> bool {
         self.queues = None;
         self.device_state = DeviceState::Inactive;
+        self.frozen = false;
         true
     }
 }

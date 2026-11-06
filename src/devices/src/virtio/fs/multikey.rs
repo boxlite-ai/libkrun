@@ -112,6 +112,10 @@ where
         self.alt.clear();
         self.main.clear()
     }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.main.values().map(|(_, value)| value)
+    }
 }
 
 #[cfg(test)]

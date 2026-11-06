@@ -77,6 +77,14 @@ A failed multi-slot request preserves and reports completed slots. Guest
 unplug requests release slots only after their last plugged block is removed;
 the host target never decreases.
 
+### Memory checkpoints (Linux x86_64/KVM)
+
+`krun_set_checkpointing`, `krun_save_checkpoint`, and
+`krun_set_checkpoint_restore` support saving a running VM and resuming it in a
+new process. Block images are packaged independently; virtio-fs reuses live host
+directories, and network streams can disconnect. See
+[the checkpoint API, resource contracts, support limits and tests](docs/memory-checkpoint.md).
+
 ## Networking
 
 In ```libkrun```, networking is provided by two different, mutually exclusive techniques: **virtio-vsock + TSI** and **virtio-net + passt/gvproxy**.

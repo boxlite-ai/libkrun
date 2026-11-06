@@ -87,6 +87,21 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    pub(crate) fn register_checkpoint_device(
+        &mut self,
+        vm: &VmFd,
+        transport: devices::virtio::MmioTransport,
+        type_id: u32,
+        id: String,
+        address: u64,
+        irq: u32,
+    ) -> Result<()> {
+        self.mmio_base = address;
+        self.irq = irq;
+        self.register_mmio_device(vm, transport, type_id, id)
+            .map(|_| ())
+    }
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
@@ -268,7 +283,6 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
@@ -295,9 +309,9 @@ impl MMIODeviceManager {
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
 #[derive(Clone, Debug)]
 pub struct MMIODeviceInfo {
-    addr: u64,
-    _irq: u32,
-    _len: u64,
+    pub(crate) addr: u64,
+    pub(crate) _irq: u32,
+    pub(crate) _len: u64,
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
