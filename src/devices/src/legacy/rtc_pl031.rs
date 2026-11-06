@@ -68,6 +68,27 @@ pub struct RTC {
 }
 
 impl RTC {
+    #[cfg(target_os = "macos")]
+    pub fn save_state(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(&(
+            [self.match_value, self.load, self.imsc, self.ris],
+            (self.tick_offset as i128 + self.previous_now.elapsed().as_nanos() as i128),
+        ))
+        .map_err(std::io::Error::other)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn restore_state(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let (registers, ticks): ([u32; 4], i128) =
+            serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+        self.tick_offset = i64::try_from(ticks).map_err(io::Error::other)?;
+        self.previous_now = Instant::now();
+        self.match_value = registers[0];
+        self.load = registers[1];
+        self.imsc = registers[2];
+        self.ris = registers[3];
+        Ok(())
+    }
+
     /// Constructs an AMBA PL031 RTC device.
     pub fn new(interrupt_evt: EventFd) -> RTC {
         RTC {

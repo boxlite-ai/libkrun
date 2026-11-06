@@ -20,6 +20,19 @@ impl IrqChipDevice {
         Self { inner: irqchip }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn is_native(&self) -> bool {
+        self.inner.is_native()
+    }
+    #[cfg(target_os = "macos")]
+    pub fn save_state(&self) -> std::io::Result<Vec<u8>> {
+        self.inner.save_state()
+    }
+    #[cfg(target_os = "macos")]
+    pub fn restore_state(&mut self, state: &[u8]) -> std::io::Result<()> {
+        self.inner.restore_state(state)
+    }
+
     pub fn get_mmio_addr(&self) -> u64 {
         self.inner.get_mmio_addr()
     }
@@ -125,6 +138,19 @@ pub trait IrqChipT: BusDevice {
 
 #[cfg(target_arch = "aarch64")]
 pub trait IrqChipT: BusDevice + GICDevice {
+    #[cfg(target_os = "macos")]
+    fn is_native(&self) -> bool {
+        false
+    }
+    #[cfg(target_os = "macos")]
+    fn save_state(&self) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("unsupported GIC"))
+    }
+    #[cfg(target_os = "macos")]
+    fn restore_state(&mut self, _: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other("unsupported GIC"))
+    }
+
     fn get_mmio_addr(&self) -> u64;
     fn get_mmio_size(&self) -> u64;
     fn set_irq(

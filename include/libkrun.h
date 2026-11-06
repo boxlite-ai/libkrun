@@ -26,7 +26,7 @@ int32_t krun_set_memory_hotplug(uint32_t ctx_id, uint32_t max_mib);
 int32_t krun_request_memory(uint32_t ctx_id, uint32_t total_mib);
 int32_t krun_get_memory_status(uint32_t ctx_id, struct krun_memory_status *status);
 
-/* Experimental checkpoint container version 1, Linux x86_64/KVM.
+/* Experimental checkpoint container version 1, Linux x86_64/KVM and macOS ARM64/HVF.
  * Configure before start_enter. Checkpoint mode owns the kernel's RAM and uses
  * ordinary virtio-fs I/O instead of a DAX window. Unsupported platforms return
  * -ENOTSUP. External virtio-fs contents are live; missing/replaced objects yield

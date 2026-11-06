@@ -47,6 +47,7 @@ static int32_t flatten_disk(const char *id, const char *source, const char *targ
 }
 
 static void grow_memory(void) {
+#ifdef __linux__
     int requested = -EAGAIN;
     for (unsigned i = 0; i < 2000 && requested == -EAGAIN; ++i) {
         requested = krun_request_memory(context, 384);
@@ -68,6 +69,9 @@ static void grow_memory(void) {
     for (unsigned i = 0; i < 2000 && access(path, F_OK); ++i) usleep(10000);
     if (access(path, F_OK)) abort();
     fprintf(stderr, "MEMORY 384 384\n");
+#else
+    abort();
+#endif
 }
 
 static void check(int result, const char *operation) {
@@ -95,8 +99,12 @@ int main(int argc, char **argv) {
     int ctx = krun_create_ctx(); check(ctx, "create"); context = ctx;
     check(krun_set_vm_config(context, 2, 256), "vm config");
     if (hotplug) {
+#ifdef __linux__
         check(krun_set_memory_hotplug(context, 384), "hotplug config");
         check(krun_add_kernel_cmdline(context, "memhp_default_state=online_movable"), "auto-online memory");
+#else
+        abort();
+#endif
     }
     int block_root = getenv("KRUN_TEST_BLOCK_ROOT") != NULL;
     if (!block_root) check(krun_set_root(context, argv[2]), "root");

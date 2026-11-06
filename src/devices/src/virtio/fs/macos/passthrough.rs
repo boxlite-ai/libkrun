@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+pub mod checkpoint;
+
 use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -61,12 +63,14 @@ enum InodeHandle {
     Path(CString),
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct CachedDirEntry {
     ino: bindings::ino64_t,
     name: Box<[u8]>,
     type_: u8,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct DirStream {
     entries: Vec<CachedDirEntry>,
     ready: bool,

@@ -19,9 +19,9 @@ use super::descriptor_utils::{Reader, Writer};
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
-#[cfg(target_os = "linux")]
+
 use super::snapshot::{FsWorkerState, WorkerCheckpoint};
-#[cfg(target_os = "linux")]
+
 use crate::virtio::{control::Command, persist::invalid};
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
@@ -68,7 +68,7 @@ pub struct FsWorker {
     shm_region: Option<VirtioShmRegion>,
     server: FsServer,
     stop_fd: EventFd,
-    #[cfg(target_os = "linux")]
+
     checkpoint: WorkerCheckpoint,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -87,7 +87,7 @@ impl FsWorker {
         read_only: bool,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
-        #[cfg(target_os = "linux")] checkpoint: WorkerCheckpoint,
+        checkpoint: WorkerCheckpoint,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let server = if read_only {
@@ -95,7 +95,7 @@ impl FsWorker {
         } else {
             FsServer::ReadWrite(Server::new(PassthroughFs::new(passthrough_cfg)?))
         };
-        #[cfg(target_os = "linux")]
+
         let server = {
             let mut server = server;
             if let Some(saved) = &checkpoint.restore {
@@ -119,7 +119,7 @@ impl FsWorker {
             shm_region,
             server,
             stop_fd,
-            #[cfg(target_os = "linux")]
+
             checkpoint,
             exit_code,
             #[cfg(target_os = "macos")]
@@ -146,16 +146,16 @@ impl FsWorker {
             stop_fd,
             &EpollEvent::new(EventSet::IN, stop_fd as u64),
         )?;
-        #[cfg(target_os = "linux")]
+
         let control_fd = self.checkpoint.control.event().as_raw_fd();
-        #[cfg(target_os = "linux")]
+
         epoll.ctl(
             ControlOperation::Add,
             control_fd,
             &EpollEvent::new(EventSet::IN, control_fd as u64),
         )?;
         let frozen = false;
-        #[cfg(target_os = "linux")]
+
         let frozen = frozen || self.checkpoint.frozen;
         if !frozen {
             for index in [HPQ_INDEX, REQ_INDEX] {
@@ -178,7 +178,7 @@ impl FsWorker {
                 let _ = self.stop_fd.read();
                 return Ok(());
             }
-            #[cfg(target_os = "linux")]
+
             {
                 if events[..count].iter().any(|event| event.fd() == control_fd) {
                     let _ = self.checkpoint.control.event().read();
@@ -211,7 +211,6 @@ impl FsWorker {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn freeze(&mut self, epoll: &Epoll) -> io::Result<()> {
         if !self.checkpoint.frozen {
             for event in &self.queue_evts {
@@ -252,7 +251,6 @@ impl FsWorker {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     fn resume(&mut self, epoll: &Epoll) -> io::Result<()> {
         if !self.checkpoint.frozen {
             return Err(invalid("fs worker is not frozen"));

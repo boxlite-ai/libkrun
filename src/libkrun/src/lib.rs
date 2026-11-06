@@ -2672,7 +2672,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         None => return -libc::ENOENT,
     };
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ))]
     if let Some(path) = ctx_cfg.checkpoint_restore.take() {
         return checkpoint::runtime::start_restore(ctx_id, ctx_cfg, &path, &mut event_manager);
     }
@@ -2785,7 +2791,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ))]
     let checkpoint_runtime = if ctx_cfg.vmr.checkpoint_enabled {
         match checkpoint::runtime::prepare(&mut event_manager, &ctx_cfg.vmr) {
             Ok(runtime) => Some(runtime),
@@ -2811,7 +2823,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ))]
     if let Some(runtime) = checkpoint_runtime {
         runtime.attach(ctx_id, _vmm.clone());
     }
@@ -2834,7 +2852,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             Ok(_) => {}
             Err(e) => {
                 error!("Error in EventManager loop: {e:?}");
-                #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+                #[cfg(all(
+                    not(feature = "tee"),
+                    any(
+                        all(target_os = "linux", target_arch = "x86_64"),
+                        all(target_os = "macos", target_arch = "aarch64")
+                    )
+                ))]
                 checkpoint::runtime::unregister(ctx_id);
                 return -libc::EINVAL;
             }

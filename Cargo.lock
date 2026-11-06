@@ -659,6 +659,7 @@ dependencies = [
  "pipewire",
  "rand",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "virtio-bindings",
  "vm-fdt",
@@ -681,10 +682,12 @@ dependencies = [
 name = "krun-hvf"
 version = "0.1.0-1.18.0"
 dependencies = [
+ "cc",
  "crossbeam-channel",
  "krun-arch",
  "libloading",
  "log",
+ "serde",
 ]
 
 [[package]]

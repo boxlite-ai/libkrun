@@ -4,6 +4,9 @@
 Build libkrun with blk,net first. Set LD_LIBRARY_PATH to a libkrunfw.so.5
 directory. Artifacts and logs remain under target/run-* for inspection.
 """
+import platform
+import errno
+import sys
 import json
 import hashlib
 import os
@@ -24,11 +27,24 @@ for name in ("dev", "proc", "sys", "tmp", "run", "etc"):
     (root / name).mkdir()
 library = work / "lib"
 library.mkdir()
-for name in ("libkrun.so", "libkrun.so.1"):
-    (library / name).symlink_to(repo / "target/debug/libkrun.so")
-subprocess.run(["cc", "-O2", "-static", "-pthread", str(Path(__file__).with_name("guest.c")), "-o", str(root / "checkpoint-guest")], check=True)
+hvf = platform.system() == "Darwin"
 host = work / "host"
+if hvf:
+    firmware = Path(sys.argv[1]).resolve()
+    assert (firmware / "libkrunfw.5.dylib").is_file()
+    for name in ("libkrun.dylib", "libkrun.1.dylib"):
+        (library / name).symlink_to(repo / "target/debug/libkrun.dylib")
+    sysroot = repo / "linux-sysroot"
+    gcc = sysroot / "usr/lib/gcc/aarch64-linux-gnu/12"
+    subprocess.run(["/usr/bin/clang", "-target", "aarch64-linux-gnu", "-fuse-ld=/opt/homebrew/opt/lld/bin/ld.lld", f"--sysroot={sysroot}", f"-B{gcc}", f"-L{gcc}", "-static", "-O2", "-pthread", str(Path(__file__).with_name("guest.c")), "-o", str(root / "checkpoint-guest")], check=True)
+    os.environ["DYLD_LIBRARY_PATH"] = f"{library}:{firmware}"
+else:
+    for name in ("libkrun.so", "libkrun.so.1"):
+        (library / name).symlink_to(repo / "target/debug/libkrun.so")
+    subprocess.run(["cc", "-O2", "-static", "-pthread", str(Path(__file__).with_name("guest.c")), "-o", str(root / "checkpoint-guest")], check=True)
 subprocess.run(["cc", "-O2", "-pthread", "-I", str(repo / "include"), str(Path(__file__).with_name("host.c")), "-L", str(library), "-lkrun", f"-Wl,-rpath,{library}", "-o", str(host)], check=True)
+if hvf:
+    subprocess.run(["codesign", "--entitlements", str(repo / "hvf-entitlements.plist"), "--force", "-s", "-", str(host)], check=True)
 disk = work / "disk.raw"
 with disk.open("wb") as file:
     file.truncate((64 if os.environ.get("KRUN_TEST_BLOCK_ROOT") else 8) * 1024 * 1024)
@@ -214,7 +230,7 @@ try:
         hidden = work / "renamed-root"
         root.rename(hidden)
         source.send_signal(signal.SIGUSR1)
-        wait(lambda: "CHECKPOINT -108" in text(log), source, [log, console], timeout=15)
+        wait(lambda: f"CHECKPOINT {-errno.ESHUTDOWN}" in text(log), source, [log, console], timeout=15)
         stopped = text(hidden / "progress")
         time.sleep(.2)
         assert text(hidden / "progress") == stopped
@@ -237,7 +253,7 @@ try:
     at_save = len(ticks())
     wait(lambda: len(ticks()) > at_save + 3, source, [log, console])
     source.send_signal(signal.SIGUSR1)
-    wait(lambda: "CHECKPOINT -17" in text(log), source, [log, console])
+    wait(lambda: f"CHECKPOINT {-errno.EEXIST}" in text(log), source, [log, console])
     stop(source)  # Source process has exited before any restore starts.
     before_restore = len(ticks())
     if not os.environ.get("KRUN_TEST_BLOCK_ROOT"):
@@ -249,12 +265,16 @@ try:
     with disk.open("r+b") as file:
         file.write(b"\xee" * 512)
 
+    if hvf:
+        time.sleep(1.1)  # guest virtual time must exclude the offline interval
     second = work / "checkpoint-2"
     target, log, console = start("restore", first, second)
     # Debug builds hash and copy every RAM artifact before entering KVM. Keep
     # startup separate from the short deadline for an already-running guest.
     wait(lambda: len(ticks()) > before_restore + 5, target, [log, console], timeout=180)
     after = ticks()[before_restore:]
+    if hvf:
+        assert after[0][3] - ticks()[before_restore - 1][3] < 750_000_000, after[0]
     if os.environ.get("KRUN_TEST_HOTPLUG"):
         assert all(row[6] == 1 for row in after), after
     assert all(row[0] == original[0] and row[5] == 1 for row in after), after
@@ -303,23 +323,30 @@ try:
     incompatible.mkdir()
     original_header = (first / "state.bin").read_bytes()[:48]
     state = json.loads((first / "state.bin").read_bytes()[48:])
-    state["cpus"][0]["tsc_khz"] += 1
+    if hvf:
+        state["cpus"][0]["cpu"]["frequency"] += 1
+    else:
+        state["cpus"][0]["tsc_khz"] += 1
     payload = json.dumps(state, separators=(",", ":")).encode()
     header = original_header[:12] + struct.pack("<I", len(payload)) + hashlib.sha256(payload).digest()
     (incompatible / "state.bin").write_bytes(header + payload)
     for artifact in first.iterdir():
         if artifact.name != "state.bin":
-            (incompatible / artifact.name).hardlink_to(artifact)
+            os.link(artifact, incompatible / artifact.name)
     progress = len(ticks())
     bad_cpu, log, console = start("restore", incompatible)
     assert bad_cpu.wait(timeout=180) != 0
-    assert "incompatible TSC frequency" in text(log), text(log)
+    assert ("incompatible HVF CPU state" if hvf else "incompatible TSC frequency") in text(log), text(log)
     assert len(ticks()) == progress
     if os.environ.get("KRUN_TEST_NET"):
         wait(lambda: backends[-1].closed, bad_cpu, [log, console])
-    result = {"status": "passed", "source_pid": source.pid, "restore_pid": target.pid, "repeat_pid": repeated.pid,
+    result = {"status": "passed", "platform": "macos-aarch64-hvf" if hvf else "linux-x86_64-kvm", "source_pid": source.pid, "restore_pid": target.pid, "repeat_pid": repeated.pid,
               "nonce": original[0], "vcpus": 2, "virtio_fs_stale_handle": not bool(os.environ.get("KRUN_TEST_BLOCK_ROOT")), "independent_disk": "qcow2-flatten" if os.environ.get("KRUN_TEST_FLATTEN") else "raw",
               "corrupt_metadata_rejected": True, "truncated_ram_rejected": True, "failed_restore_joined": True, "work": str(work)}
+    if hvf:
+        saved_platform = json.loads((first / "state.bin").read_bytes()[48:])["vm"]
+        result["gic"] = "native" if saved_platform["native_gic"] else "software"
+        result["virtual_clock_excludes_offline"] = True
     result["ext4_rootfs"] = bool(os.environ.get("KRUN_TEST_BLOCK_ROOT"))
     result["tsi_tcp_accept_udp"] = bool(os.environ.get("KRUN_TEST_TSI"))
     result["hotplug_384_mib"] = bool(os.environ.get("KRUN_TEST_HOTPLUG"))

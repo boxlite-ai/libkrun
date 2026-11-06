@@ -568,12 +568,18 @@ pub fn build_microvm(
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     if vm_resources.checkpoint_enabled
         && (!cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            not(feature = "tee")
+            not(feature = "tee"),
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
         )) || vm_resources.nested_enabled
             || vm_resources.split_irqchip)
     {
+        return Err(StartMicrovmError::UnsupportedCheckpointConfiguration);
+    }
+    #[cfg(target_os = "macos")]
+    if vm_resources.checkpoint_enabled && vm_resources.serial_consoles.len() > 1 {
         return Err(StartMicrovmError::UnsupportedCheckpointConfiguration);
     }
     let payload = choose_payload(vm_resources)?;
@@ -816,7 +822,8 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -909,7 +916,12 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            let native = if std::env::var("KRUN_HVF_GIC").as_deref() == Ok("software") {
+                Err(hvf::Error::VmCreate)
+            } else {
+                HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64)
+            };
+            let gic = match native {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -927,6 +939,9 @@ pub fn build_microvm(
         )
         .map_err(StartMicrovmError::Internal)?;
 
+        for cpu in &mut vcpus {
+            cpu.native_gic = intc.lock().unwrap().is_native();
+        }
         attach_legacy_devices(
             &vm,
             &mut mmio_device_manager,
@@ -970,13 +985,19 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            not(feature = "tee"),
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
+        ))]
         checkpoint_enabled: vm_resources.checkpoint_enabled,
+        #[cfg(target_os = "macos")]
+        hvf_state: crate::checkpoint::hvf::Runtime::new(intc.clone(), vcpu_list.clone()),
         checkpoint_files: Vec::new(),
         checkpoint_dirs: Vec::new(),
-        #[cfg(target_os = "linux")]
         vcpus_paused: true,
-        #[cfg(target_os = "linux")]
         vcpus_failed: false,
         exit_evt,
         exit_observers: Vec::new(),
@@ -1774,7 +1795,7 @@ fn attach_legacy_devices(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn attach_legacy_devices(
+pub(crate) fn attach_legacy_devices(
     vm: &Vm,
     mmio_device_manager: &mut MMIODeviceManager,
     kernel_cmdline: &mut kernel::cmdline::Cmdline,
@@ -1870,7 +1891,7 @@ fn create_vcpus_aarch64(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn create_vcpus_aarch64(
+pub(crate) fn create_vcpus_aarch64(
     _vm: &Vm,
     vcpu_config: &VcpuConfig,
     mem_info: &ArchMemoryInfo,
@@ -1880,7 +1901,7 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut boot_senders: HashMap<u64, Sender<(u64, u64)>> = HashMap::new();
 
     for cpu_index in 0..vcpu_config.vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {

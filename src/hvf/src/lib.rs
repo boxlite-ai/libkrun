@@ -8,6 +8,10 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+#[cfg(target_os = "macos")]
+pub mod snapshot;
+#[cfg(target_os = "macos")]
+mod snapshot_sme;
 
 #[macro_use]
 extern crate log;
@@ -550,9 +554,7 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
-        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
-
+    pub fn complete_exit(&mut self) -> Result<(), Error> {
         if let Some(mmio_read) = self.pending_mmio_read.take() {
             if mmio_read.srt < 31 {
                 let val = match mmio_read.len {
@@ -576,6 +578,12 @@ impl HvfVcpu<'_> {
             self.pending_advance_pc = false;
         }
 
+        Ok(())
+    }
+
+    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
+        self.complete_exit()?;
+        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
         if pending_irq {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
@@ -712,7 +720,12 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
+                let mut offset = 0;
+                let ret = unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset) };
+                if ret != HV_SUCCESS {
+                    return Err(Error::VcpuReadSystemRegister);
+                }
+                let now = unsafe { mach_absolute_time() }.wrapping_sub(offset);
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
@@ -726,6 +739,22 @@ impl HvfVcpu<'_> {
                 self.handle_psci_request()
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
+        }
+    }
+}
+
+impl Drop for HvfVcpu<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            hv_vcpu_destroy(self.vcpuid);
+        }
+    }
+}
+
+impl Drop for HvfVm {
+    fn drop(&mut self) {
+        unsafe {
+            hv_vm_destroy();
         }
     }
 }

@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux/x86 checkpoint ownership. Operations run on the event-loop thread;
+//! Whole-VM checkpoint ownership. Operations run on the event-loop thread;
 //! its subscriber callback is the barrier for event-loop memory writers.
 //! Block image flattening belongs to the caller's existing image implementation.
 
+#[cfg(target_os = "macos")]
+pub(crate) mod hvf;
 mod restore;
+#[cfg(target_os = "macos")]
+use hvf::LegacyState;
+#[cfg(target_os = "linux")]
+const PLATFORM: &str = "linux-x86_64-kvm";
+#[cfg(target_os = "macos")]
+const PLATFORM: &str = "macos-aarch64-hvf";
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -17,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use devices::virtio::console::ConsoleState;
 use devices::virtio::fs::FsDeviceState;
+#[cfg(target_os = "linux")]
 use devices::virtio::mem::{Mem, MemState};
 #[cfg(feature = "net")]
 use devices::virtio::net::{Net, NetCheckpoint};
@@ -76,6 +85,7 @@ struct Metadata {
     irq_counts: Vec<u64>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyState {
@@ -106,6 +116,7 @@ enum DeviceSnapshot {
     Fs(FsDeviceState),
     Rng(EventDeviceState),
     Balloon(EventDeviceState),
+    #[cfg(target_os = "linux")]
     Memory(MemState),
     #[cfg(feature = "blk")]
     Block(BlockState, Artifact, u32),
@@ -116,11 +127,13 @@ struct LiveDevice {
     address: u64,
     irq: u32,
     device: Arc<Mutex<dyn VirtioDevice>>,
+    #[cfg(target_os = "linux")]
     interrupt: EventFd,
 }
 
 impl Drop for Vmm {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         if !self.checkpoint_enabled {
             return;
         }
@@ -158,6 +171,10 @@ impl Vmm {
     fn checkpoint_devices(&self) -> io::Result<Vec<LiveDevice>> {
         let mut result = Vec::new();
         for ((kind, id), info) in self.mmio_device_manager.get_device_info() {
+            #[cfg(target_os = "macos")]
+            if !matches!(kind, devices::DeviceType::Virtio(_)) {
+                continue;
+            }
             let bus = self
                 .mmio_device_manager
                 .get_device(*kind, id)
@@ -176,8 +193,9 @@ impl Vmm {
                     || any.is::<Fs>()
                     || any.is::<Rng>()
                     || any.is::<Balloon>()
-                    || any.is::<Mem>()
                     || any.is::<Vsock>();
+                #[cfg(target_os = "linux")]
+                let supported = supported || any.is::<Mem>();
                 #[cfg(feature = "blk")]
                 let supported = supported || any.is::<Block>();
                 #[cfg(feature = "net")]
@@ -201,8 +219,12 @@ impl Vmm {
             result.push(LiveDevice {
                 id: id.clone(),
                 address: info.addr,
+                #[cfg(target_os = "linux")]
                 irq: info._irq,
+                #[cfg(target_os = "macos")]
+                irq: info.irq,
                 device,
+                #[cfg(target_os = "linux")]
                 interrupt: transport.interrupt_evt().try_clone()?,
             });
         }
@@ -261,6 +283,7 @@ impl Vmm {
         )
         .map_err(other)?;
         // Online hotplug targets join the same boundary as guest requests.
+        #[cfg(target_os = "linux")]
         for device in &devices {
             if let Some(memory) = device
                 .device
@@ -284,19 +307,27 @@ impl Vmm {
                 return Err(error);
             }
         }
+        #[cfg(target_os = "linux")]
         let mut detached = 0;
         let mut counts = Vec::new();
         let saved = (|| {
-            for (event, irq) in &bindings {
-                self.vm.fd().unregister_irqfd(event, *irq).map_err(other)?;
-                detached += 1;
+            for (event, _irq) in &bindings {
+                #[cfg(target_os = "linux")]
+                {
+                    self.vm.fd().unregister_irqfd(event, *_irq).map_err(other)?;
+                    detached += 1;
+                }
                 counts.push(drain(event)?);
             }
             self.write_checkpoint(staging.as_path(), &devices, counts.clone(), flatten)
         })();
+        if let Err(error) = &saved {
+            error!("checkpoint capture failed: {error}");
+        }
         // Even storage/flatten failure releases a confirmed barrier. An unknown
         // control/IRQ outcome instead permanently disables and stops the VM.
         let resumed = (|| {
+            #[cfg(target_os = "linux")]
             for (index, (event, irq)) in bindings.iter().take(detached).enumerate() {
                 if let Some(&count) = counts.get(index) {
                     if count != 0 {
@@ -346,6 +377,7 @@ impl Vmm {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn irq_bindings(&self, devices: &[LiveDevice]) -> io::Result<Vec<(EventFd, u32)>> {
         let mut bindings = Vec::new();
         for device in devices {
@@ -369,7 +401,7 @@ impl Vmm {
         directory: &Path,
         devices: &[LiveDevice],
         irq_counts: Vec<u64>,
-        flatten: &mut Flatten<'_>,
+        _flatten: &mut Flatten<'_>,
     ) -> io::Result<()> {
         if self.exit_code.load(std::sync::atomic::Ordering::Acquire) != i32::MAX {
             return Err(invalid("VM is exiting"));
@@ -379,35 +411,56 @@ impl Vmm {
             self.exit_evt.write(exiting)?;
             return Err(invalid("VM is exiting"));
         }
-        let memory_device = devices
-            .iter()
-            .find(|d| d.device.lock().unwrap().as_any().is::<Mem>());
-        let memory_guard = memory_device.map(|d| d.device.lock().unwrap());
-        let hotplug = memory_guard
-            .as_ref()
-            .map(|d| d.as_any().downcast_ref::<Mem>().unwrap());
-        let boot = match hotplug {
-            Some(device) => device.boot_memory(&self.guest_memory)?,
-            None => self.guest_memory.clone(),
+        #[cfg(target_os = "linux")]
+        let (memory_device, memory_guard, memory_state, accessible, ram, hotplug_artifact) = {
+            let memory_device = devices
+                .iter()
+                .find(|d| d.device.lock().unwrap().as_any().is::<Mem>());
+            let memory_guard = memory_device.map(|d| d.device.lock().unwrap());
+            let hotplug = memory_guard
+                .as_ref()
+                .map(|d| d.as_any().downcast_ref::<Mem>().unwrap());
+            let boot = match hotplug {
+                Some(device) => device.boot_memory(&self.guest_memory)?,
+                None => self.guest_memory.clone(),
+            };
+            // Raw aliases remain under the frozen memory-device lock until every
+            // queue validation is complete, and cannot escape this function.
+            let accessible = match hotplug {
+                Some(device) => unsafe { device.accessible_memory(&self.guest_memory)? },
+                None => boot.clone(),
+            };
+            let ram = write_artifact(directory, "ram.bin", &crate::ram_snapshot::save(&boot)?)?;
+            let hotplug_artifact = if let Some(device) = hotplug {
+                let mut file = create_file(&directory.join("hotplug.bin"))?;
+                device.save_memory(&mut file)?;
+                file.sync_all()?;
+                Some(artifact(directory, "hotplug.bin")?)
+            } else {
+                None
+            };
+            let memory_state = hotplug.map(Mem::save_state).transpose()?;
+            (
+                memory_device,
+                memory_guard,
+                memory_state,
+                accessible,
+                ram,
+                hotplug_artifact,
+            )
         };
-        // Raw aliases remain under the frozen memory-device lock until every
-        // queue validation is complete, and cannot escape this function.
-        let accessible = match hotplug {
-            Some(device) => unsafe { device.accessible_memory(&self.guest_memory)? },
-            None => boot.clone(),
-        };
-        let ram = write_artifact(directory, "ram.bin", &crate::ram_snapshot::save(&boot)?)?;
-        let hotplug_artifact = if let Some(device) = hotplug {
-            let mut file = create_file(&directory.join("hotplug.bin"))?;
-            device.save_memory(&mut file)?;
-            file.sync_all()?;
-            Some(artifact(directory, "hotplug.bin")?)
-        } else {
-            None
-        };
-        let memory_state = hotplug.map(Mem::save_state).transpose()?;
+        #[cfg(target_os = "macos")]
+        let (accessible, ram, hotplug_artifact) = (
+            self.guest_memory.clone(),
+            write_artifact(
+                directory,
+                "ram.bin",
+                &crate::ram_snapshot::save(&self.guest_memory)?,
+            )?,
+            None,
+        );
         let mut records = Vec::new();
-        for (index, live) in devices.iter().enumerate() {
+        for (_index, live) in devices.iter().enumerate() {
             let transport = {
                 let bus = self
                     .mmio_device_manager
@@ -418,6 +471,7 @@ impl Vmm {
                     .lock()
                     .unwrap();
                 // Do not relock the memory device while holding memory_guard.
+                #[cfg(target_os = "linux")]
                 if memory_device.is_some_and(|d| d.address == live.address) {
                     drop(bus);
                     continue;
@@ -487,8 +541,8 @@ impl Vmm {
                             return Err(invalid("standalone VMDK export is not implemented"))
                         }
                     };
-                    let name = format!("disk-{index}.img");
-                    flatten(&live.id, Path::new(source), &directory.join(&name), format)?;
+                    let name = format!("disk-{_index}.img");
+                    _flatten(&live.id, Path::new(source), &directory.join(&name), format)?;
                     let image = open_file(&directory.join(&name))?;
                     validate_disk(&image, format, &state)?;
                     use std::os::unix::fs::MetadataExt;
@@ -522,7 +576,9 @@ impl Vmm {
             });
         }
         drop(accessible);
+        #[cfg(target_os = "linux")]
         drop(memory_guard);
+        #[cfg(target_os = "linux")]
         if let (Some(live), Some(state)) = (memory_device, memory_state) {
             let bus = self
                 .mmio_device_manager
@@ -554,14 +610,13 @@ impl Vmm {
                 _ => return Err(invalid("missing vCPU state")),
             }
         }
-        let cmos = self.pio_device_manager.cmos.lock().unwrap().save_state();
-        let mut serial = Vec::new();
-        for address in [0x3f8, 0x2f8, 0x3e8, 0x2e8] {
-            serial.push(
-                self.pio_device_manager
-                    .io_bus
-                    .get_device(address)
-                    .map(|(_, device)| {
+        #[cfg(target_os = "linux")]
+        let legacy = {
+            let cmos = self.pio_device_manager.cmos.lock().unwrap().save_state();
+            let mut serial = Vec::new();
+            for address in [0x3f8, 0x2f8, 0x3e8, 0x2e8] {
+                serial.push(self.pio_device_manager.io_bus.get_device(address).map(
+                    |(_, device)| {
                         device
                             .lock()
                             .unwrap()
@@ -569,13 +624,24 @@ impl Vmm {
                             .downcast_ref::<devices::legacy::Serial>()
                             .unwrap()
                             .save_state()
-                    }),
-            );
-        }
+                    },
+                ));
+            }
+            LegacyState {
+                cmos_index: cmos.index,
+                cmos: cmos.data.to_vec(),
+                keyboard: self.pio_device_manager.i8042.lock().unwrap().save_state(),
+                serial,
+                serial_endpoints: self.pio_device_manager.stdio_serial.len(),
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let legacy = self.save_hvf_legacy()?;
         let info = &self.arch_memory_info;
         let metadata = Metadata {
             version: VERSION,
-            platform: "linux-x86_64-kvm".into(),
+            platform: PLATFORM.into(),
+            #[cfg(target_os = "linux")]
             arch_memory: [
                 info.ram_below_gap,
                 info.ram_above_gap,
@@ -586,18 +652,26 @@ impl Vmm {
                 info.firmware_addr,
                 0,
             ],
+            #[cfg(target_os = "macos")]
+            arch_memory: [
+                info.ram_start_addr,
+                info.fdt_addr,
+                info.ram_last_addr,
+                info.shm_start_addr,
+                info.page_size as u64,
+                info.initrd_addr,
+                info.firmware_addr,
+                0,
+            ],
             ram,
             hotplug: hotplug_artifact,
+            #[cfg(target_os = "linux")]
             vm: self.vm.save_state().map_err(other)?,
+            #[cfg(target_os = "macos")]
+            vm: self.save_hvf_vm()?,
             cpus,
             devices: records,
-            legacy: LegacyState {
-                cmos_index: cmos.index,
-                cmos: cmos.data.to_vec(),
-                keyboard: self.pio_device_manager.i8042.lock().unwrap().save_state(),
-                serial,
-                serial_endpoints: self.pio_device_manager.stdio_serial.len(),
-            },
+            legacy,
             irq_counts,
         };
         let bytes = serde_json::to_vec(&metadata).map_err(other)?;
@@ -642,6 +716,7 @@ fn freeze_device(device: &mut dyn VirtioDevice, deadline: Instant) -> io::Result
     if let Some(balloon) = any.downcast_mut::<Balloon>() {
         balloon.freeze();
     }
+    #[cfg(target_os = "linux")]
     if let Some(mem) = any.downcast_mut::<Mem>() {
         mem.freeze();
     }
@@ -673,6 +748,7 @@ fn resume_device(device: &mut dyn VirtioDevice) -> io::Result<()> {
     if let Some(balloon) = any.downcast_mut::<Balloon>() {
         return balloon.resume();
     }
+    #[cfg(target_os = "linux")]
     if let Some(mem) = any.downcast_mut::<Mem>() {
         return mem.resume();
     }
@@ -749,6 +825,7 @@ fn open_file(path: &Path) -> io::Result<File> {
     }
     Ok(file)
 }
+#[cfg(any(target_os = "linux", feature = "blk"))]
 fn artifact(directory: &Path, name: &str) -> io::Result<Artifact> {
     let mut file = open_file(&directory.join(name))?;
     let mut hash = Sha256::new();
@@ -779,7 +856,8 @@ fn write_artifact(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<Arti
 fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     let source = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(other)?;
     let destination = std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(other)?;
-    if unsafe {
+    #[cfg(target_os = "linux")]
+    let ret = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
             source.as_ptr(),
@@ -787,8 +865,10 @@ fn publish(source: &Path, destination: &Path) -> io::Result<()> {
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
-    } != 0
-    {
+    };
+    #[cfg(target_os = "macos")]
+    let ret = unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if ret != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

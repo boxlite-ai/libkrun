@@ -18,9 +18,11 @@ pub type FlattenCallback = unsafe extern "C" fn(
 pub extern "C" fn krun_set_checkpointing(ctx_id: u32, enabled: bool) -> i32 {
     if enabled
         && !cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            not(feature = "tee")
+            not(feature = "tee"),
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
         ))
     {
         return -libc::ENOTSUP;
@@ -34,9 +36,11 @@ pub extern "C" fn krun_set_checkpointing(ctx_id: u32, enabled: bool) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_checkpoint_restore(ctx_id: u32, path: *const c_char) -> i32 {
     if !cfg!(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        not(feature = "tee")
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
     )) {
         return -libc::ENOTSUP;
     }
@@ -67,19 +71,37 @@ pub unsafe extern "C" fn krun_save_checkpoint(
     if path.is_null() {
         return -libc::EINVAL;
     }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ))]
     {
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(CStr::from_ptr(path).to_bytes()));
         runtime::save(ctx_id, path, flatten, opaque as usize)
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))))]
+    #[cfg(not(all(
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    )))]
     {
         let _ = (ctx_id, flatten, opaque);
         -libc::ENOTSUP
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    not(feature = "tee"),
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub(crate) mod runtime {
     use super::*;
     use crossbeam_channel::{bounded, Receiver, Sender};
@@ -330,7 +352,13 @@ pub(crate) mod runtime {
                 return -libc::EIO;
             }
         };
-        let vmm = match vmm::checkpoint::restore(path, &ctx.vmr, events) {
+        let vmm = match vmm::checkpoint::restore(
+            path,
+            &ctx.vmr,
+            events,
+            #[cfg(target_os = "macos")]
+            ctx.shutdown_efd.take(),
+        ) {
             Ok(vmm) => vmm,
             Err(error) => {
                 error!("checkpoint restore failed: {error}");

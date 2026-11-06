@@ -15,7 +15,13 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
-#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    not(feature = "tee"),
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub mod checkpoint;
 pub(crate) mod device_manager;
 /// RAM-only byte image encoding, independent of VM execution state.
@@ -45,7 +51,6 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
@@ -202,14 +207,20 @@ pub struct Vmm {
     kernel_cmdline: KernelCmdline,
 
     vcpus_handles: Vec<VcpuHandle>,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ))]
     checkpoint_enabled: bool,
     checkpoint_files: Vec<utils::tempfile::TempFile>,
     checkpoint_dirs: Vec<utils::tempdir::TempDir>,
-    #[cfg(target_os = "linux")]
     vcpus_paused: bool,
-    #[cfg(target_os = "linux")]
     vcpus_failed: bool,
+    #[cfg(target_os = "macos")]
+    hvf_state: checkpoint::hvf::Runtime,
     exit_evt: EventFd,
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
@@ -239,7 +250,6 @@ impl Vmm {
 
     /// Build vCPU threads without allowing KVM_RUN. Restore builders must finish
     /// RAM, devices, interrupt controller and CPU state before resuming them.
-    #[cfg(target_os = "linux")]
     pub fn start_vcpus_paused(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
         self.spawn_vcpus(vcpus)
     }
@@ -258,7 +268,6 @@ impl Vmm {
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
         }
 
-        #[cfg(target_os = "linux")]
         {
             self.vcpus_paused = true;
         }
@@ -266,23 +275,28 @@ impl Vmm {
     }
 
     /// Sends a resume command to the vcpus.
-    #[cfg(target_os = "linux")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
         self.transition_vcpus(false, Instant::now() + Duration::from_secs(1))
     }
 
     /// CPU barrier only. The event loop and device/host writers must still be
     /// frozen separately before capturing memory or interrupt-controller state.
-    #[cfg(target_os = "linux")]
     pub fn pause_vcpus(&mut self, deadline: Instant) -> Result<()> {
         self.transition_vcpus(true, deadline)
     }
 
-    #[cfg(target_os = "linux")]
     fn transition_vcpus(&mut self, pause: bool, deadline: Instant) -> Result<()> {
         use vstate::control::Command;
         if self.vcpus_failed {
             return Err(Error::VcpuResume);
+        }
+        #[cfg(target_os = "macos")]
+        if !pause {
+            if let Err(error) = self.resume_hvf_clock() {
+                self.vcpus_failed = true;
+                let _ = self.stop_vcpus(Instant::now() + Duration::from_secs(1));
+                return Err(Error::Vcpu(vstate::Error::Checkpoint(error)));
+            }
         }
         for handle in &mut self.vcpus_handles {
             let command = if pause {
@@ -298,11 +312,14 @@ impl Vmm {
                 return Err(Error::Vcpu(error));
             }
         }
+        #[cfg(target_os = "macos")]
+        if pause && self.hvf_state.paused_at.is_none() {
+            self.hvf_state.paused_at = Some(unsafe { hvf::mach_absolute_time() });
+        }
         self.vcpus_paused = pause;
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     pub fn stop_vcpus(&mut self, deadline: Instant) -> Result<()> {
         self.vcpus_failed = true;
         let mut result = Ok(());
@@ -312,11 +329,6 @@ impl Vmm {
             }
         }
         result
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn resume_vcpus(&mut self) -> Result<()> {
-        Ok(())
     }
 
     /// Configures the system for boot.

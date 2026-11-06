@@ -17,15 +17,15 @@ use super::super::{
     VirtioShmRegion,
 };
 use super::passthrough;
-#[cfg(target_os = "linux")]
+
 use super::snapshot::{FsWorkerState, WorkerCheckpoint};
 use super::worker::FsWorker;
 use super::ExportTable;
 use super::{defs, defs::uapi};
-#[cfg(target_os = "linux")]
+
 use crate::virtio::control::{self, WorkerController};
 use crate::virtio::InterruptTransport;
-#[cfg(target_os = "linux")]
+
 use std::sync::Mutex;
 
 #[derive(Copy, Clone)]
@@ -56,17 +56,17 @@ pub struct Fs {
     pub(super) read_only: bool,
     pub(super) worker_thread: Option<JoinHandle<()>>,
     pub(super) worker_stopfd: EventFd,
-    #[cfg(target_os = "linux")]
+
     pub(super) worker_control: Option<WorkerController>,
-    #[cfg(target_os = "linux")]
+
     pub(super) snapshot_worker: Arc<Mutex<Option<FsWorkerState>>>,
-    #[cfg(target_os = "linux")]
+
     pub(super) restore_worker: Option<FsWorkerState>,
-    #[cfg(target_os = "linux")]
+
     pub(super) frozen: bool,
-    #[cfg(target_os = "linux")]
+
     pub(super) snapshot_failed: bool,
-    #[cfg(target_os = "linux")]
+
     pub(super) snapshot_retired_root: bool,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -103,17 +103,17 @@ impl Fs {
             passthrough_cfg: fs_cfg,
             read_only,
             worker_thread: None,
-            #[cfg(target_os = "linux")]
+
             worker_control: None,
-            #[cfg(target_os = "linux")]
+
             snapshot_worker: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "linux")]
+
             restore_worker: None,
-            #[cfg(target_os = "linux")]
+
             frozen: false,
-            #[cfg(target_os = "linux")]
+
             snapshot_failed: false,
-            #[cfg(target_os = "linux")]
+
             snapshot_retired_root: false,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -157,7 +157,6 @@ impl Fs {
 }
 
 impl VirtioDevice for Fs {
-    #[cfg(target_os = "linux")]
     fn activate_frozen(
         &mut self,
         mem: GuestMemoryMmap,
@@ -228,11 +227,10 @@ impl VirtioDevice for Fs {
             panic!("virtio_fs: worker thread already exists");
         }
 
-        #[cfg(target_os = "linux")]
         if self.snapshot_failed {
             return Err(ActivateError::BadActivate);
         }
-        #[cfg(target_os = "linux")]
+
         if let Some(saved) = &self.restore_worker {
             if queues.len() != saved.queues.len() {
                 return Err(ActivateError::BadActivate);
@@ -248,7 +246,7 @@ impl VirtioDevice for Fs {
                 }
             }
         }
-        #[cfg(target_os = "linux")]
+
         let (controller, control) = control::channel().map_err(|_| ActivateError::BadActivate)?;
         // Extract queues and eventfds from DeviceQueues.
         let mut worker_queues = Vec::with_capacity(queues.len());
@@ -268,7 +266,6 @@ impl VirtioDevice for Fs {
             self.read_only,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
-            #[cfg(target_os = "linux")]
             WorkerCheckpoint {
                 control,
                 state: self.snapshot_worker.clone(),
@@ -283,7 +280,7 @@ impl VirtioDevice for Fs {
             ActivateError::BadActivate
         })?;
         self.worker_thread = Some(worker.run());
-        #[cfg(target_os = "linux")]
+
         {
             self.worker_control = Some(controller);
             self.restore_worker = None;
@@ -308,7 +305,7 @@ impl VirtioDevice for Fs {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
-        #[cfg(target_os = "linux")]
+
         {
             self.worker_control = None;
             self.frozen = false;

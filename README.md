@@ -77,7 +77,7 @@ A failed multi-slot request preserves and reports completed slots. Guest
 unplug requests release slots only after their last plugged block is removed;
 the host target never decreases.
 
-### Memory checkpoints (Linux x86_64/KVM)
+### Memory checkpoints (Linux x86_64/KVM and macOS ARM64/HVF)
 
 `krun_set_checkpointing`, `krun_save_checkpoint`, and
 `krun_set_checkpoint_restore` support saving a running VM and resuming it in a
