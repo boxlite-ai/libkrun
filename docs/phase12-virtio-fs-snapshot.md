@@ -1,7 +1,7 @@
 # 阶段 12：virtio-fs 内部快照检查点
 
 > 历史阶段记录：本文描述已退役的 v7/v8 归档检查点，不是当前契约。
-> 当前 v9 内存与外部资源契约、C ABI 和验证入口见 [README](../README.md#memory-checkpoints-experimental-version-9)。
+> 当前内存与外部资源契约、C ABI 和验证入口见 [README](../README.md#memory-checkpoints-experimental-version-10)。
 > v9 回归必须保留设备续跑、目录游标、排队请求及失败清理断言；删除旧归档编码不代表删除这些契约。外部根目录和磁盘由调用方持有，导入失败或 VM 退出均不得删除它们。
 
 

@@ -306,14 +306,16 @@ To avoid this problem, use the ```LD_LIBRARY_PATH``` environment variable to poi
 LD_LIBRARY_PATH=/usr/local/lib64 ./chroot_vm rootfs_fedora/ /bin/sh
 ```
 
-## Memory checkpoints (experimental, version 9)
+## Memory checkpoints (experimental, version 10)
 
 The Linux x86_64/KVM owner saves RAM, CPU/KVM/device state and FUSE sessions
 without archiving filesystem contents. A checkpoint pairs `snapshot.mem` with
 one standalone `snapshot.qcow2`; the caller retains external share recovery
 points, open/unlinked objects and the exact readonly boot disk. Version 7/8 full
-images are rejected, never upgraded. RAM-only `KRUNRAM` retains its separate
-version-1 meaning; disk-only BoxLite archives are outside this library contract.
+images are rejected. Version 9 remains readable without checksum verification;
+new exports use version 10 and cannot be read by older runtimes. RAM-only
+`KRUNRAM` retains its separate version-1 meaning; disk-only BoxLite archives are
+outside this library contract.
 
 ### Descriptor API
 
@@ -323,14 +325,14 @@ embedders use `SnapshotVm` and `snapshot_vm::checkpoint` resource types.
 
 | Operation | Contract |
 | --- | --- |
-| `krun_snapshot_capabilities` | Memory-v9, capture-reservation and external-FD capability bits; zero on unsupported platforms |
+| `krun_snapshot_capabilities` | Existing `MEMORY_V9` ABI bit (v9/v10 reader, v10 writer), capture-reservation and external-FD bits; zero on unsupported platforms |
 | `begin_capture(CHECKPOINT)` | Reserve an already confirmed Paused owner; never start or implicitly pause |
 | `begin_capture(DISK)` | Reserve Running, pause/drain/flush internally; state queries keep reporting Running |
 | `prepare_capture` | Return bounded session/object JSON and owned CLOEXEC duplicates of retained object FDs; no tree traversal |
-| `export_fd` | Write/seal/sync a new memory FD, binding its paired standalone QCOW2 digest and provider references |
+| `export_fd` | Write/seal/sync a new memory FD with a capture identity, paired QCOW2 length and provider references |
 | `end_capture(COMPLETE)` | Retire token; resume an internal disk capture or retain checkpoint Paused |
 | `end_capture(CANCEL)` | Stop execution; use on cancellation or unknown outcome |
-| `inspect_fd` | Verify version, lengths, checksums and metadata extents without KVM or external-resource creation |
+| `inspect_fd` | Check version, lengths and metadata extents without KVM or external-resource creation |
 | `import_fd`, then `start_enter` | Verify supplied disk/share dependencies, restore devices/FUSE/DAX, publish Paused; resume is explicit |
 
 Keep the dedicated connected Unix stream's peer open and silent through the
@@ -417,18 +419,22 @@ execution, and teardown preserves foreign paths. RNG resumes pending requests
 without requiring a new kick; UART/CMOS/i8042 state persists, including guest reset.
 
 External roots and disk files remain caller-owned on failed import and teardown.
-Device continuation tests cross the full v9 descriptor export/import boundary;
+Device continuation tests cross the full descriptor export/import boundary;
 standalone device state tests alone do not establish owner ordering or cleanup.
 
 ### Memory format and verification
 
-The 160-byte little-endian header contains `KRUNVM\0\0`, version 9, header length,
-exact total/metadata/payload lengths, paired QCOW2 length, SHA-256 hashes for
-metadata, payload and QCOW2, and sixteen reserved zero bytes. Metadata is bounded
+The 160-byte little-endian header contains `KRUNVM\0\0`, version 10, header length,
+exact total/metadata/payload lengths, paired QCOW2 length, a random 32-byte capture
+identity at offsets 48–80, and eighty reserved zero bytes. Metadata is bounded
 to 16 MiB and rejects unknown fields. Checked concatenated RAM/init/anonymous-DAX
 extents must cover the payload exactly. The valid header is written only after
-the payload is synced, then synced again. Hashes detect corruption; they are not
-authentication. The library does not publish directories or delete caller files.
+the payload is synced, then synced again. There are no RAM/QCOW2 content hashes;
+same-size corruption can go undetected. Restore checks disk roles, type and length
+without hashing contents. The capture identity does not bind or authenticate the
+QCOW2 contents; callers must supply the matching pair. Boot SHA-256 remains a
+dependency identifier generated at capture for the embedder's exact cache lookup.
+The library does not publish directories or delete caller files.
 
 The embedder owns private pair staging, sync/no-overwrite publication, external
 storage consistency, cancellation cleanup after joining writers, persistent boot
@@ -450,8 +456,10 @@ make snapshot-abi-check
 make snapshot-feature-check
 ```
 
-Tests with `snapshot_v9` cover the memory envelope, external disk integrity and
-real KVM owner continuation through a private QCOW2 copy (requires `qemu-img`; the block-I/O fixture also uses `qemu-io`).
+Tests with `snapshot_v10` cover the memory envelope, capture identity and external
+disk length/role checks; `snapshot_v9` covers legacy envelope reading and real
+KVM owner continuation through a private QCOW2 copy (requires `qemu-img`; the
+block-I/O fixture also uses `qemu-io`).
 Owner channel tests cover reservation, logical Running, Busy, stale token,
 cancellation and disconnect. The rootless `rootless_fs_external_received_*`
 tests exercise actual received orphan/handle/writable-DAX FDs under bwrap and

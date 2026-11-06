@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Version-9 memory-only images with external disk and FUSE dependencies.
+//! Version-10 memory-only images with external disk and FUSE dependencies.
 
 use super::*;
 use crate::ram_snapshot::boot::NewConsoleOutput;
@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 mod format;
 
 const FULL_MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const FULL_VERSION: u32 = 9;
+const FULL_VERSION: u32 = 10;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 
 #[cfg(feature = "blk")]
@@ -424,8 +424,7 @@ fn write_memory(
         virtio_fs::write_payloads(file, shares)?;
     }
     let disk_len = qcow2.metadata()?.len();
-    let disk_hash = format::digest(qcow2, 0, disk_len)?;
-    format::seal(file, encoded.0.len() as u64, payload, disk_len, disk_hash)
+    format::seal(file, encoded.0.len() as u64, payload, disk_len)
 }
 
 /// Capture the target's compatibility and check the saved CPUs against it.
@@ -650,7 +649,7 @@ impl RamSnapshotVm {
         bindings: crate::snapshot_vm::checkpoint::ImportBindings,
         mut resources: RestoreResources,
     ) -> Result<Self> {
-        // Envelope, payload and external hashes are verified before allocating VM RAM.
+        // Envelope, payload extents and disk roles/lengths are checked before allocating VM RAM.
         let (metadata, envelope) = read_metadata(&mut file, usize::MAX, snapshot::MAX_CPUS)?;
         Requirements::of(&metadata).check(&resources)?;
         verify_disks(&metadata.disk_dependencies, &bindings.disks, &envelope)?;
@@ -826,15 +825,15 @@ fn verify_disks(
                 "external disk descriptor access or type differs",
             ));
         }
-        let (length, hash) = match dependency {
+        let length = match dependency {
             DiskDependency::ContainerQcow2 => {
                 verify_qcow2(file)?;
-                (envelope.disk_len, envelope.disk_hash)
+                envelope.disk_len
             }
-            DiskDependency::ExternalReadonlyBoot { length, sha256 } => (*length, *sha256),
+            DiskDependency::ExternalReadonlyBoot { length, .. } => *length,
         };
-        if file.metadata()?.len() != length || format::digest(file, 0, length)? != hash {
-            return Err(Error::Invalid("external disk length or checksum differs"));
+        if file.metadata()?.len() != length {
+            return Err(Error::Invalid("external disk length differs"));
         }
     }
     Ok(())
