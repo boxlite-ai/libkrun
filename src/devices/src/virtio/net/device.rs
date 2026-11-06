@@ -48,15 +48,6 @@ pub enum FrontendError {
     ReadOnlyDescriptor,
 }
 
-/// The feature set `Net::new` offers for the caller's `features`: single
-/// source of truth for construction and snapshot validation.
-pub fn offered_features(features: u32) -> u64 {
-    features as u64
-        | (1 << VIRTIO_NET_F_MAC)
-        | (1 << VIRTIO_RING_F_EVENT_IDX)
-        | (1 << VIRTIO_F_VERSION_1)
-}
-
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 struct VirtioNetConfig {
@@ -67,16 +58,6 @@ struct VirtioNetConfig {
 
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioNetConfig {}
-
-impl VirtioNetConfig {
-    fn for_mac(mac: [u8; 6]) -> Self {
-        VirtioNetConfig {
-            mac,
-            status: 0,
-            max_virtqueue_pairs: 0,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
@@ -115,9 +96,16 @@ impl Net {
         mac: [u8; 6],
         features: u32,
     ) -> Result<Self> {
-        let avail_features = offered_features(features);
+        let avail_features = features as u64
+            | (1 << VIRTIO_NET_F_MAC)
+            | (1 << VIRTIO_RING_F_EVENT_IDX)
+            | (1 << VIRTIO_F_VERSION_1);
 
-        let config = VirtioNetConfig::for_mac(mac);
+        let config = VirtioNetConfig {
+            mac,
+            status: 0,
+            max_virtqueue_pairs: 0,
+        };
 
         Ok(Net {
             id,
