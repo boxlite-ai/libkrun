@@ -26,14 +26,6 @@ pub struct PortDescription {
 }
 
 impl PortDescription {
-    /// Fail unless every endpoint of this description can be checkpointed;
-    /// usable before any device exists.
-    pub fn check_snapshot_support(&self, port_id: u32) -> Result<(), SnapshotError> {
-        self.snapshot_kinds()
-            .map(drop)
-            .map_err(|endpoint| SnapshotError::UnsupportedEndpoint { port_id, endpoint })
-    }
-
     /// The snapshot kinds of the endpoints; `Err` names the first custom
     /// one.
     pub(crate) fn snapshot_kinds(&self) -> Result<FreshPort<'_>, &'static str> {
