@@ -29,7 +29,7 @@ fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
 }
 
 pub use self::device::Net;
-pub use self::worker::{NetQueueStates, NetWorkerHandle};
+pub use self::worker::NetQueueStates;
 #[derive(Debug)]
 pub enum Error {
     /// EventFd error.

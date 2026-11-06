@@ -59,7 +59,7 @@ pub(crate) enum NetWorkerCommand {
 }
 
 /// Controller side of the net worker snapshot control channel.
-pub struct NetWorkerHandle {
+pub(super) struct NetWorkerHandle {
     pub(crate) control_fd: EventFd,
     pub(crate) commands: Sender<NetWorkerCommand>,
     pub(crate) unusable: AtomicBool,
@@ -67,7 +67,8 @@ pub struct NetWorkerHandle {
 
 impl NetWorkerHandle {
     /// Freeze the worker and return its queue cursors.
-    pub fn freeze(&self) -> result::Result<NetQueueStates, WorkerControlError> {
+    #[cfg(test)]
+    fn freeze(&self) -> result::Result<NetQueueStates, WorkerControlError> {
         self.freeze_with_timeout(CONTROL_TIMEOUT)
     }
 

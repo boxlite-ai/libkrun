@@ -120,8 +120,8 @@ impl Vsock {
     /// Quiesce stream backends without the device lock, which a blocked
     /// send can hold. The owner must then stop/join the backend on the event
     /// thread before capturing queues or RAM.
-    pub fn snapshot_control(&self) -> super::Result<Arc<VsockGate>> {
-        Ok(self.muxer.gate().clone())
+    pub fn snapshot_control(&self) -> Arc<VsockGate> {
+        self.muxer.gate().clone()
     }
 
     /// Write `notifier` once a reopen fails on an event-queue kick, where no

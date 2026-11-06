@@ -150,14 +150,7 @@ pub(crate) mod runtime {
         let gates = resources
             .vsock
             .get()
-            .map(|device| {
-                device
-                    .lock()
-                    .unwrap()
-                    .snapshot_control()
-                    .map_err(|e| io::Error::other(format!("{e:?}")))
-            })
-            .transpose()?
+            .map(|device| device.lock().unwrap().snapshot_control())
             .into_iter()
             .collect();
         let event = Arc::new(EventFd::new(EFD_NONBLOCK)?);

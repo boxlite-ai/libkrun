@@ -542,7 +542,7 @@ fn snapshot_vsock_quiesce_interrupts_guest_connection_send() {
     device
         .activate(mem.clone(), irq.clone(), guest.queues())
         .unwrap();
-    let gate = device.snapshot_control().unwrap();
+    let gate = device.snapshot_control();
     let vsock = Arc::new(Mutex::new(device));
 
     guest.send(uapi::VSOCK_OP_REQUEST, GUEST_PORT, HOST_PORT, 0);
@@ -607,7 +607,7 @@ fn snapshot_vsock_quiesce_interrupts_host_connection_send() {
     device
         .activate(mem.clone(), interrupt(), guest.queues())
         .unwrap();
-    let gate = device.snapshot_control().unwrap();
+    let gate = device.snapshot_control();
     let vsock = Arc::new(Mutex::new(device));
 
     let (mut peer, peer_port) = host_connect(&mut vsock.lock().unwrap(), &mut guest, &path);
@@ -642,7 +642,7 @@ fn snapshot_vsock_repeated_stop_restart_and_drop_release_everything() {
     vsock
         .activate(mem.clone(), interrupt(), guest.queues())
         .unwrap();
-    let gate = vsock.snapshot_control().unwrap();
+    let gate = vsock.snapshot_control();
 
     for cycle in 0..3 {
         let _peer = UnixStream::connect(&path).unwrap();
@@ -694,7 +694,7 @@ fn snapshot_vsock_stop_reports_worker_panic_after_full_cleanup() {
     vsock
         .activate(mem.clone(), interrupt(), guest.queues())
         .unwrap();
-    let gate = vsock.snapshot_control().unwrap();
+    let gate = vsock.snapshot_control();
     // Joined after the panicked worker, ahead of the real ones; it still
     // holds guest RAM when the stop starts.
     let slow_mem = mem.clone();
@@ -766,7 +766,7 @@ fn snapshot_vsock_inactive_and_frozen_devices_bind_only_on_restart() {
     let mem = guest_memory();
     let guest = Guest::new(&mem);
     let mut vsock = new_vsock(&[(HOST_PORT, &path, true)], TsiFlags::empty());
-    vsock.snapshot_control().unwrap().quiesce();
+    vsock.snapshot_control().quiesce();
     vsock.stop_backend().unwrap();
     assert!(vsock.snapshot_queue_states().is_none());
     assert_eq!(vsock.snapshot_reset_state(), VsockResetState::default());
@@ -857,7 +857,7 @@ fn snapshot_vsock_reset_waits_for_an_event_buffer_before_connections() {
     vsock
         .activate(mem.clone(), irq.clone(), guest.queues())
         .unwrap();
-    let gate = vsock.snapshot_control().unwrap();
+    let gate = vsock.snapshot_control();
     let (_peer, peer_port) = host_connect(&mut vsock, &mut guest, &path);
 
     gate.quiesce();
@@ -1060,7 +1060,7 @@ fn snapshot_vsock_stale_tx_never_replays() {
     vsock
         .activate(mem.clone(), interrupt(), guest.queues())
         .unwrap();
-    let gate = vsock.snapshot_control().unwrap();
+    let gate = vsock.snapshot_control();
     let listener = idle_listener(&path);
     let mut peer = guest_connect(&mut vsock, &mut guest, &listener, (GUEST_PORT, HOST_PORT));
 
@@ -1121,7 +1121,7 @@ fn snapshot_vsock_source_and_copied_restore_serve_both_directions() {
     source
         .activate(mem.clone(), interrupt(), guest.queues())
         .unwrap();
-    let gate = source.snapshot_control().unwrap();
+    let gate = source.snapshot_control();
     let host_listener_a = idle_listener(&host_a);
     let _in = host_connect(&mut source, &mut guest, &listen_a);
     let _out = guest_connect(
