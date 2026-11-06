@@ -97,13 +97,15 @@ impl Object {
         let path = if metadata.nlink() == 0 {
             None
         } else {
-            std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                .ok()
-                .and_then(|path| {
-                    path.strip_prefix(root)
-                        .ok()
-                        .map(|p| p.as_os_str().as_bytes().to_vec())
-                })
+            match std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+                Ok(path) => path
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|p| p.as_os_str().as_bytes().to_vec()),
+                // The file may have been unlinked since the metadata read.
+                Err(_) if file.metadata()?.nlink() == 0 => None,
+                Err(error) => return Err(error),
+            }
         };
         Ok(Self {
             path,

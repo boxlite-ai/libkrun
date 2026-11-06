@@ -61,8 +61,9 @@ impl Object {
     fn capture(file: &File, root: &Path) -> io::Result<Self> {
         let metadata = file.metadata()?;
         let mut path = [0i8; libc::PATH_MAX as usize];
-        let path = if metadata.nlink() != 0
-            && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == 0
+        let path = if metadata.nlink() == 0 {
+            None
+        } else if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } == 0
         {
             let path = Path::new(std::ffi::OsStr::from_bytes(
                 unsafe { CStr::from_ptr(path.as_ptr()) }.to_bytes(),
@@ -71,6 +72,12 @@ impl Object {
                 .ok()
                 .map(|p| p.as_os_str().as_bytes().to_vec())
         } else {
+            let error = io::Error::last_os_error();
+            // Unlink can race the first metadata read. Other query failures
+            // must not turn a live object into a permanently stale guest ID.
+            if file.metadata()?.nlink() != 0 {
+                return Err(error);
+            }
             None
         };
         use std::os::macos::fs::MetadataExt as MacMetadata;
@@ -210,10 +217,19 @@ impl PassthroughFs {
         let mut inodes = Vec::new();
         for inode in self.inodes.read().unwrap().values() {
             let path = CString::new(format!("/.vol/{}/{}", inode.dev, inode.ino)).unwrap();
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_SYMLINK | libc::O_CLOEXEC) };
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
             let object = if fd >= 0 {
                 Object::capture(&unsafe { File::from_raw_fd(fd) }, &root)?
             } else {
+                let error = io::Error::last_os_error();
+                if !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESTALE)) {
+                    return Err(error);
+                }
                 Object {
                     path: None,
                     dev: inode.dev as u64,

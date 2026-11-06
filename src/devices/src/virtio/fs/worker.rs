@@ -154,10 +154,7 @@ impl FsWorker {
             control_fd,
             &EpollEvent::new(EventSet::IN, control_fd as u64),
         )?;
-        let frozen = false;
-
-        let frozen = frozen || self.checkpoint.frozen;
-        if !frozen {
+        if !self.checkpoint.frozen {
             for index in [HPQ_INDEX, REQ_INDEX] {
                 let event = &self.queue_evts[index];
                 epoll.ctl(
@@ -179,25 +176,23 @@ impl FsWorker {
                 return Ok(());
             }
 
-            {
-                if events[..count].iter().any(|event| event.fd() == control_fd) {
-                    let _ = self.checkpoint.control.event().read();
-                    while let Ok(request) = self.checkpoint.control.try_recv() {
-                        if request.is_expired() {
-                            return Err(invalid("fs control deadline elapsed"));
-                        }
-                        let result = match request.command() {
-                            Command::Freeze => self.freeze(&epoll),
-                            Command::Resume => self.resume(&epoll),
-                        };
-                        if !request.respond(result) {
-                            return Err(invalid("fs control outcome unknown"));
-                        }
+            if events[..count].iter().any(|event| event.fd() == control_fd) {
+                let _ = self.checkpoint.control.event().read();
+                while let Ok(request) = self.checkpoint.control.try_recv() {
+                    if request.is_expired() {
+                        return Err(invalid("fs control deadline elapsed"));
+                    }
+                    let result = match request.command() {
+                        Command::Freeze => self.freeze(&epoll),
+                        Command::Resume => self.resume(&epoll),
+                    };
+                    if !request.respond(result) {
+                        return Err(invalid("fs control outcome unknown"));
                     }
                 }
-                if self.checkpoint.frozen {
-                    continue;
-                }
+            }
+            if self.checkpoint.frozen {
+                continue;
             }
             for event in &events[..count] {
                 if let Some(index) = self

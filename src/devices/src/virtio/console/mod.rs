@@ -12,11 +12,9 @@ mod tests;
 mod worker;
 
 pub use self::defs::uapi::VIRTIO_ID_CONSOLE as TYPE_CONSOLE;
-pub use self::defs::QUEUE_SIZE as CONSOLE_QUEUE_SIZE;
-pub use self::device::{Console, AVAIL_FEATURES as CONSOLE_FEATURES};
+pub use self::device::Console;
 pub use self::persist::{ConsolePortState, ConsoleState, SnapshotError, TerminalSize, TxProgress};
 pub use self::port::PortDescription;
-pub use self::port_queue_mapping::num_queues as console_num_queues;
 
 mod defs {
     pub const CONSOLE_DEV_ID: &str = "virtio_console";
