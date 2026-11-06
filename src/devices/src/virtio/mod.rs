@@ -18,6 +18,7 @@ pub mod bindings;
 #[cfg(feature = "blk")]
 pub mod block;
 pub mod console;
+pub mod control;
 pub mod descriptor_utils;
 pub mod device;
 pub mod file_traits;
@@ -33,6 +34,7 @@ pub mod mem;
 mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod persist;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
