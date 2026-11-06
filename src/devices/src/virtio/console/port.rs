@@ -231,17 +231,6 @@ impl Port {
         matches!(self.state, PortState::Active { .. })
     }
 
-    /// Running workers; each holds one guest memory clone.
-    pub fn workers(&self) -> usize {
-        match &self.state {
-            PortState::Inactive => 0,
-            PortState::Active { rx, tx } => [rx, tx]
-                .into_iter()
-                .filter(|q| matches!(q, PortQueue::Worker { .. }))
-                .count(),
-        }
-    }
-
     pub fn notify_rx(&self) {
         if let PortState::Active { rx, .. } = &self.state {
             rx.notify()

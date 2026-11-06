@@ -77,8 +77,10 @@ recreated internally; the restore caller need not configure that retired root.
   using that helper for general QCOW2 checkpoint export.
 - Virtio-fs uses the same host directory's live contents. Inodes and handles are
   rebound by path and identity, never by old FD numbers. Deleted/replaced objects
-  return guest errors on subsequent FUSE operations. Cached guest pages remain
-  part of guest RAM: this is not a transactional directory snapshot, and cached
+  return guest errors on subsequent FUSE operations. Resource exhaustion, access
+  failures and host I/O errors abort restore without installing partial inode or
+  handle tables. Cached guest pages remain part of guest RAM: this is not a
+  transactional directory snapshot, and cached
   reads need not immediately notice host changes. Without inode birth times,
   identity checking conservatively treats changed ctimes as stale. DAX and
   exported guest-memory aliases are excluded; checkpoint-enabled boot does not
@@ -170,31 +172,6 @@ Hotplug requires guest firmware with `CONFIG_VIRTIO_MEM=y`; the host flag
 guest can allocate and touch 300 MiB before capturing a 256-to-384 MiB VM.
 The block-root fixture requires `mkfs.ext4` and tests its own generated rootfs.
 
-The authorized KVM machine is SSH host `eric-kvm-dev`. The isolated test copy is
-`/tmp/libkrun-memory-complete.PPL5Uv`. No commit, push, PR or deployment is part of
-this work.
-
-### Recorded runs (2026-11-06)
-
-Local review artifacts are under `target/checkpoint-validation/` (ignored by git).
-These are actual KVM runs on `eric-kvm-dev`, each using distinct source/restore
-process IDs; each normal run also performs a second save/restore.
-
-| Run | Evidence |
-| --- | --- |
-| ext4 rootfs + existing QCOW2 flatten + TSI TCP/accept/UDP | [result](../target/checkpoint-validation/ext4-rootfs.json) |
-| 256-to-384 MiB hotplug + 300 MiB guest pattern + fs + QCOW2 + TSI | [result](../target/checkpoint-validation/hotplug-tsi-qcow2.json) |
-| virtio-net fresh backend + failed export/source continuation + incompatible CPU restore cleanup | [result](../target/checkpoint-validation/net-export-failure.json) |
-| default TSI + failed export/source continuation | [result](../target/checkpoint-validation/tsi-export-failure.json) |
-| failure during device freeze returns `-ESHUTDOWN`, guest stays stopped | [result](../target/checkpoint-validation/freeze-failure.json) |
-
-Linux device tests: 133 passed. Linux VMM tests: 34 passed, one pre-existing test
-ignored. Existing flatten tests with the compatibility patch: 5 passed on Linux
-and macOS. Native macOS device tests: 103 passed. Linux aarch64 GNU and native
-macOS library checks passed. These earlier compile checks did not validate
-whole-VM ARM/HVF restore; native HVF checkpoint evidence follows below.
-`cargo fmt --check`, Python fixture syntax checks and `git diff --check` passed.
-
 ### Native HVF checkpoint validation (2026-11-06)
 
 The local Apple Silicon host runs the shared C API fixture in distinct boot,
@@ -221,24 +198,6 @@ The fixture signs its native host binary with the repository's Hypervisor
 entitlement and retains logs/results under `target/run-*`. It uses the local
 Linux sysroot to compile its guest. Firmware and the BoxLite checkout are read only.
 The old cold-boot-only fixture has been replaced by this shared checkpoint runner.
-
-Native unit tests cover nonzero integer/SIMD/system/SME state, deferred MMIO,
-powered-off and WFE CPU barriers, repeated restoration, and filesystem handle
-identity. Native results: 104 device tests, 27 VMM tests and one HVF test passed.
-Linux/KVM regression: 133 device tests and 34 VMM tests passed (one existing ignore).
-
-Local evidence (artifacts are ignored by git):
-
-- [Final native GIC + raw disk restore](../target/checkpoint-validation/hvf-complete/native-raw.json)
-- [Native GIC + QCOW2 + TSI](../target/checkpoint-validation/hvf-complete/native-qcow2-tsi.json)
-- [Software GIC + virtio-net + failed export](../target/checkpoint-validation/hvf-complete/software-net-export-failure.json)
-- [Freeze failure](../target/checkpoint-validation/hvf-complete/freeze-failure.json)
-- [Native unit tests](../target/checkpoint-validation/hvf-complete/native-unit-tests.log)
-- [Linux/KVM unit tests](../target/checkpoint-validation/hvf-complete/linux-unit-tests.log)
-- [Linux/KVM process-exit/restore regression](../target/checkpoint-validation/hvf-complete/linux-roundtrip.log)
-
-The Linux regression used an isolated copy at
-`/tmp/libkrun-hvf-regression.ZXZq9h` on `eric-kvm-dev`.
 
 ### Export/import baseline before sparse RAM (2026-11-06)
 
@@ -276,7 +235,7 @@ in `target/checkpoint-benchmark-*`; verified snapshot images are removed after
 each iteration to bound disk use.
 
 Measured hosts: HVF uses the local Apple M5 Max (128 GiB RAM, macOS 27.2,
-native GIC, APFS). KVM uses `eric-kvm-dev` (Intel Xeon 2.80 GHz, 8 logical CPUs,
+native GIC, APFS). KVM uses an Intel Xeon 2.80 GHz host (8 logical CPUs,
 31 GiB reported RAM, Ubuntu Linux, GCP Persistent Disk). The KVM host is itself
 a virtual machine, so this run uses nested virtualization. Neither host was
 reserved exclusively for this benchmark. These are deployment-specific latency
@@ -296,10 +255,6 @@ Seconds, median of five measurements; parentheses show minimum–maximum:
 | HVF | 2048 | 3.852 (3.844–3.878) | 7.720 (7.628–7.734) |
 
 All 40 measured restores and eight warmups passed the full guest-pattern scan.
-Raw evidence: [KVM samples](../target/checkpoint-validation/performance/kvm.json),
-[HVF samples](../target/checkpoint-validation/performance/hvf.json),
-[KVM run log](../target/checkpoint-validation/performance/kvm.log),
-[HVF run log](../target/checkpoint-validation/performance/hvf.log).
 
 A separate one-second sampling window during the beginning of a 1 GiB HVF
 import found 667 of 677 main-thread samples in SHA-256 compression (98.5%).
@@ -308,9 +263,6 @@ feature set does not enable `asm`, which selects its software backend on
 AArch64. Import also hashes RAM twice: the artifact scan and verification of
 the bytes actually read into memory. These identify concrete optimization
 opportunities; the measurements above use the unchanged snapshot implementation.
-See [sampling evidence](../target/checkpoint-validation/performance/hvf-import.sample)
-and [enabled SHA-2 features](../target/checkpoint-validation/performance/sha2-features.txt).
-
 
 ### Sparse anonymous RAM
 
@@ -339,12 +291,6 @@ with the sparse RAM file. The whole-VM container remains experimental version 1:
 The benchmark now reports both logical snapshot bytes and `st_blocks * 512`
 allocated bytes. Earlier baseline results above retain their original meanings.
 
-Validation: native HVF VMM tests passed (29); Linux VMM tests passed (36, one
-existing ignore). Both platforms passed process-exit and repeated-restore
-regressions. The Linux regression also exercised plugged RAM, TSI and an
-export failure followed by source continuation. All 40 benchmark measurements
-and eight warmups passed the full guest-pattern scan.
-
 Post-change performance uses the same hosts, release build, two vCPUs,
 half-filled pseudorandom guest memory and warm-cache import as the baseline.
 Each value is the median of five measured iterations. Allocated MiB includes
@@ -360,10 +306,3 @@ RAM and state files; logical file size is still approximately configured RAM.
 | HVF | 512 | 95.4 | 31.4 | 314.2 |
 | HVF | 1024 | 165.2 | 54.5 | 585.1 |
 | HVF | 2048 | 307.0 | 99.8 | 1102.6 |
-
-Evidence: [HVF performance](../target/checkpoint-validation/sparse-ram/hvf-performance.json),
-[KVM performance](../target/checkpoint-validation/sparse-ram/kvm-performance.json),
-[HVF VMM tests](../target/checkpoint-validation/sparse-ram/hvf-vmm-tests.log),
-[KVM VMM tests](../target/checkpoint-validation/sparse-ram/kvm-sparse-tests.log),
-[HVF roundtrip](../target/checkpoint-validation/sparse-ram/hvf-roundtrip.log),
-[KVM roundtrip](../target/checkpoint-validation/sparse-ram/kvm-sparse-roundtrip.log).

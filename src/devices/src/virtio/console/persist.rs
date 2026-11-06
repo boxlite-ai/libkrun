@@ -15,7 +15,6 @@ use super::console_control::VirtioConsoleControl;
 use super::defs::control_event;
 use super::device::VirtioConsoleConfig;
 use super::device::{CONTROL_RXQ_INDEX, CONTROL_TXQ_INDEX};
-use super::port::PortDescription;
 use super::port_io::{InputKind, OutputState, PortOutputLog, TerminalKind};
 use super::port_queue_mapping::{
     num_queues, port_id_to_queue_idx, queue_idx_to_port_id, QueueDirection,
@@ -196,24 +195,6 @@ impl ConsoleState {
             }
         }
         Ok(())
-    }
-
-    /// `validate_for` against the descriptions a restore will build its
-    /// endpoints from, before any device exists.
-    pub fn validate_descriptions(
-        &self,
-        ports: &[PortDescription],
-        activated: bool,
-    ) -> Result<(), SnapshotError> {
-        let fresh = ports
-            .iter()
-            .zip(0u32..)
-            .map(|(port, port_id)| {
-                port.snapshot_kinds()
-                    .map_err(|endpoint| SnapshotError::UnsupportedEndpoint { port_id, endpoint })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.validate_for(&fresh, activated)
     }
 
     /// Check against loaded guest RAM and the validated queue states, before

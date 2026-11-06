@@ -394,12 +394,6 @@ impl Console {
 /// endpoints (FD, empty and SIGINT input, FD and log output, FD and fixed
 /// terminals) can be checkpointed.
 impl Console {
-    /// Guest memory clones the device holds: one while activated, plus one
-    /// per running port worker.
-    pub fn memory_clones(&self) -> usize {
-        usize::from(self.is_activated()) + self.ports.iter().map(Port::workers).sum::<usize>()
-    }
-
     /// Snapshot attach validation: fails for a custom endpoint.
     pub fn check_snapshot_support(&self) -> Result<(), SnapshotError> {
         self.ports.iter().try_for_each(Port::check_snapshot_support)
@@ -408,10 +402,6 @@ impl Console {
     /// Freeze the control queues, then every port worker. Idempotent; an
     /// error leaves the device frozen as far as it got, and the owner must
     /// disable it rather than resume.
-    pub fn snapshot_freeze(&mut self) -> Result<(), SnapshotError> {
-        self.snapshot_freeze_with_timeout(CONTROL_TIMEOUT)
-    }
-
     pub fn snapshot_freeze_with_timeout(&mut self, timeout: Duration) -> Result<(), SnapshotError> {
         self.check_snapshot_support()?;
         if self.snapshot_failed {

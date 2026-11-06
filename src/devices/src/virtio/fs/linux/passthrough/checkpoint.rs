@@ -55,6 +55,14 @@ fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
+fn object_unavailable(error: &io::Error) -> bool {
+    // EXDEV means a changed path would escape the share's RESOLVE_BENEATH root.
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::ESTALE | libc::EXDEV)
+    )
+}
+
 impl Object {
     fn identity_time(file: &File) -> io::Result<(bool, [i64; 2])> {
         let mut stat = MaybeUninit::<libc::statx>::zeroed();
@@ -302,32 +310,37 @@ impl PassthroughFs {
         let mut inodes = MultikeyBTreeMap::new();
         let mut handles = BTreeMap::new();
         for saved in &state.inodes {
-            if let Ok(file) = saved.object.reopen(&root) {
-                let (st, mnt_id) = statx(&file)?;
-                let key = InodeAltKey {
-                    ino: st.st_ino,
+            let file = match saved.object.reopen(&root) {
+                Ok(file) => file,
+                Err(error) if object_unavailable(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let (st, mnt_id) = statx(&file)?;
+            let key = InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+                mnt_id,
+            };
+            if inodes.get_alt(&key).is_some() {
+                return Err(invalid("duplicate host inode in checkpoint"));
+            }
+            inodes.insert(
+                saved.inode,
+                key,
+                Arc::new(InodeData {
+                    inode: saved.inode,
+                    file,
                     dev: st.st_dev,
                     mnt_id,
-                };
-                if inodes.get_alt(&key).is_some() {
-                    return Err(invalid("duplicate host inode in checkpoint"));
-                }
-                inodes.insert(
-                    saved.inode,
-                    key,
-                    Arc::new(InodeData {
-                        inode: saved.inode,
-                        file,
-                        dev: st.st_dev,
-                        mnt_id,
-                        refcount: AtomicU64::new(saved.references),
-                    }),
-                );
-            }
+                    refcount: AtomicU64::new(saved.references),
+                }),
+            );
         }
         for saved in &state.handles {
-            let Ok(object) = saved.object.reopen(&root) else {
-                continue;
+            let object = match saved.object.reopen(&root) {
+                Ok(object) => object,
+                Err(error) if object_unavailable(&error) => continue,
+                Err(error) => return Err(error),
             };
             // Open through the pinned O_PATH descriptor, not the path again.
             // Never replay O_CREAT/O_TRUNC or silently bind a replacement inode.
@@ -339,11 +352,15 @@ impl PassthroughFs {
                 )
             };
             if fd < 0 {
-                continue;
+                let error = io::Error::last_os_error();
+                if object_unavailable(&error) {
+                    continue;
+                }
+                return Err(error);
             }
             let file = unsafe { File::from_raw_fd(fd) };
             if unsafe { libc::lseek64(fd, saved.offset, libc::SEEK_SET) } < 0 {
-                continue;
+                return Err(io::Error::last_os_error());
             }
             handles.insert(
                 saved.handle,
@@ -506,3 +523,7 @@ mod tests {
         assert!(state.validate().is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "../../checkpoint_tests.rs"]
+mod regression_tests;

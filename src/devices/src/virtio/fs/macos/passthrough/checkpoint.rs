@@ -50,6 +50,13 @@ fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
+fn object_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP | libc::ESTALE)
+    )
+}
+
 impl Object {
     fn capture(file: &File, root: &Path) -> io::Result<Self> {
         let metadata = file.metadata()?;
@@ -101,8 +108,9 @@ impl Object {
         let mut parent = root.try_clone()?;
         for (index, component) in components.iter().enumerate() {
             let name = CString::new(*component)?;
-            let flags = if index + 1 == components.len() {
-                flags
+            // Inspect even FIFO replacements without opening them for data I/O.
+            let probe_flags = if index + 1 == components.len() {
+                libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK
             } else {
                 libc::O_RDONLY | libc::O_DIRECTORY
             };
@@ -110,7 +118,7 @@ impl Object {
                 libc::openat(
                     parent.as_raw_fd(),
                     name.as_ptr(),
-                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    probe_flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
@@ -128,7 +136,23 @@ impl Object {
         {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
-        Ok(parent)
+        if flags == libc::O_EVTONLY {
+            return Ok(parent);
+        }
+        // Keep the checked vnode pinned while restoring access by volume/inode.
+        // Opening the original path again could bind a replacement (or block on
+        // a FIFO) between the identity check and the access open.
+        let path = CString::new(format!(
+            "/.vol/{}/{}",
+            metadata.dev() as i32,
+            metadata.ino()
+        ))
+        .unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
 impl FsState {
@@ -247,42 +271,48 @@ impl PassthroughFs {
         let mut inodes = MultikeyBTreeMap::new();
         let mut handles = BTreeMap::new();
         for saved in &state.inodes {
-            if let Ok(file) = saved.object.reopen(&root, libc::O_SYMLINK) {
-                let metadata = file.metadata()?;
-                let key = InodeAltKey {
-                    ino: metadata.ino(),
-                    dev: metadata.dev() as i32,
-                };
-                if inodes.get_alt(&key).is_some() {
-                    return Err(invalid("duplicate fs object"));
-                }
-                inodes.insert(
-                    saved.inode,
-                    key,
-                    Arc::new(InodeData {
-                        inode: saved.inode,
-                        ino: key.ino,
-                        dev: key.dev,
-                        refcount: AtomicU64::new(saved.references),
-                        unlinked_fd: AtomicI64::new(-1),
-                    }),
-                );
+            let file = match saved.object.reopen(&root, libc::O_EVTONLY) {
+                Ok(file) => file,
+                Err(error) if object_unavailable(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let metadata = file.metadata()?;
+            let key = InodeAltKey {
+                ino: metadata.ino(),
+                dev: metadata.dev() as i32,
+            };
+            if inodes.get_alt(&key).is_some() {
+                return Err(invalid("duplicate fs object"));
             }
+            inodes.insert(
+                saved.inode,
+                key,
+                Arc::new(InodeData {
+                    inode: saved.inode,
+                    ino: key.ino,
+                    dev: key.dev,
+                    refcount: AtomicU64::new(saved.references),
+                    unlinked_fd: AtomicI64::new(-1),
+                }),
+            );
         }
         for saved in &state.handles {
-            if let Ok(file) = saved.object.reopen(&root, saved.flags) {
-                if unsafe { libc::lseek(file.as_raw_fd(), saved.offset, libc::SEEK_SET) } < 0 {
-                    continue;
-                }
-                handles.insert(
-                    saved.handle,
-                    Arc::new(HandleData {
-                        inode: saved.inode,
-                        file: RwLock::new(file),
-                        dirstream: Mutex::new(saved.directory.clone()),
-                    }),
-                );
+            let file = match saved.object.reopen(&root, saved.flags) {
+                Ok(file) => file,
+                Err(error) if object_unavailable(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if unsafe { libc::lseek(file.as_raw_fd(), saved.offset, libc::SEEK_SET) } < 0 {
+                return Err(io::Error::last_os_error());
             }
+            handles.insert(
+                saved.handle,
+                Arc::new(HandleData {
+                    inode: saved.inode,
+                    file: RwLock::new(file),
+                    dirstream: Mutex::new(saved.directory.clone()),
+                }),
+            );
         }
         *self.inodes.write().unwrap() = inodes;
         *self.handles.write().unwrap() = handles;
@@ -412,3 +442,7 @@ mod tests {
         assert_eq!(next.next_inode.load(Ordering::Relaxed), repeated.next_inode);
     }
 }
+
+#[cfg(test)]
+#[path = "../../checkpoint_tests.rs"]
+mod regression_tests;
