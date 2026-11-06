@@ -8,7 +8,6 @@ import platform
 import errno
 import sys
 import json
-import hashlib
 import os
 from pathlib import Path
 import signal
@@ -306,11 +305,11 @@ try:
     corrupt = work / "corrupt"
     corrupt.mkdir()
     data = bytearray((first / "state.bin").read_bytes())
-    data[-1] ^= 1
+    data[0] ^= 1
     (corrupt / "state.bin").write_bytes(data)
     bad, log, console = start("restore", corrupt)
     assert bad.wait(timeout=15) != 0
-    assert "checksum" in text(log), text(log)
+    assert "invalid checkpoint header" in text(log), text(log)
     corrupt_ram = work / "corrupt-ram"
     corrupt_ram.mkdir()
     (corrupt_ram / "state.bin").write_bytes((first / "state.bin").read_bytes())
@@ -318,17 +317,17 @@ try:
     (corrupt_ram / "ram.bin").write_bytes((first / "ram.bin").read_bytes()[:4096])
     bad_ram, log, console = start("restore", corrupt_ram)
     assert bad_ram.wait(timeout=15) != 0
-    assert "checksum" in text(log), text(log)
+    assert "artifact length mismatch" in text(log), text(log)
     incompatible = work / "incompatible-cpu"
     incompatible.mkdir()
-    original_header = (first / "state.bin").read_bytes()[:48]
-    state = json.loads((first / "state.bin").read_bytes()[48:])
+    original_header = (first / "state.bin").read_bytes()[:16]
+    state = json.loads((first / "state.bin").read_bytes()[16:])
     if hvf:
         state["cpus"][0]["cpu"]["frequency"] += 1
     else:
         state["cpus"][0]["tsc_khz"] += 1
     payload = json.dumps(state, separators=(",", ":")).encode()
-    header = original_header[:12] + struct.pack("<I", len(payload)) + hashlib.sha256(payload).digest()
+    header = original_header[:12] + struct.pack("<I", len(payload))
     (incompatible / "state.bin").write_bytes(header + payload)
     for artifact in first.iterdir():
         if artifact.name != "state.bin":
@@ -344,7 +343,7 @@ try:
               "nonce": original[0], "vcpus": 2, "virtio_fs_stale_handle": not bool(os.environ.get("KRUN_TEST_BLOCK_ROOT")), "independent_disk": "qcow2-flatten" if os.environ.get("KRUN_TEST_FLATTEN") else "raw",
               "corrupt_metadata_rejected": True, "truncated_ram_rejected": True, "failed_restore_joined": True, "work": str(work)}
     if hvf:
-        saved_platform = json.loads((first / "state.bin").read_bytes()[48:])["vm"]
+        saved_platform = json.loads((first / "state.bin").read_bytes()[16:])["vm"]
         result["gic"] = "native" if saved_platform["native_gic"] else "software"
         result["virtual_clock_excludes_offline"] = True
     result["ext4_rootfs"] = bool(os.environ.get("KRUN_TEST_BLOCK_ROOT"))

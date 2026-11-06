@@ -119,6 +119,7 @@ def main():
                 stop(source_proc)
                 artifacts = [p for p in snapshot.rglob("*") if p.is_file()]
                 snapshot_bytes = sum(p.stat().st_size for p in artifacts)
+                allocated_bytes = sum(p.stat().st_blocks * 512 for p in artifacts)
                 # Explicit warm-cache condition, outside the import timer.
                 for path in artifacts:
                     with path.open("rb") as stream:
@@ -133,7 +134,7 @@ def main():
                     raise RuntimeError("restored RAM integrity check failed")
                 sample = {"memory_mib": size, "iteration": iteration, "warmup": iteration == 0,
                           "export_ms": export_ns / 1e6, "import_ms": import_ns / 1e6,
-                          "snapshot_bytes": snapshot_bytes, "filled_mib": size // 2,
+                          "snapshot_bytes": snapshot_bytes, "allocated_bytes": allocated_bytes, "filled_mib": size // 2,
                           "source_pid": source_proc.pid, "restore_pid": restored_proc.pid,
                           "integrity_verified": True}
                 result["samples"].append(sample)

@@ -11,7 +11,6 @@ use crate::vstate::{KvmContext, Vcpu, Vm};
 use devices::legacy::{Cmos, IrqChip, IrqChipDevice, KvmIoapic};
 use devices::virtio::DeviceQueue;
 use polly::event_manager::EventManager;
-use std::io::Seek;
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 #[cfg(target_os = "linux")]
@@ -23,60 +22,28 @@ fn checked_artifact(directory: &Path, expected: &Artifact, name: &str) -> io::Re
     if expected.name != name {
         return Err(invalid("invalid checkpoint artifact name"));
     }
-    let mut file = open_file(&directory.join(name))?;
+    let file = open_file(&directory.join(name))?;
     if file.metadata()?.len() != expected.len {
-        return Err(invalid("checkpoint artifact checksum mismatch"));
+        return Err(invalid("checkpoint artifact length mismatch"));
     }
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    if hash.finalize()[..] != expected.sha256 {
-        return Err(invalid("checkpoint artifact checksum mismatch"));
-    }
-    file.rewind()?;
     Ok(file)
-}
-
-// Hash the bytes actually installed into KVM slots as well as the initial
-// artifact scan, so a concurrent edit cannot run with unverified hotplug RAM.
-#[cfg(target_os = "linux")]
-struct HotplugReader {
-    file: File,
-    hash: Sha256,
-}
-#[cfg(target_os = "linux")]
-impl Read for HotplugReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.file.read(buffer)?;
-        self.hash.update(&buffer[..count]);
-        Ok(count)
-    }
 }
 
 fn metadata(directory: &Path) -> io::Result<Metadata> {
     let mut file = open_file(&directory.join("state.bin"))?;
-    let mut header = [0; 48];
+    let mut header = [0; 16];
     file.read_exact(&mut header)?;
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     if &header[..8] != MAGIC
         || version != VERSION
         || len > MAX_METADATA
-        || file.metadata()?.len() != 48 + len as u64
+        || file.metadata()?.len() != 16 + len as u64
     {
         return Err(invalid("invalid checkpoint header/version/length"));
     }
     let mut bytes = vec![0; len];
     file.read_exact(&mut bytes)?;
-    if Sha256::digest(&bytes)[..] != header[16..48] {
-        return Err(invalid("checkpoint metadata checksum mismatch"));
-    }
     let state: Metadata = serde_json::from_slice(&bytes).map_err(other)?;
     if state.version != VERSION
         || state.platform != PLATFORM
@@ -187,12 +154,8 @@ pub fn restore(
     if saved.ram.len > budget.saturating_add(1024 * 1024) {
         return Err(invalid("checkpoint exceeds configured boot RAM budget"));
     }
-    let mut ram = Vec::new();
-    checked_artifact(directory, &saved.ram, "ram.bin")?.read_to_end(&mut ram)?;
-    if ram.len() as u64 != saved.ram.len || Sha256::digest(&ram)[..] != saved.ram.sha256 {
-        return Err(invalid("RAM image changed during import"));
-    }
-    let ram_layout = crate::ram_snapshot::get_metadata(&ram)?;
+    let mut ram = checked_artifact(directory, &saved.ram, "ram.bin")?;
+    let ram_layout = crate::ram_snapshot::file_metadata(&mut ram)?;
     if ram_layout.memory_bytes > budget || ram_layout.regions.len() > 64 {
         return Err(invalid("checkpoint RAM layout exceeds configured budget"));
     }
@@ -209,7 +172,7 @@ pub fn restore(
             return Err(invalid("invalid RAM mapping or MMIO overlap"));
         }
     }
-    let memory = crate::ram_snapshot::restore(&ram)?;
+    let memory = crate::ram_snapshot::restore_file(&ram, &ram_layout)?;
     drop(ram);
     #[cfg(target_os = "linux")]
     let (mut vmm, intc) = {
@@ -311,14 +274,8 @@ pub fn restore(
             if artifact.len != state.memory_bytes() {
                 return Err(invalid("hotplug RAM length mismatch"));
             }
-            let mut reader = HotplugReader {
-                file: checked_artifact(directory, artifact, "hotplug.bin")?,
-                hash: Sha256::new(),
-            };
+            let mut reader = checked_artifact(directory, artifact, "hotplug.bin")?;
             device.restore_state(state, &mut reader)?;
-            if reader.hash.finalize()[..] != artifact.sha256 {
-                return Err(invalid("hotplug RAM changed during import"));
-            }
             Some(Arc::new(Mutex::new(device)))
         } else {
             None
@@ -509,14 +466,10 @@ pub fn restore(
                             .write(true)
                             .truncate(true)
                             .open(image.as_path())?;
-                        io::copy(&mut source, &mut destination)?;
+                        let copied = io::copy(&mut source, &mut destination)?;
                         destination.sync_all()?;
-                        let copied = super::artifact(
-                            image.as_path().parent().unwrap(),
-                            image.as_path().file_name().unwrap().to_str().unwrap(),
-                        )?;
-                        if copied.len != artifact.len || copied.sha256 != artifact.sha256 {
-                            return Err(invalid("disk image changed during import"));
+                        if copied != artifact.len {
+                            return Err(invalid("disk image length changed during import"));
                         }
                         validate_disk(&open_file(image.as_path())?, *format, state)?;
                         let format = match format {

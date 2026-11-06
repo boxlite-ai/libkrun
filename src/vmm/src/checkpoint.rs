@@ -36,7 +36,6 @@ use devices::virtio::{block::BlockState, block::ImageType, Block};
 use devices::virtio::{Balloon, Console, Fs, MmioTransport, Rng, VirtioDevice};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use utils::eventfd::EventFd;
 
 use crate::vstate::control::{Command, Reply};
@@ -67,7 +66,6 @@ fn other(error: impl std::fmt::Debug) -> io::Error {
 struct Artifact {
     name: String,
     len: u64,
-    sha256: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -430,7 +428,7 @@ impl Vmm {
                 Some(device) => unsafe { device.accessible_memory(&self.guest_memory)? },
                 None => boot.clone(),
             };
-            let ram = write_artifact(directory, "ram.bin", &crate::ram_snapshot::save(&boot)?)?;
+            let ram = write_ram(directory, &boot)?;
             let hotplug_artifact = if let Some(device) = hotplug {
                 let mut file = create_file(&directory.join("hotplug.bin"))?;
                 device.save_memory(&mut file)?;
@@ -452,11 +450,7 @@ impl Vmm {
         #[cfg(target_os = "macos")]
         let (accessible, ram, hotplug_artifact) = (
             self.guest_memory.clone(),
-            write_artifact(
-                directory,
-                "ram.bin",
-                &crate::ram_snapshot::save(&self.guest_memory)?,
-            )?,
+            write_ram(directory, &self.guest_memory)?,
             None,
         );
         let mut records = Vec::new();
@@ -682,7 +676,6 @@ impl Vmm {
         file.write_all(MAGIC)?;
         file.write_all(&VERSION.to_le_bytes())?;
         file.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        file.write_all(&Sha256::digest(&bytes))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         File::open(directory)?.sync_all()
@@ -825,33 +818,17 @@ fn open_file(path: &Path) -> io::Result<File> {
     }
     Ok(file)
 }
-#[cfg(any(target_os = "linux", feature = "blk"))]
 fn artifact(directory: &Path, name: &str) -> io::Result<Artifact> {
-    let mut file = open_file(&directory.join(name))?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
     Ok(Artifact {
         name: name.into(),
-        len: file.metadata()?.len(),
-        sha256: hash.finalize().into(),
+        len: open_file(&directory.join(name))?.metadata()?.len(),
     })
 }
-fn write_artifact(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<Artifact> {
-    let mut file = create_file(&directory.join(name))?;
-    file.write_all(bytes)?;
+fn write_ram(directory: &Path, memory: &vm_memory::GuestMemoryMmap) -> io::Result<Artifact> {
+    let mut file = create_file(&directory.join("ram.bin"))?;
+    crate::ram_snapshot::save_file(memory, &mut file)?;
     file.sync_all()?;
-    Ok(Artifact {
-        name: name.into(),
-        len: bytes.len() as u64,
-        sha256: Sha256::digest(bytes).into(),
-    })
+    artifact(directory, "ram.bin")
 }
 fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     let source = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(other)?;

@@ -29,8 +29,11 @@ int rc = krun_save_checkpoint(ctx, "/path/to/new-checkpoint", flatten, opaque);
 The context ID remains valid for this request. The call is synchronous, including
 all flatten callbacks. Concurrent requests return `-EBUSY`. The destination must
 not exist. Successful publication uses an atomic directory rename after syncing
-the artifacts. RAM and metadata have checksums; readers reject incompatible,
-truncated or changed artifacts before releasing vCPUs.
+the artifacts. Readers validate format, version, artifact lengths, resource
+budgets and saved CPU/device topology before releasing vCPUs. The container no longer stores
+SHA-256 checksums for metadata, RAM and disk artifacts; same-length content corruption is
+not detected by a checksum. Checkpoint contents must remain unchanged during
+import.
 
 On success, the original VM resumes. A file/export failure after a confirmed
 freeze also resumes it. `-ESHUTDOWN` is reserved for an unusable VM: vCPUs remain
@@ -237,7 +240,10 @@ Local evidence (artifacts are ignored by git):
 The Linux regression used an isolated copy at
 `/tmp/libkrun-hvf-regression.ZXZq9h` on `eric-kvm-dev`.
 
-### Export/import performance (2026-11-06)
+### Export/import baseline before sparse RAM (2026-11-06)
+
+The following measurements were taken at commit `e93ecf6`, before removing
+SHA-256 and adding sparse RAM export/import.
 
 `tests/checkpoint/benchmark.py` runs the same public-API workload on both
 platforms, with a release `blk,net` build, two vCPUs, and 256/512/1024/2048 MiB
@@ -297,10 +303,67 @@ Raw evidence: [KVM samples](../target/checkpoint-validation/performance/kvm.json
 
 A separate one-second sampling window during the beginning of a 1 GiB HVF
 import found 667 of 677 main-thread samples in SHA-256 compression (98.5%).
-This diagnostic run is excluded from the table. The current `sha2 0.10.9`
+This diagnostic run is excluded from the table. That build's `sha2 0.10.9`
 feature set does not enable `asm`, which selects its software backend on
 AArch64. Import also hashes RAM twice: the artifact scan and verification of
 the bytes actually read into memory. These identify concrete optimization
 opportunities; the measurements above use the unchanged snapshot implementation.
 See [sampling evidence](../target/checkpoint-validation/performance/hvf-import.sample)
 and [enabled SHA-2 features](../target/checkpoint-validation/performance/sha2-features.txt).
+
+
+### Sparse anonymous RAM
+
+Whole-VM export streams RAM through a 1 MiB buffer instead of constructing a
+RAM-sized `Vec`. It queries page allocation before reading private anonymous
+regions: Linux uses `/proc/self/pagemap` and retains present **or swapped** pages;
+macOS uses `mach_vm_page_range_query` and retains every nonzero disposition,
+including compressed/paged-out pages. Only confirmed unallocated pages are
+omitted. Allocated pages containing all zeroes are still written; no zero-page
+content scan is performed. These queries do not identify guest-OS free pages.
+All guest/device writers stay frozen through the query and copy.
+
+If page-state queries fail, or a mapping is not private anonymous memory, export
+copies the region in full. The snapshot is a sparse file with the same logical
+RAM byte layout as before; physical disk use depends on filesystem support.
+Import reads its `SEEK_DATA`/`SEEK_HOLE` extents into fresh anonymous memory and
+leaves holes as zero-filled anonymous pages. Unsupported sparse seeking falls
+back to full reads. All saved data is loaded before vCPUs resume: this is eager
+restore, with no snapshot-file mapping or userfaultfd. Existing plugged-memory
+streaming remains unchanged apart from removal of its checksum.
+
+The standalone in-memory RAM codec still uses version 1 and remains byte-compatible
+with the sparse RAM file. The whole-VM container remains experimental version 1: its header is
+16 bytes, followed by JSON metadata, and artifacts record names and lengths only.
+
+The benchmark now reports both logical snapshot bytes and `st_blocks * 512`
+allocated bytes. Earlier baseline results above retain their original meanings.
+
+Validation: native HVF VMM tests passed (29); Linux VMM tests passed (36, one
+existing ignore). Both platforms passed process-exit and repeated-restore
+regressions. The Linux regression also exercised plugged RAM, TSI and an
+export failure followed by source continuation. All 40 benchmark measurements
+and eight warmups passed the full guest-pattern scan.
+
+Post-change performance uses the same hosts, release build, two vCPUs,
+half-filled pseudorandom guest memory and warm-cache import as the baseline.
+Each value is the median of five measured iterations. Allocated MiB includes
+RAM and state files; logical file size is still approximately configured RAM.
+
+| Platform | RAM (MiB) | Export (ms) | Import (ms) | Allocated (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| KVM | 256 | 645.6 | 168.9 | 166.1 |
+| KVM | 512 | 1189.2 | 272.8 | 299.2 |
+| KVM | 1024 | 2273.7 | 469.7 | 564.5 |
+| KVM | 2048 | 4281.6 | 878.5 | 1094.3 |
+| HVF | 256 | 61.4 | 21.9 | 171.4 |
+| HVF | 512 | 95.4 | 31.4 | 314.2 |
+| HVF | 1024 | 165.2 | 54.5 | 585.1 |
+| HVF | 2048 | 307.0 | 99.8 | 1102.6 |
+
+Evidence: [HVF performance](../target/checkpoint-validation/sparse-ram/hvf-performance.json),
+[KVM performance](../target/checkpoint-validation/sparse-ram/kvm-performance.json),
+[HVF VMM tests](../target/checkpoint-validation/sparse-ram/hvf-vmm-tests.log),
+[KVM VMM tests](../target/checkpoint-validation/sparse-ram/kvm-sparse-tests.log),
+[HVF roundtrip](../target/checkpoint-validation/sparse-ram/hvf-roundtrip.log),
+[KVM roundtrip](../target/checkpoint-validation/sparse-ram/kvm-sparse-roundtrip.log).

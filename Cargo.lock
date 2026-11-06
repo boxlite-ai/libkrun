@@ -784,7 +784,6 @@ dependencies = [
  "nix 0.30.1",
  "serde",
  "serde_json",
- "sha2",
  "tdx",
  "vm-memory",
  "vmm-sys-util 0.14.0",

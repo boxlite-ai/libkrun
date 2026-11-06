@@ -21,7 +21,6 @@ aws-nitro = []
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"
-sha2 = "0.10"
 flate2 = "1.0.35"
 libc = ">=0.2.39"
 linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }

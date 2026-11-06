@@ -10,6 +10,9 @@ use std::io::{self, Read};
 
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
+mod file;
+pub(crate) use file::{file_metadata, restore_file, save_file};
+
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
 const VERSION: u32 = 1;
 const HEADER_LEN: u64 = 16;
@@ -94,7 +97,10 @@ pub fn save(memory: &GuestMemoryMmap) -> io::Result<Vec<u8>> {
 /// payload length. Region count, RAM budget and platform layout policy belong
 /// to the caller. Region addresses are reported as encoded.
 pub fn get_metadata(image: &[u8]) -> io::Result<Metadata> {
-    let mut reader = image;
+    read_metadata(&mut &image[..], image.len() as u64)
+}
+
+fn read_metadata(reader: &mut impl Read, image_len: u64) -> io::Result<Metadata> {
     let mut header = [0; HEADER_LEN as usize];
     reader.read_exact(&mut header)?;
     if &header[..8] != MAGIC {
@@ -105,7 +111,7 @@ pub fn get_metadata(image: &[u8]) -> io::Result<Metadata> {
         return Err(invalid("unsupported RAM image version"));
     }
     let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-    if HEADER_LEN + count as u64 * REGION_LEN > image.len() as u64 {
+    if HEADER_LEN + count as u64 * REGION_LEN > image_len {
         return Err(invalid("truncated RAM region table"));
     }
     let mut regions = Vec::new();
@@ -122,7 +128,7 @@ pub fn get_metadata(image: &[u8]) -> io::Result<Metadata> {
         });
     }
     let memory_bytes = memory_bytes(&regions)?;
-    if memory_bytes != image.len() as u64 - HEADER_LEN - count as u64 * REGION_LEN {
+    if memory_bytes != image_len - HEADER_LEN - count as u64 * REGION_LEN {
         return Err(invalid("RAM image length differs from region table"));
     }
     Ok(Metadata {
