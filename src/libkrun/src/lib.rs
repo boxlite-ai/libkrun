@@ -2798,16 +2798,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             all(target_os = "macos", target_arch = "aarch64")
         )
     ))]
-    let checkpoint_runtime = if ctx_cfg.vmr.checkpoint_enabled {
-        match checkpoint::runtime::prepare(&mut event_manager, &ctx_cfg.vmr) {
-            Ok(runtime) => Some(runtime),
-            Err(error) => {
-                error!("Checkpoint control setup failed: {error}");
-                return -libc::EIO;
-            }
+    let checkpoint_runtime = match checkpoint::runtime::prepare(&mut event_manager, &ctx_cfg.vmr) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            error!("Checkpoint control setup failed: {error}");
+            return -libc::EIO;
         }
-    } else {
-        None
     };
 
     let _vmm = match vmm::builder::build_microvm(
@@ -2830,9 +2826,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             all(target_os = "macos", target_arch = "aarch64")
         )
     ))]
-    if let Some(runtime) = checkpoint_runtime {
-        runtime.attach(ctx_id, _vmm.clone());
-    }
+    checkpoint_runtime.attach(ctx_id, _vmm.clone());
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {

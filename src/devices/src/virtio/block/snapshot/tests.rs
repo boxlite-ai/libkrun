@@ -35,31 +35,6 @@ fn irq() -> InterruptTransport {
     InterruptTransport::new(DummyIrqChip::new().into(), "block-test".into()).unwrap()
 }
 
-#[test]
-fn checkpoint_source_pins_absolute_path_and_rejects_missing_or_replaced_disk() {
-    let cwd = std::env::current_dir().unwrap();
-    let dir = utils::tempdir::TempDir::new_with_prefix(cwd.join(".block-checkpoint-")).unwrap();
-    let relative = std::path::Path::new(dir.as_path().file_name().unwrap()).join("disk.raw");
-    std::fs::write(&relative, [0x37; 4096]).unwrap();
-    let source = block(relative.to_str().unwrap());
-    let (path, format) = source.checkpoint_source().unwrap();
-    assert!(path.is_absolute());
-    assert_eq!(path, cwd.join(&relative));
-    assert!(matches!(format, ImageType::Raw));
-
-    std::fs::rename(&relative, dir.as_path().join("live.raw")).unwrap();
-    assert_eq!(
-        source.checkpoint_source().unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
-    );
-    std::fs::write(&relative, [0xe5; 4096]).unwrap();
-    assert!(source
-        .checkpoint_source()
-        .unwrap_err()
-        .to_string()
-        .contains("replaced"));
-}
-
 // A real write request, followed by a pending read across worker destruction
 // and recreation. No guest kick is issued in the importing process's equivalent
 // path; resume must discover the available descriptor itself.
@@ -120,7 +95,7 @@ fn frozen_disk_roundtrip_rescans_pending_io_and_can_snapshot_again() {
     ring.dtable[1].set(0x5000, 512, 3, 2);
     ring.avail.ring[1].set(0);
     ring.avail.idx.set(2);
-    // An independently flattened image has a different host inode. Preserve
+    // A caller-provided disk copy has a different host inode. Preserve
     // the guest-visible GET_ID value while binding this new backing file.
     let independent = TempFile::new().unwrap();
     std::fs::copy(path, independent.as_path()).unwrap();

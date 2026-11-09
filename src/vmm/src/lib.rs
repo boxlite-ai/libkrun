@@ -214,8 +214,7 @@ pub struct Vmm {
             all(target_os = "macos", target_arch = "aarch64")
         )
     ))]
-    checkpoint_enabled: bool,
-    checkpoint_files: Vec<utils::tempfile::TempFile>,
+    checkpoint_supported: bool,
     checkpoint_dirs: Vec<utils::tempdir::TempDir>,
     vcpus_paused: bool,
     vcpus_failed: bool,
@@ -430,7 +429,6 @@ impl Vmm {
                 .on_vmm_exit();
         }
 
-        self.checkpoint_files.clear();
         self.checkpoint_dirs.clear();
 
         // Exit from Firecracker using the provided exit code. Safe because we're terminating

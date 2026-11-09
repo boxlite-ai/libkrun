@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -56,6 +57,8 @@ with disk.open("wb") as file:
 base_disk = disk
 processes = []
 backends = []
+saved_disks = {}
+live_disks = {}
 
 
 class EchoBackend:
@@ -161,22 +164,28 @@ def text(path):
         return ""
 
 
-def start(mode, checkpoint, next_checkpoint=None):
+def start(mode, checkpoint, next_checkpoint=None, missing_disk=False):
     number = len(processes)
     log = work / f"host-{number}.log"
     console = work / f"console-{number}.log"
     env = os.environ.copy()
     if next_checkpoint:
         env["KRUN_TEST_NEXT_CHECKPOINT"] = str(next_checkpoint)
+    image = disk
     if mode == "restore":
         env.pop("KRUN_TEST_FAIL_EXPORT", None)
+        image = work / f"restore-disk-{number}.img"
+        shutil.copyfile(saved_disks.get(checkpoint, saved_disks.get(work / "checkpoint-1")), image)
+    if missing_disk:
+        env["KRUN_TEST_MISSING_DISK"] = "1"
     if env.get("KRUN_TEST_NET"):
         backend = EchoBackend(work / f"net-{number}.sock")
         backends.append(backend)
         env["KRUN_TEST_NET_SOCKET"] = str(backend.path)
     with log.open("wb") as output:
-        process = subprocess.Popen([str(host), mode, str(root), str(checkpoint), str(console), str(disk)], stdout=output, stderr=subprocess.STDOUT, env=env)
+        process = subprocess.Popen([str(host), mode, str(root), str(checkpoint), str(console), str(image)], stdout=output, stderr=subprocess.STDOUT, env=env)
     processes.append(process)
+    live_disks[process.pid] = image
     return process, log, console
 
 
@@ -189,6 +198,42 @@ def wait(predicate, process, logs, timeout=45):
             break
         time.sleep(.05)
     raise AssertionError(f"guest/control did not progress; exit={process.poll()}\n" + "\n".join(text(log)[-6000:] for log in logs) + "\n" + text(root / "failure"))
+
+
+def checkpoint_state(path):
+    with path.open("rb") as file:
+        header = file.read(16)
+        magic, version, length = struct.unpack("<8sII", header)
+        assert magic == b"KRUNVM\0\0" and version == 2
+        return json.loads(file.read(length))
+
+
+def save_paused(process, checkpoint, log, console, expected=0):
+    previous = text(log).count("CHECKPOINT ")
+    process.send_signal(signal.SIGUSR1)
+    wait(lambda: text(log).count("CHECKPOINT ") > previous, process, [log, console])
+    assert f"CHECKPOINT {expected}" in text(log).splitlines()[-1], text(log)
+    progress = guest_output()
+    time.sleep(.2)
+    assert guest_output() == progress, "guest progressed while paused"
+    if expected == 0:
+        assert checkpoint.is_file(), "checkpoint must be a single file"
+        image = work / f"{checkpoint.name}.disk"
+        if os.environ.get("KRUN_TEST_FLATTEN"):
+            subprocess.run([os.environ["KRUN_TEST_FLATTEN"], "flatten", str(live_disks[process.pid]), str(image)], check=True)
+        else:
+            shutil.copyfile(live_disks[process.pid], image)
+        saved_disks[checkpoint] = image
+        state = checkpoint_state(checkpoint)
+        assert all(d["state"]["kind"] != "Block" or isinstance(d["state"]["state"], dict) for d in state["devices"])
+        assert "disk_image_path" not in json.dumps(state)
+
+
+def resume(process, log, console):
+    previous = text(log).count("RESUME ")
+    process.send_signal(signal.SIGUSR2)
+    wait(lambda: text(log).count("RESUME ") > previous, process, [log, console])
+    assert text(log).splitlines()[-1] == "RESUME 0", text(log)
 
 
 def guest_output():
@@ -243,55 +288,30 @@ try:
         (work / "result.json").write_text(json.dumps(result, indent=2))
         print(json.dumps(result, indent=2))
         raise SystemExit(0)
-    if os.environ.get("KRUN_TEST_REPLACED_DISK"):
-        # The live block worker retains its original open image. Replacing
-        # the source pathname must never silently export the new file.
-        original_disk = disk.with_name("renamed-live.raw")
-        disk.rename(original_disk)
-        with disk.open("wb") as replacement:
-            replacement.truncate(original_disk.stat().st_size)
-            replacement.write(bytes([0xe5]) * 512)
-        source.send_signal(signal.SIGUSR1)
-        wait(lambda: "CHECKPOINT " in text(log), source, [log, console])
-        if "CHECKPOINT 0" in text(log):
-            artifacts = list(first.glob("disk-*.img"))
-            assert len(artifacts) == 1, artifacts
-            with artifacts[0].open("rb") as image, original_disk.open("rb") as live:
-                assert image.read(512) == live.read(512), "checkpoint exported replacement path instead of live disk"
-        else:
-            assert not first.exists(), "rejected export published a checkpoint"
-            progress = len(ticks())
-            wait(lambda: len(ticks()) > progress + 3, source, [log, console])
-        result = {"status": "passed", "replaced_disk_safe": True, "work": str(work)}
-        (work / "result.json").write_text(json.dumps(result, indent=2))
-        print(json.dumps(result, indent=2))
-        raise SystemExit(0)
-    source.send_signal(signal.SIGUSR1)
     if os.environ.get("KRUN_TEST_FAIL_EXPORT"):
-        wait(lambda: "CHECKPOINT -5" in text(log), source, [log, console])
+        save_paused(source, first, log, console, -errno.ENOENT)
         assert not first.exists()
+        resume(source, log, console)
         progress = len(ticks())
         wait(lambda: len(ticks()) > progress + 3, source, [log, console])
-        source.send_signal(signal.SIGUSR1)
-    wait(lambda: "CHECKPOINT 0" in text(log), source, [log, console])
+    save_paused(source, first, log, console)
     if os.environ.get("KRUN_TEST_EXTRA_FS"):
-        saved = json.loads((first / "state.bin").read_bytes()[16:])
+        saved = checkpoint_state(first)
         assert len(saved["devices"]) > 24, "fixture did not exceed the previous device limit"
-    if os.environ.get("KRUN_TEST_TSI"):
-        wait(lambda: ticks()[-1][9] > 0 and ticks()[-1][10] > 0, source, [log, console])
+
     if os.environ.get("KRUN_TEST_DAX"):
-        saved = json.loads((first / "state.bin").read_bytes()[16:])
+        saved = checkpoint_state(first)
         fs = next(d["state"]["state"] for d in saved["devices"]
                   if d["state"]["kind"] == "Fs" and d["state"]["state"]["tag"] == "dax-test")
         assert fs["dax_window"]["size"] == 8 * 1024 * 1024
         mappings = fs["worker"]["filesystem"]["mappings"]
         assert any(m["writable"] for m in mappings), "missing writable DAX mapping"
         assert any(not m["writable"] for m in mappings), "missing read-only DAX mapping"
-        assert saved["ram"]["len"] < 257 * 1024 * 1024, "DAX windows entered RAM export"
+        assert saved["ram_len"] < 257 * 1024 * 1024, "DAX windows entered RAM export"
+    save_paused(source, first, log, console, -errno.EEXIST)
+    resume(source, log, console)
     at_save = len(ticks())
     wait(lambda: len(ticks()) > at_save + 3, source, [log, console])
-    source.send_signal(signal.SIGUSR1)
-    wait(lambda: f"CHECKPOINT {-errno.EEXIST}" in text(log), source, [log, console])
     stop(source)  # Source process has exited before any restore starts.
     if os.environ.get("KRUN_TEST_DAX"):
         # The shared directory stays live; restored CPU mappings must observe host edits.
@@ -315,8 +335,8 @@ try:
         time.sleep(1.1)  # guest virtual time must exclude the offline interval
     second = work / "checkpoint-2"
     target, log, console = start("restore", first, second)
-    # Debug builds hash and copy every RAM artifact before entering KVM. Keep
-    # startup separate from the short deadline for an already-running guest.
+    # Import loads saved RAM before entering the guest. Keep startup separate
+    # from the short deadline for an already-running guest.
     wait(lambda: len(ticks()) > before_restore + 5, target, [log, console], timeout=180)
     if os.environ.get("KRUN_TEST_DAX"):
         wait(lambda: (root / "dax-observed").exists(), target, [log, console])
@@ -338,8 +358,7 @@ try:
         initial = ticks()[-1]
         wait(lambda: ticks()[-1][8] > initial[8] + 3 and ticks()[-1][11] > initial[11] + 3
              and ticks()[-1][9] > 0 and ticks()[-1][10] > 0, target, [log, console])
-    target.send_signal(signal.SIGUSR1)
-    wait(lambda: "CHECKPOINT 0" in text(log), target, [log, console])
+    save_paused(target, second, log, console)
     stop(target)
     before_repeat = len(ticks())
     repeated, log, console = start("restore", second)
@@ -354,36 +373,50 @@ try:
              and ticks()[-1][9] >= 2 and ticks()[-1][10] >= 2, repeated, [log, console])
     stop(repeated)
 
+    # Missing or capacity-mismatched disks must be rejected before execution.
+    progress = len(ticks())
+    missing, log, console = start("restore", first, missing_disk=True)
+    assert missing.wait(timeout=15) != 0
+    assert "matching caller-provided disks" in text(log), text(log)
+    assert len(ticks()) == progress
+    original_disk = saved_disks[first]
+    small_disk = work / "small.raw"
+    small_disk.write_bytes(bytes(4096))
+    if not os.environ.get("KRUN_TEST_FLATTEN"):
+        saved_disks[first] = small_disk
+        wrong, log, console = start("restore", first)
+        assert wrong.wait(timeout=30) != 0
+        assert len(ticks()) == progress
+        saved_disks[first] = original_disk
+
     corrupt = work / "corrupt"
-    corrupt.mkdir()
-    data = bytearray((first / "state.bin").read_bytes())
-    data[0] ^= 1
-    (corrupt / "state.bin").write_bytes(data)
+    with first.open("rb") as file:
+        header = file.read(16)
+    corrupt.write_bytes(bytes([header[0] ^ 1]) + header[1:])
     bad, log, console = start("restore", corrupt)
     assert bad.wait(timeout=15) != 0
     assert "invalid checkpoint header" in text(log), text(log)
     corrupt_ram = work / "corrupt-ram"
-    corrupt_ram.mkdir()
-    (corrupt_ram / "state.bin").write_bytes((first / "state.bin").read_bytes())
-    # Truncated payloads must fail before any vCPU or device worker starts.
-    (corrupt_ram / "ram.bin").write_bytes((first / "ram.bin").read_bytes()[:4096])
+    with first.open("rb") as file:
+        metadata_len = struct.unpack("<I", file.read(16)[12:])[0]
+        file.seek(0)
+        corrupt_ram.write_bytes(file.read(16 + metadata_len + 4096))
     bad_ram, log, console = start("restore", corrupt_ram)
     assert bad_ram.wait(timeout=15) != 0
-    assert "artifact length mismatch" in text(log), text(log)
+    assert "payload length mismatch" in text(log), text(log)
     incompatible = work / "incompatible-cpu"
-    incompatible.mkdir()
-    original_header = (first / "state.bin").read_bytes()[:16]
-    state = json.loads((first / "state.bin").read_bytes()[16:])
+    state = checkpoint_state(first)
     if hvf:
         state["cpus"][0]["cpu"]["frequency"] += 1
     else:
         state["cpus"][0]["tsc_khz"] += 1
     payload = json.dumps(state, separators=(",", ":")).encode()
-    header = original_header[:12] + struct.pack("<I", len(payload))
-    (incompatible / "state.bin").write_bytes(header + payload)
-    for artifact in first.iterdir():
-        if artifact.name != "state.bin":
-            os.link(artifact, incompatible / artifact.name)
+    with first.open("rb") as source_file, incompatible.open("wb") as target_file:
+        original_header = source_file.read(16)
+        length = struct.unpack("<I", original_header[12:])[0]
+        source_file.seek(16 + length)
+        target_file.write(original_header[:12] + struct.pack("<I", len(payload)) + payload)
+        shutil.copyfileobj(source_file, target_file)
     progress = len(ticks())
     bad_cpu, log, console = start("restore", incompatible)
     assert bad_cpu.wait(timeout=180) != 0
@@ -407,17 +440,18 @@ try:
         assert len(ticks()) == progress, "vCPUs resumed with replaced DAX backing"
 
     result = {"status": "passed", "platform": "macos-aarch64-hvf" if hvf else "linux-x86_64-kvm", "source_pid": source.pid, "restore_pid": target.pid, "repeat_pid": repeated.pid,
-              "nonce": original[0], "vcpus": 2, "virtio_fs_stale_handle": not bool(os.environ.get("KRUN_TEST_BLOCK_ROOT")), "independent_disk": "qcow2-flatten" if os.environ.get("KRUN_TEST_FLATTEN") else "raw",
+              "nonce": original[0], "vcpus": 2, "virtio_fs_stale_handle": not bool(os.environ.get("KRUN_TEST_BLOCK_ROOT")), "external_disk": "qcow2-flatten" if os.environ.get("KRUN_TEST_FLATTEN") else "raw",
+              "single_file": True, "save_requires_pause": True, "save_preserves_pause": True, "missing_disk_rejected": True,
               "corrupt_metadata_rejected": True, "truncated_ram_rejected": True, "failed_restore_joined": True, "work": str(work)}
     if hvf:
-        saved_platform = json.loads((first / "state.bin").read_bytes()[16:])["vm"]
+        saved_platform = checkpoint_state(first)["vm"]
         result["gic"] = "native" if saved_platform["native_gic"] else "software"
         result["virtual_clock_excludes_offline"] = True
     result["dax_mapping_restore"] = bool(os.environ.get("KRUN_TEST_DAX"))
     result["ext4_rootfs"] = bool(os.environ.get("KRUN_TEST_BLOCK_ROOT"))
     result["tsi_tcp_accept_udp"] = bool(os.environ.get("KRUN_TEST_TSI"))
     result["hotplug_384_mib"] = bool(os.environ.get("KRUN_TEST_HOTPLUG"))
-    result["failed_export_resumed_source"] = bool(os.environ.get("KRUN_TEST_FAIL_EXPORT"))
+    result["failed_export_kept_paused_then_resumed"] = bool(os.environ.get("KRUN_TEST_FAIL_EXPORT"))
     result["fresh_net_backend"] = bool(os.environ.get("KRUN_TEST_NET"))
     (work / "result.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))

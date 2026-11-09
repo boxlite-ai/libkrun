@@ -11,8 +11,8 @@ use crate::virtio::control::{Command, WorkerControl};
 use crate::virtio::persist::{invalid, QueueState, VirtioDeviceState};
 use crate::virtio::VirtioDevice;
 
-/// The checkpoint owner supplies an independent flattened disk image made at
-/// the same freeze boundary. This state preserves the guest-visible disk ID,
+/// The application supplies a matching disk image saved while the VM is paused.
+/// This state preserves the guest-visible disk ID,
 /// which must not change when the new backing file has a different host inode.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

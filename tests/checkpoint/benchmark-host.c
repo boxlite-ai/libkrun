@@ -32,7 +32,8 @@ static void *save(void *unused) {
     int signal;
     if (sigwait(&signals, &signal)) abort();
     uint64_t start = now_ns();
-    int result = krun_save_checkpoint(context, destination, NULL, NULL);
+    int result = krun_pause(context);
+    if (!result) result = krun_save_checkpoint(context, destination);
     uint64_t elapsed = now_ns() - start;
     fprintf(stderr, "EXPORT_NS %llu RESULT %d\n", (unsigned long long)elapsed, result);
     fflush(stderr);
@@ -69,8 +70,7 @@ int main(int argc, char **argv) {
     const char *env[] = {"PATH=/bin:/usr/bin", NULL};
     check(krun_set_exec(context, "/benchmark-guest", args, env), "exec");
     int restoring = strcmp(argv[1], "restore") == 0;
-    if (restoring) check(krun_set_checkpoint_restore(context, argv[3]), "restore");
-    else check(krun_set_checkpointing(context, true), "checkpoint");
+    if (restoring) check(krun_build_from_checkpoint(context, argv[3]), "restore");
     destination = argv[3];
     snprintf(response, sizeof(response), "%s/response", argv[2]);
     pthread_t thread;

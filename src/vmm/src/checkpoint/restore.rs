@@ -18,19 +18,7 @@ use std::sync::atomic::AtomicI32;
 #[cfg(target_os = "linux")]
 use utils::eventfd::EFD_NONBLOCK;
 
-fn checked_artifact(directory: &Path, expected: &Artifact, name: &str) -> io::Result<File> {
-    if expected.name != name {
-        return Err(invalid("invalid checkpoint artifact name"));
-    }
-    let file = open_file(&directory.join(name))?;
-    if file.metadata()?.len() != expected.len {
-        return Err(invalid("checkpoint artifact length mismatch"));
-    }
-    Ok(file)
-}
-
-fn metadata(directory: &Path) -> io::Result<Metadata> {
-    let mut file = open_file(&directory.join("state.bin"))?;
+fn metadata(file: &mut File) -> io::Result<Metadata> {
     let mut header = [0; 16];
     file.read_exact(&mut header)?;
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -38,7 +26,7 @@ fn metadata(directory: &Path) -> io::Result<Metadata> {
     if &header[..8] != MAGIC
         || version != VERSION
         || len > MAX_METADATA
-        || file.metadata()?.len() != 16 + len as u64
+        || file.metadata()?.len() < 16 + len as u64
     {
         return Err(invalid("invalid checkpoint header/version/length"));
     }
@@ -92,7 +80,7 @@ fn metadata(directory: &Path) -> io::Result<Metadata> {
             #[cfg(target_os = "linux")]
             DeviceSnapshot::Memory(state) => Some(&state.device),
             #[cfg(feature = "blk")]
-            DeviceSnapshot::Block(state, _, _) => Some(&state.device),
+            DeviceSnapshot::Block(state) => Some(&state.device),
             DeviceSnapshot::Console(_, _) => None,
         };
         if common.is_some_and(|common| common != &record.transport.device) {
@@ -116,12 +104,44 @@ fn metadata(directory: &Path) -> io::Result<Metadata> {
 /// must not dispatch until this returns; on success the VM is running. Discard
 /// the event manager on failure, since it may contain inactive subscribers.
 pub fn restore(
-    directory: &Path,
+    path: &Path,
     resources: &VmResources,
     events: &mut EventManager,
     #[cfg(target_os = "macos")] shutdown_efd: Option<EventFd>,
 ) -> io::Result<Arc<Mutex<Vmm>>> {
-    let mut saved = metadata(directory)?;
+    let mut file = open_file(path)?;
+    let mut saved = metadata(&mut file)?;
+    let ram_offset = file.stream_position()?;
+    let hotplug_offset = ram_offset
+        .checked_add(saved.ram_len)
+        .ok_or_else(|| invalid("checkpoint length overflow"))?;
+    let expected_len = hotplug_offset
+        .checked_add(saved.hotplug_len.unwrap_or(0))
+        .ok_or_else(|| invalid("checkpoint length overflow"))?;
+    if file.metadata()?.len() != expected_len {
+        return Err(invalid("checkpoint payload length mismatch"));
+    }
+    #[cfg(feature = "blk")]
+    {
+        let disk_ids: Vec<_> = saved
+            .devices
+            .iter()
+            .filter_map(|record| {
+                matches!(record.state, DeviceSnapshot::Block(_)).then_some(&record.id)
+            })
+            .collect();
+        if resources.block.list.len() != disk_ids.len()
+            || disk_ids.iter().any(|id| {
+                !resources
+                    .block
+                    .list
+                    .iter()
+                    .any(|block| block.lock().unwrap().id() == *id)
+            })
+        {
+            return Err(invalid("restore requires matching caller-provided disks"));
+        }
+    }
     if resources.serial_consoles.len() != saved.legacy.serial_endpoints
         || resources.nested_enabled
         || resources.split_irqchip
@@ -141,7 +161,7 @@ pub fn restore(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if memory_state.len() > 1 || memory_state.is_empty() != saved.hotplug.is_none() {
+        if memory_state.len() > 1 || memory_state.is_empty() != saved.hotplug_len.is_none() {
             return Err(invalid("inconsistent hotplug checkpoint"));
         }
         if let Some(state) = memory_state.first() {
@@ -149,11 +169,10 @@ pub fn restore(
         }
         memory_state
     };
-    if saved.ram.len > budget.saturating_add(1024 * 1024) {
+    if saved.ram_len > budget.saturating_add(1024 * 1024) {
         return Err(invalid("checkpoint exceeds configured boot RAM budget"));
     }
-    let mut ram = checked_artifact(directory, &saved.ram, "ram.bin")?;
-    let ram_layout = crate::ram_snapshot::file_metadata(&mut ram)?;
+    let ram_layout = crate::ram_snapshot::file_metadata_at(&mut file, ram_offset, saved.ram_len)?;
     if ram_layout.memory_bytes > budget || ram_layout.regions.len() > 64 {
         return Err(invalid("checkpoint RAM layout exceeds configured budget"));
     }
@@ -170,7 +189,7 @@ pub fn restore(
             return Err(invalid("invalid RAM mapping or MMIO overlap"));
         }
     }
-    let mut memory = crate::ram_snapshot::restore_file(&ram, &ram_layout)?;
+    let mut memory = crate::ram_snapshot::restore_file_at(&file, &ram_layout, ram_offset)?;
     // DAX windows are address-space reservations, not RAM payload. Never read
     // their file-backed/protected pages through the RAM codec.
     for record in &saved.devices {
@@ -217,7 +236,6 @@ pub fn restore(
             }
         }
     }
-    drop(ram);
     #[cfg(target_os = "linux")]
     let (mut vmm, intc) = {
         let kvm = KvmContext::new().map_err(other)?;
@@ -269,8 +287,7 @@ pub fn restore(
             },
             kernel_cmdline: kernel::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE),
             vcpus_handles: Vec::new(),
-            checkpoint_enabled: true,
-            checkpoint_files: Vec::new(),
+            checkpoint_supported: true,
             checkpoint_dirs: Vec::new(),
             vcpus_paused: true,
             vcpus_failed: false,
@@ -314,11 +331,12 @@ pub fn restore(
                 .map_err(other)?;
             let mut device = Mem::new(control, region)?;
             device.freeze();
-            let artifact = saved.hotplug.as_ref().unwrap();
-            if artifact.len != state.memory_bytes() {
+            let length = saved.hotplug_len.unwrap();
+            if length != state.memory_bytes() {
                 return Err(invalid("hotplug RAM length mismatch"));
             }
-            let mut reader = checked_artifact(directory, artifact, "hotplug.bin")?;
+            file.seek(SeekFrom::Start(hotplug_offset))?;
+            let mut reader = (&mut file).take(length);
             device.restore_state(state, &mut reader)?;
             Some(Arc::new(Mutex::new(device)))
         } else {
@@ -337,7 +355,7 @@ pub fn restore(
         let accessible = vmm.guest_memory.clone();
         #[cfg(feature = "net")]
         let mut network_owed = Vec::new();
-        for (_index, record) in saved.devices.iter().enumerate() {
+        for record in &saved.devices {
             #[cfg(target_os = "linux")]
             if matches!(record.state, DeviceSnapshot::Memory(_)) {
                 continue;
@@ -514,51 +532,16 @@ pub fn restore(
                         (device, queues.clone())
                     }
                     #[cfg(feature = "blk")]
-                    DeviceSnapshot::Block(state, artifact, format) => {
-                        let image = utils::tempfile::TempFile::new().map_err(other)?;
-                        let mut source =
-                            checked_artifact(directory, artifact, &format!("disk-{_index}.img"))?;
-                        let mut destination = OpenOptions::new()
-                            .write(true)
-                            .truncate(true)
-                            .open(image.as_path())?;
-                        let copied = io::copy(&mut source, &mut destination)?;
-                        destination.sync_all()?;
-                        if copied != artifact.len {
-                            return Err(invalid("disk image length changed during import"));
-                        }
-                        validate_disk(&open_file(image.as_path())?, *format, state)?;
-                        let format = match format {
-                            0 => ImageType::Raw,
-                            1 => ImageType::Qcow2,
-                            _ => return Err(invalid("unsupported independent disk format")),
-                        };
-                        let readonly = state.device.avail_features & (1 << 5) != 0;
-                        let sync = if state.device.avail_features & (1 << 9) != 0 {
-                            devices::virtio::block::SyncMode::Full
-                        } else {
-                            devices::virtio::block::SyncMode::None
-                        };
-                        let mut block = Block::new(
-                            record.id.clone(),
-                            None,
-                            devices::virtio::block::CacheType::Writeback,
-                            image
-                                .as_path()
-                                .to_str()
-                                .ok_or_else(|| invalid("invalid image path"))?
-                                .into(),
-                            format,
-                            readonly,
-                            false,
-                            sync,
-                        )?;
-                        block.restore_state(state)?;
-                        vmm.checkpoint_files.push(image);
-                        (
-                            Arc::new(Mutex::new(block)),
-                            state.queue.clone().map(|q| vec![q]),
-                        )
+                    DeviceSnapshot::Block(state) => {
+                        let block = resources
+                            .block
+                            .list
+                            .iter()
+                            .find(|block| block.lock().unwrap().id() == &record.id)
+                            .ok_or_else(|| invalid("missing caller-provided disk"))?
+                            .clone();
+                        block.lock().unwrap().restore_state(state)?;
+                        (block, state.queue.clone().map(|q| vec![q]))
                     }
                     #[cfg(target_os = "linux")]
                     DeviceSnapshot::Memory(_) => unreachable!(),

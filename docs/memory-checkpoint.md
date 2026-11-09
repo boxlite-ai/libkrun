@@ -1,45 +1,44 @@
 # Memory checkpoints
 
-This workspace adds an experimental version-1 checkpoint container and an online
-C API. The shared device and RAM container supports Linux x86_64/KVM and macOS ARM64/HVF.
-A checkpoint includes RAM, vCPU/VM/clock/interrupt state, the device topology and
-state, and independent block images. Restore constructs a stopped VM directly
-from that state; it does not run the boot loader over restored memory.
+The experimental version-2 checkpoint is one file containing RAM,
+vCPU/VM/clock/interrupt state, and device topology and state. It supports
+Linux x86_64/KVM and macOS ARM64/HVF and is available by default, with no enable
+API. Disk image contents are managed entirely by the embedding application.
+Restore builds directly from saved state without running boot loaders.
 
 ## API
 
-Before starting a source VM:
+`ctx_id` is the VM handle returned by `krun_create_ctx()`. Configure the VM
+normally and call `krun_start_enter(ctx_id)`. That call consumes the configuration
+and owns its calling thread. The same handle identifies the running VM for
+synchronous control calls from another host thread:
 
 ```c
-int ctx = krun_create_ctx();
-krun_set_vm_config(ctx, 2, 256);
-krun_set_root(ctx, "/path/to/rootfs");
-/* Configure execution, disks, consoles, network and optional hotplug normally. */
-krun_set_checkpointing(ctx, true);
-krun_start_enter(ctx);
+int rc = krun_pause(ctx_id);
+if (rc != 0) { /* handle error */ }
+else {
+    rc = krun_save_checkpoint(ctx_id, "/path/to/state.checkpoint");
+    /* While still paused, save matching disks using the application's storage
+     * implementation. Assemble state.checkpoint + disk images in the upper layer.
+     * Resume only after every required artifact has been captured. */
+    int resume_rc = krun_resume(ctx_id);
+    /* Check rc and resume_rc. */
+}
 ```
 
-`krun_start_enter` still consumes the configuration and owns the calling thread.
-A separate host thread calls:
+`krun_pause` stops CPUs, freezes device writers and flushes/syncs disks. It also
+holds the event-loop barrier until `krun_resume`, so serial and timer events
+cannot change captured state. Repeated pause/resume is a no-op. Successful saves
+and storage failures both leave the VM paused. Saving a running VM returns
+`-EBUSY`; overlapping control requests also return `-EBUSY`. An unstarted VM
+returns `-EAGAIN`. Network streams disconnect on pause and UDP packets may be lost.
 
-```c
-int rc = krun_save_checkpoint(ctx, "/path/to/new-checkpoint", flatten, opaque);
-```
-
-The context ID remains valid for this request. The call is synchronous, including
-all flatten callbacks. Concurrent requests return `-EBUSY`. The destination must
-not exist. Successful publication uses an atomic directory rename after syncing
-the artifacts. Readers validate format, version, artifact lengths, resource
-budgets and saved CPU/device topology before releasing vCPUs. The container no longer stores
-SHA-256 checksums for metadata, RAM and disk artifacts; same-length content corruption is
-not detected by a checksum. Checkpoint contents must remain unchanged during
-import.
-
-On success, the original VM resumes. A file/export failure after a confirmed
-freeze also resumes it. `-ESHUTDOWN` is reserved for an unusable VM: vCPUs remain
-stopped, uncertain workers are stopped/joined, and the embedding process must be
-torn down. Later requests cannot resume it. Network streams may be disconnected
-by a checkpoint attempt even when the attempt fails.
+The destination is a new file; existing paths are refused with `-EEXIST`.
+The file is synced and published with an atomic rename without replacement,
+then its parent directory is synced. A failed directory sync can return an error
+after the complete file has been published. `-ESHUTDOWN` means the VM is unusable
+and permanently stopped; the embedding process must be torn down. Later requests
+cannot resume it.
 
 To restore in a new process:
 
@@ -47,34 +46,40 @@ To restore in a new process:
 int ctx = krun_create_ctx();
 krun_set_vm_config(ctx, 2, 256);
 krun_set_root(ctx, "/path/to/the-same-rootfs");
-/* Bind fresh console/network endpoints, and matching hotplug configuration. */
-krun_set_checkpoint_restore(ctx, "/path/to/checkpoint");
+krun_add_disk2(ctx, "data", "/path/to/restored-disk.raw",
+               KRUN_DISK_FORMAT_RAW, false);
+/* Bind fresh console/network endpoints and matching hotplug configuration. */
+krun_build_from_checkpoint(ctx, "/path/to/state.checkpoint");
 krun_start_enter(ctx);
 ```
 
-The configured memory size is an allocation budget for the saved boot RAM.
+`krun_build_from_checkpoint` selects the checkpoint on an existing configured
+context; `krun_start_enter` performs the build and starts execution. Boot RAM
+configuration is an allocation budget at least as large as saved boot RAM.
 Hotplug's initial/max sizes must match. CPU count and MMIO/GPA/IRQ topology come
-from the checkpoint. Block devices are recreated from the packaged images, not
-from source disk paths. A block-root boot's deleted bootstrap virtio-fs root is
-recreated internally; the restore caller need not configure that retired root.
+from the checkpoint. Bind exactly the saved disk device IDs, capacities and
+features using the normal disk APIs. Paths and image formats are supplied by the
+application. A block-root boot's retired bootstrap virtio-fs root is recreated
+internally and need not be configured by the restore caller.
+
+The file layout is a 16-byte header (magic, version, JSON length), JSON metadata,
+a RAM section using the version-1 RAM codec, and optional hotplug RAM bytes.
+Metadata records section lengths and disk device state, without disk paths or
+image data. Import validates the exact total length, RAM layout, resource budget,
+and CPU/device topology before releasing vCPUs. There are no content checksums;
+same-length corruption is not detected by a checksum. Keep the file unchanged
+during import. Version 1 directory checkpoints are not accepted by this API.
 
 ## Resources and consistency
 
-- Block workers finish the current request and flush/sync before capture. The
-  application must exclude other writers to the disk and its backing chain
-  during capture. The
-  callback receives `(device_id, source, destination, format, opaque)` and must
-  create an independent image of the same format and capacity. Return zero or a
-  negative errno. Do not modify the source or reenter VM control in the callback.
-  A null callback copies raw images; QCOW2 requires the application's existing
-  flatten function. Restore makes a private writable copy, so repeated restores
-  cannot mutate checkpoint artifacts. Guest disk IDs stay unchanged.
-- BoxLite's existing `Qcow2Helper::flatten` is the intended QCOW2 callback. The
-  reviewable patch in `patches/boxlite-flatten-tail-and-zero-clusters.patch` fixes
-  short final clusters written by imago and explicit QCOW2 zero clusters. It
-  modifies that existing function, not the image format or snapshot mechanism.
-  The main BoxLite checkout has not been changed. Apply the patch there before
-  using that helper for general QCOW2 checkpoint export.
+- Disk workers finish the current request and flush/sync at pause. Libkrun
+  captures only block device state, including queues and guest-visible disk ID.
+  There is no flatten callback or opaque pointer in the C API. The application
+  must exclude other writers, capture the disk and any backing chain while the
+  VM is paused, and supply corresponding writable images for each restore.
+  Libkrun validates device IDs, capacity and features; it cannot verify that
+  externally supplied disk contents match saved guest RAM. Repeated restores
+  need their own working images if writes must remain isolated.
 - Virtio-fs uses the same host directory's live contents. Inodes and handles are
   rebound by path and identity, never by old FD numbers. Deleted/replaced objects
   return guest errors on subsequent FUSE operations. Resource exhaustion, access
@@ -125,7 +130,6 @@ recreated internally; the restore caller need not configure that retired root.
 | console, block raw/QCOW2, fs, TSI/vsock, virtio-net, rng, balloon free-page reporting, virtio-mem | Connected to capture/restore |
 | nested virtualization, split irqchip, TEE | Unsupported |
 | GPU/input/sound and unrecognized devices, exported guest-memory aliases | Rejected; device/resource state is not silently discarded |
-| VMDK checkpoint export | Unsupported |
 | Linux aarch64 | Whole-VM checkpoint API returns `-ENOTSUP`; cross-compilation is not runtime validation |
 | macOS ARM64/HVF | Implemented; native and software GIC, 2-vCPU process-exit/repeated restore tested |
 
@@ -151,11 +155,14 @@ The container is versioned but is not yet a stable cross-release migration ABI.
 
 ## Validation
 
-`tests/checkpoint/host.c` calls the public C API. `guest.c` checks memory patterns,
-two pinned CPU counters, monotonic time, open-file I/O, direct block I/O or ext4
-rootfs I/O, and optional network/hotplug workloads. `run.py` exits the original
-process before restore, repeats save/restore, tests a duplicate destination and
-corrupt inputs, and retains JSON results and logs under `target/run-*`.
+`tests/checkpoint/host.c` calls the public pause/save/resume/build C API.
+`guest.c` checks memory patterns, two pinned CPU counters, monotonic time,
+open-file I/O, direct block I/O or ext4 rootfs I/O, and optional network/hotplug
+workloads. `run.py` checks that running saves fail, paused saves stay stopped, and explicit
+resume restarts execution. It copies disks in the application layer while paused,
+exits the original process before restore, and repeats save/restore. Missing or
+wrong-capacity disks, duplicate destinations and corrupt inputs are rejected.
+JSON results and logs remain under `target/run-*`.
 
 On Linux x86_64 with `/dev/kvm` and a matching `libkrunfw.so.5`:
 
@@ -167,7 +174,7 @@ KRUN_TEST_TSI=1 KRUN_TEST_FREEZE_FAILURE=1 LD_LIBRARY_PATH=/path/to/firmware pyt
 KRUN_TEST_DAX=1 KRUN_TEST_FAIL_EXPORT=1 LD_LIBRARY_PATH=/path/to/firmware python3 tests/checkpoint/run.py
 ```
 
-For QCOW2, build the adapter around the existing BoxLite source; it applies the
+For optional upper-layer QCOW2 testing, the existing adapter applies the
 patch only to a copy under this workspace's ignored `target` directory:
 
 ```sh
@@ -182,16 +189,17 @@ Hotplug requires guest firmware with `CONFIG_VIRTIO_MEM=y`; the host flag
 guest can allocate and touch 300 MiB before capturing a 256-to-384 MiB VM.
 The block-root fixture requires `mkfs.ext4` and tests its own generated rootfs.
 
-### Native HVF checkpoint validation (2026-11-06)
+### Native HVF checkpoint validation
 
 The local Apple Silicon host runs the shared C API fixture in distinct boot,
 restore and repeat-restore processes. Both native and software GIC runs verify
 memory patterns, two pinned CPU counters, virtual monotonic time excluding an
 offline delay, virtio-fs open handles, replaced-object errors and independent disk
-images. Corrupt metadata, truncated RAM and incompatible CPU state are rejected;
-failed restore joins its CPU/device threads. The export-failure case verifies
-source continuation, and the freeze-failure case verifies `-ESHUTDOWN` with the
-guest stopped and no published checkpoint.
+images supplied by the application. Corrupt metadata, truncated RAM and
+incompatible CPU state are rejected; failed restore joins its CPU/device threads.
+The export-failure case verifies the source stays paused and continues after
+explicit resume. The freeze-failure case verifies `-ESHUTDOWN` with the guest
+stopped and no published checkpoint.
 
 ```sh
 # Configure CC_LINUX for a static aarch64 Linux compiler/sysroot first.
@@ -219,8 +227,8 @@ contains all configured RAM, CPU and device state. This workload uses virtio-fs
 and has no attached block image or network backend, so it excludes disk-image
 copying/flattening. There is no RAM compression.
 
-Export is host monotonic time around `krun_save_checkpoint`, including freeze,
-RAM serialization, file sync, publication and source resume. Import is
+Export is host monotonic time around `krun_pause` plus `krun_save_checkpoint`,
+including freeze, RAM serialization, file sync and publication. The source stays paused. Import is
 host monotonic time from immediately before `krun_start_enter` until a restored
 guest writes its response through virtio-fs (100 us host polling interval and
 1 ms guest polling interval). Process startup and configuration are excluded.
@@ -268,17 +276,18 @@ back to full reads. All saved data is loaded before vCPUs resume: this is eager
 restore, with no snapshot-file mapping or userfaultfd. Existing plugged-memory
 streaming remains unchanged apart from removal of its checksum.
 
-The standalone in-memory RAM codec still uses version 1 and remains byte-compatible
-with the sparse RAM file. The whole-VM container remains experimental version 1: its header is
-16 bytes, followed by JSON metadata, and artifacts record names and lengths only.
+The standalone RAM codec still uses version 1. The whole-VM container is version 2;
+its RAM section embeds those same codec bytes at the offset following JSON metadata.
 
 The benchmark now reports both logical snapshot bytes and `st_blocks * 512`
 allocated bytes.
 
-The following measurements use the hosts and benchmark method described above,
+The following historical measurements used the previous version-1 directory
+container and automatic resume after save; they are not measurements of the new API.
+They use the hosts and benchmark method described above,
 a release build, two vCPUs, half-filled pseudorandom guest memory and warm-cache import.
 Each value is the median of five measured iterations. Allocated MiB includes
-RAM and state files; logical file size is still approximately configured RAM.
+RAM and state files in that older container; logical file size is still approximately configured RAM.
 
 | Platform | RAM (MiB) | Export (ms) | Import (ms) | Allocated (MiB) |
 | --- | ---: | ---: | ---: | ---: |

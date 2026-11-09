@@ -79,10 +79,11 @@ the host target never decreases.
 
 ### Memory checkpoints (Linux x86_64/KVM and macOS ARM64/HVF)
 
-`krun_set_checkpointing`, `krun_save_checkpoint`, and
-`krun_set_checkpoint_restore` support saving a running VM and resuming it in a
-new process. Block images are packaged independently; virtio-fs reuses live host
-directories, and network streams can disconnect. See
+`krun_pause`, `krun_resume`, `krun_save_checkpoint`, and
+`krun_build_from_checkpoint` are available without an enable flag. Save requires
+a paused VM and writes RAM, CPU and device state to one file. The application
+saves disks separately while paused and supplies matching images on restore.
+Virtio-fs reuses live host directories; network streams disconnect on pause. See
 [the checkpoint API, resource contracts, support limits and tests](docs/memory-checkpoint.md).
 
 ## Networking

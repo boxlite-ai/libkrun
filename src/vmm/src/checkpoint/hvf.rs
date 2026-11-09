@@ -129,7 +129,7 @@ impl Vmm {
 }
 pub(super) fn validate(saved: &Metadata) -> io::Result<()> {
     if saved.arch_memory[4] != unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64
-        || saved.hotplug.is_some()
+        || saved.hotplug_len.is_some()
         || !saved.irq_counts.is_empty()
         || saved.vm.pending.len() != saved.cpus.len()
         || saved.vm.gic.is_empty()
@@ -226,8 +226,7 @@ pub(super) fn build(
         },
         kernel_cmdline: cmdline,
         vcpus_handles: Vec::new(),
-        checkpoint_enabled: true,
-        checkpoint_files: Vec::new(),
+        checkpoint_supported: true,
         checkpoint_dirs: Vec::new(),
         vcpus_paused: true,
         vcpus_failed: false,

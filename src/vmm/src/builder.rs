@@ -102,7 +102,6 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
-    UnsupportedCheckpointConfiguration,
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     #[cfg(target_os = "macos")]
@@ -235,7 +234,6 @@ impl Display for StartMicrovmError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         use self::StartMicrovmError::*;
         match *self {
-            UnsupportedCheckpointConfiguration => write!(f, "Checkpointing requires Linux x86_64 KVM without nested virtualization or split irqchip"),
             AttachBlockDevice(ref err) => {
                 write!(f, "Unable to attach block device to Vmm. Error: {err}")
             }
@@ -566,22 +564,6 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
-    if vm_resources.checkpoint_enabled
-        && (!cfg!(all(
-            not(feature = "tee"),
-            any(
-                all(target_os = "linux", target_arch = "x86_64"),
-                all(target_os = "macos", target_arch = "aarch64")
-            )
-        )) || vm_resources.nested_enabled
-            || vm_resources.split_irqchip)
-    {
-        return Err(StartMicrovmError::UnsupportedCheckpointConfiguration);
-    }
-    #[cfg(target_os = "macos")]
-    if vm_resources.checkpoint_enabled && vm_resources.serial_consoles.len() > 1 {
-        return Err(StartMicrovmError::UnsupportedCheckpointConfiguration);
-    }
     let payload = choose_payload(vm_resources)?;
 
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
@@ -992,10 +974,11 @@ pub fn build_microvm(
                 all(target_os = "macos", target_arch = "aarch64")
             )
         ))]
-        checkpoint_enabled: vm_resources.checkpoint_enabled,
+        checkpoint_supported: !vm_resources.nested_enabled
+            && !vm_resources.split_irqchip
+            && (cfg!(target_os = "linux") || vm_resources.serial_consoles.len() <= 1),
         #[cfg(target_os = "macos")]
         hvf_state: crate::checkpoint::hvf::Runtime::new(intc.clone(), vcpu_list.clone()),
-        checkpoint_files: Vec::new(),
         checkpoint_dirs: Vec::new(),
         vcpus_paused: true,
         vcpus_failed: false,
@@ -1383,26 +1366,16 @@ fn load_payload(
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
 
-            let kernel_region = if _vm_resources.checkpoint_enabled {
-                let region =
-                    MmapRegion::new(kernel_size).map_err(StartMicrovmError::InvalidKernelBundle)?;
-                // The bundle is readable for kernel_size bytes, as in the
-                // existing borrowed mapping. The new anonymous region is owned
-                // exclusively by this VM and cannot alias libkrunfw globals.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        kernel_host_addr as *const u8,
-                        region.as_ptr(),
-                        kernel_size,
-                    );
-                }
-                region
-            } else {
-                unsafe {
-                    MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
-                        .map_err(StartMicrovmError::InvalidKernelBundle)?
-                }
-            };
+            let kernel_region =
+                MmapRegion::new(kernel_size).map_err(StartMicrovmError::InvalidKernelBundle)?;
+            // Every VM owns its kernel RAM so it can be checkpointed.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    kernel_host_addr as *const u8,
+                    kernel_region.as_ptr(),
+                    kernel_size,
+                );
+            }
 
             Ok((
                 guest_mem

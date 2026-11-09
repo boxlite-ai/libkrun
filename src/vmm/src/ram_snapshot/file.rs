@@ -10,10 +10,26 @@ mod pages;
 
 const COPY_CHUNK: usize = 1024 * 1024;
 
+pub(crate) fn file_size(memory: &GuestMemoryMmap) -> io::Result<u64> {
+    memory.iter().try_fold(
+        HEADER_LEN + memory.num_regions() as u64 * REGION_LEN,
+        |total, region| {
+            total
+                .checked_add(region.len())
+                .ok_or_else(|| invalid("RAM length overflow"))
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn save_file(memory: &GuestMemoryMmap, file: &mut File) -> io::Result<()> {
+    save_file_at(memory, file, 0)
+}
+
 /// Writers must be frozen throughout the query and copy. Only private anonymous
 /// mappings can omit pages without consulting a backing object. Failed queries
 /// fall back to copying, never to assuming that a page is empty.
-pub(crate) fn save_file(memory: &GuestMemoryMmap, file: &mut File) -> io::Result<()> {
+pub(crate) fn save_file_at(memory: &GuestMemoryMmap, file: &mut File, base: u64) -> io::Result<()> {
     let mut header = Vec::from(MAGIC.as_slice());
     header.extend_from_slice(&VERSION.to_le_bytes());
     let count = u32::try_from(memory.num_regions()).map_err(|_| invalid("too many RAM regions"))?;
@@ -31,10 +47,13 @@ pub(crate) fn save_file(memory: &GuestMemoryMmap, file: &mut File) -> io::Result
         header.extend_from_slice(&0u64.to_le_bytes());
     }
     // Truncate first, so reusing a file cannot leave old data inside a new hole.
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
+    file.set_len(base)?;
+    file.seek(SeekFrom::Start(base))?;
     file.write_all(&header)?;
-    file.set_len(total)?;
+    file.set_len(
+        base.checked_add(total)
+            .ok_or_else(|| invalid("RAM offset overflow"))?,
+    )?;
     // SAFETY: sysconf has no pointer arguments or side effects on mappings.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {
@@ -42,7 +61,7 @@ pub(crate) fn save_file(memory: &GuestMemoryMmap, file: &mut File) -> io::Result
     }
     let page_size = page_size as usize;
     let mut buffer = vec![0; COPY_CHUNK];
-    let mut file_offset = header.len() as u64;
+    let mut file_offset = base + header.len() as u64;
     for region in memory.iter() {
         let len = region.len() as usize;
         let allocated = if region.file_offset().is_none()
@@ -85,15 +104,33 @@ pub(crate) fn save_file(memory: &GuestMemoryMmap, file: &mut File) -> io::Result
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn file_metadata(file: &mut File) -> io::Result<Metadata> {
-    file.seek(SeekFrom::Start(0))?;
-    read_metadata(file, file.metadata()?.len())
+    file_metadata_at(file, 0, file.metadata()?.len())
+}
+
+pub(crate) fn file_metadata_at(file: &mut File, offset: u64, len: u64) -> io::Result<Metadata> {
+    file.seek(SeekFrom::Start(offset))?;
+    read_metadata(&mut file.take(len), len)
 }
 
 /// Eagerly load every data extent into fresh anonymous RAM. File holes remain
 /// demand-zero anonymous pages; there is no file mapping or deferred data load.
 /// The caller validates the layout/resource budget before invoking this method.
+#[cfg(test)]
 pub(crate) fn restore_file(file: &File, metadata: &Metadata) -> io::Result<GuestMemoryMmap> {
+    let expected = HEADER_LEN + metadata.regions.len() as u64 * REGION_LEN + metadata.memory_bytes;
+    if file.metadata()?.len() != expected {
+        return Err(invalid("RAM image length changed during import"));
+    }
+    restore_file_at(file, metadata, 0)
+}
+
+pub(crate) fn restore_file_at(
+    file: &File,
+    metadata: &Metadata,
+    offset: u64,
+) -> io::Result<GuestMemoryMmap> {
     let ranges: Vec<_> = metadata
         .regions
         .iter()
@@ -101,7 +138,7 @@ pub(crate) fn restore_file(file: &File, metadata: &Metadata) -> io::Result<Guest
         .collect();
     let memory = GuestMemoryMmap::from_ranges(&ranges).map_err(io::Error::other)?;
     let mut buffer = vec![0; COPY_CHUNK];
-    let mut base = HEADER_LEN + metadata.regions.len() as u64 * REGION_LEN;
+    let mut base = offset + HEADER_LEN + metadata.regions.len() as u64 * REGION_LEN;
     for region in &metadata.regions {
         let end = base + region.len;
         let mut cursor = base;
@@ -121,7 +158,7 @@ pub(crate) fn restore_file(file: &File, metadata: &Metadata) -> io::Result<Guest
         }
         base = end;
     }
-    if file.metadata()?.len() != base {
+    if file.metadata()?.len() < base {
         return Err(invalid("RAM image length changed during import"));
     }
     Ok(memory)
@@ -227,6 +264,33 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, super::super::save(&memory).unwrap());
+    }
+
+    #[test]
+    fn ram_section_preserves_container_header_and_bounds_reads() {
+        let snapshot = TempFile::new().unwrap();
+        let mut file = snapshot.as_file().try_clone().unwrap();
+        let prefix = b"checkpoint metadata";
+        file.write_all(prefix).unwrap();
+        let offset = prefix.len() as u64;
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        memory
+            .write_slice(b"guest memory", GuestAddress(4096))
+            .unwrap();
+        let len = file_size(&memory).unwrap();
+        save_file_at(&memory, &mut file, offset).unwrap();
+        file.seek(SeekFrom::Start(offset + len)).unwrap();
+        file.write_all(b"hotplug section").unwrap();
+        let mut actual_prefix = vec![0; prefix.len()];
+        file.read_exact_at(&mut actual_prefix, 0).unwrap();
+        assert_eq!(actual_prefix, prefix);
+        let layout = file_metadata_at(&mut file, offset, len).unwrap();
+        let restored = restore_file_at(&file, &layout, offset).unwrap();
+        let mut bytes = [0; 12];
+        restored.read_slice(&mut bytes, GuestAddress(4096)).unwrap();
+        assert_eq!(&bytes, b"guest memory");
+        assert!(file_metadata_at(&mut file, offset, len - 1).is_err());
+        assert!(file_metadata_at(&mut file, offset, len + 1).is_err());
     }
 
     #[test]

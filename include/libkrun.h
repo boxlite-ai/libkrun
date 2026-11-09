@@ -26,42 +26,35 @@ int32_t krun_set_memory_hotplug(uint32_t ctx_id, uint32_t max_mib);
 int32_t krun_request_memory(uint32_t ctx_id, uint32_t total_mib);
 int32_t krun_get_memory_status(uint32_t ctx_id, struct krun_memory_status *status);
 
-/* Experimental checkpoint container version 1, Linux x86_64/KVM and macOS ARM64/HVF.
- * Configure before start_enter. Checkpoint mode owns the kernel's RAM and
- * preserves virtio-fs DAX mappings. Unsupported platforms return -ENOTSUP.
- * External virtio-fs contents remain live. Missing/replaced objects yield guest
- * FUSE errors; missing/replaced/truncated DAX backing files reject restore.
- * HVF DAX backing files require host read/write access even for read-only guests.
+/* Experimental single-file checkpoints, Linux x86_64/KVM and macOS ARM64/HVF.
+ * Available by default; unsupported platforms/configurations return -ENOTSUP.
+ * ctx_id is the VM handle returned by krun_create_ctx(). After start_enter
+ * consumes its configuration, the same handle identifies the running VM.
+ * Call pause/resume/save from another host thread. All calls are synchronous;
+ * overlapping control requests return -EBUSY, and an unstarted VM gives -EAGAIN.
+ * Pause freezes CPUs and devices and flushes block storage. Repeated pause or
+ * resume is a no-op. Streams disconnect on pause; UDP packets may be lost.
+ * -ESHUTDOWN means the VM is permanently stopped; tear down its process.
  */
-int32_t krun_set_checkpointing(uint32_t ctx_id, bool enabled);
-/* Restore uses start_enter with the existing ctx lifecycle, bypassing all boot
- * loaders. Bind the original fs roots and fresh console endpoints in ctx first.
- * Configure a boot RAM budget at least as large as the saved boot RAM; hotplug
- * configuration must also match. Disks come from the checkpoint's independent
- * images and are copied to private writable working files on restore. A block
- * rootfs's retired bootstrap share is recreated internally. Network endpoints
- * must be fresh; stream sessions are disconnected and UDP may lose packets.
+int32_t krun_pause(uint32_t ctx_id);
+int32_t krun_resume(uint32_t ctx_id);
+/* Requires a paused VM (-EBUSY otherwise). Saves RAM, CPU and device state to
+ * one new file; never includes disk image contents. Success and storage errors
+ * leave the VM paused. Existing paths are refused (-EEXIST). The application
+ * must save matching disks while paused and assemble its own combined artifact.
  */
-int32_t krun_set_checkpoint_restore(uint32_t ctx_id, const char *directory);
-/* Application's existing flatten implementation. format: 0=raw, 1=QCOW2.
- * Write a standalone image of the same format at destination, with no backing
- * chain. Source is flushed and frozen for the entire callback. Return 0 or a
- * negative errno. Do not modify source or reenter VM control from this callback.
+int32_t krun_save_checkpoint(uint32_t ctx_id, const char *file_path);
+/* Select a checkpoint file on a configured ctx, before start_enter. That call
+ * builds from saved state, bypasses boot loaders, and starts execution. Bind
+ * matching disks by their original device IDs using krun_add_disk* first;
+ * disk capacity/features must match. The application owns image restoration.
+ * Bind original fs roots and fresh console/network endpoints. Boot RAM budget
+ * must cover saved boot RAM; hotplug configuration must match. A retired block
+ * rootfs bootstrap share is recreated internally. Virtio-fs contents stay live;
+ * DAX mappings are preserved, but missing/replaced/truncated backing files
+ * reject restore. HVF DAX backing files require host read/write access.
  */
-typedef int32_t (*krun_checkpoint_flatten_fn)(const char *id, const char *source,
-    const char *destination, uint32_t format, void *opaque);
-/* Call from a separate host thread after start_enter consumed ctx. ctx_id stays
- * valid for online checkpoint requests. This call blocks until all callbacks
- * finish; opaque must remain valid until return. NULL flatten copies raw images
- * and returns -ENOTSUP for QCOW2. Existing destination directories are refused.
- * On success the original VM continues. A storage error after a confirmed
- * freeze also resumes it; uncertain worker/CPU outcomes disable the VM instead.
- * -ESHUTDOWN means the VM is permanently stopped and the owner must tear down
- * its process; subsequent requests cannot resume it. Other errors leave a
- * running source VM usable. Network streams may be disconnected by the attempt.
- */
-int32_t krun_save_checkpoint(uint32_t ctx_id, const char *directory,
-    krun_checkpoint_flatten_fn flatten, void *opaque);
+int32_t krun_build_from_checkpoint(uint32_t ctx_id, const char *file_path);
 
 /**
  * Sets the log level for the library.

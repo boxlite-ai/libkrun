@@ -66,7 +66,7 @@ def main():
         "library_sha256": hashlib.sha256(lib.read_bytes()).hexdigest(),
         "profile": "release", "vcpus": 2, "guest_filled_fraction": 0.5,
         "payload": "Full RAM + CPU + device state; virtio-fs root; no block disks or network",
-        "export_scope": "krun_save_checkpoint call through return, including fsync and resume",
+        "export_scope": "krun_pause + krun_save_checkpoint through return, including fsync; source stays paused",
         "import_scope": "krun_start_enter through first restored guest response, excluding later integrity scan",
         "cache": "all snapshot files read before import; no global cache eviction",
         "warmups_per_size": 1, "repeats_per_size": args.repeats,
@@ -117,7 +117,7 @@ def main():
                     raise RuntimeError(log.read_text())
                 export_ns = int(match[1])
                 stop(source_proc)
-                artifacts = [p for p in snapshot.rglob("*") if p.is_file()]
+                artifacts = [snapshot]
                 snapshot_bytes = sum(p.stat().st_size for p in artifacts)
                 allocated_bytes = sum(p.stat().st_blocks * 512 for p in artifacts)
                 # Explicit warm-cache condition, outside the import timer.
@@ -143,7 +143,7 @@ def main():
             finally:
                 stop(source_proc)
                 stop(restored_proc)
-            shutil.rmtree(snapshot)
+            snapshot.unlink()
         samples = [s for s in result["samples"] if s["memory_mib"] == size and not s["warmup"]]
         row = {"memory_mib": size}
         for name in ("export_ms", "import_ms"):

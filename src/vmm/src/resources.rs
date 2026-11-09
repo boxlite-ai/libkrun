@@ -128,9 +128,6 @@ pub enum VsockConfig {
 /// held in the Vmm.
 #[derive(Default)]
 pub struct VmResources {
-    /// Own kernel RAM and register checkpoint control. DAX windows retain their
-    /// normal configuration and are restored separately from ordinary RAM.
-    pub checkpoint_enabled: bool,
     #[cfg(all(target_os = "linux", not(feature = "tee")))]
     pub memory_hotplug: Option<std::sync::Arc<devices::virtio::mem::MemoryControl>>,
     /// The vCpu and memory configuration for this microVM.
@@ -413,7 +410,6 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
-            checkpoint_enabled: false,
             #[cfg(all(target_os = "linux", not(feature = "tee")))]
             memory_hotplug: None,
             vm_config: VmConfig::default(),

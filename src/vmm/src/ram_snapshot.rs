@@ -11,7 +11,7 @@ use std::io::{self, Read};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 mod file;
-pub(crate) use file::{file_metadata, restore_file, save_file};
+pub(crate) use file::{file_metadata_at, file_size, restore_file_at, save_file_at};
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";
 const VERSION: u32 = 1;

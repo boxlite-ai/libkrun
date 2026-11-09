@@ -2,7 +2,7 @@
 
 //! Whole-VM checkpoint ownership. Operations run on the event-loop thread;
 //! its subscriber callback is the barrier for event-loop memory writers.
-//! Block image flattening belongs to the caller's existing image implementation.
+//! Disk image contents belong to the embedding application.
 
 #[cfg(target_os = "macos")]
 pub(crate) mod hvf;
@@ -17,7 +17,7 @@ const PLATFORM: &str = "linux-x86_64-kvm";
 const PLATFORM: &str = "macos-aarch64-hvf";
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -34,7 +34,7 @@ use devices::virtio::net::{Net, NetCheckpoint};
 use devices::virtio::persist::{EventDeviceState, MmioTransportState, QueueState};
 use devices::virtio::vsock::{Vsock, VsockState};
 #[cfg(feature = "blk")]
-use devices::virtio::{block::BlockState, block::ImageType, Block};
+use devices::virtio::{block::BlockState, Block};
 use devices::virtio::{Balloon, Console, Fs, MmioTransport, Rng, VirtioDevice};
 
 use serde::{Deserialize, Serialize};
@@ -47,14 +47,9 @@ use crate::Vmm;
 pub use restore::restore;
 
 const MAGIC: &[u8; 8] = b"KRUNVM\0\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Called only after all guest/device writers stopped and disk sync completed.
-/// Produce a standalone image at destination, without modifying source. For
-/// QCOW2 the application should invoke its existing flatten implementation.
-pub type Flatten<'a> = dyn FnMut(&str, &Path, &Path, u32) -> io::Result<()> + 'a;
 
 fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
@@ -65,19 +60,12 @@ fn other(error: impl std::fmt::Debug) -> io::Error {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Artifact {
-    name: String,
-    len: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Metadata {
     version: u32,
     platform: String,
     arch_memory: [u64; 8],
-    ram: Artifact,
-    hotplug: Option<Artifact>,
+    ram_len: u64,
+    hotplug_len: Option<u64>,
     vm: VmState,
     cpus: Vec<Box<VcpuState>>,
     devices: Vec<DeviceRecord>,
@@ -119,7 +107,7 @@ enum DeviceSnapshot {
     #[cfg(target_os = "linux")]
     Memory(MemState),
     #[cfg(feature = "blk")]
-    Block(BlockState, Artifact, u32),
+    Block(BlockState),
 }
 
 struct LiveDevice {
@@ -133,10 +121,6 @@ struct LiveDevice {
 
 impl Drop for Vmm {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        if !self.checkpoint_enabled {
-            return;
-        }
         // Rust would otherwise drop guest_memory before vcpus_handles. In a
         // failed restore, no event-loop owner remains to retain the VM for us.
         for handle in &mut self.vcpus_handles {
@@ -216,7 +200,10 @@ impl Vmm {
                     ));
                 }
                 if locked.shm_region().is_some() && !any.is::<Fs>() {
-                    return Err(invalid("checkpoint cannot capture shared host mappings"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "checkpoint cannot capture shared host mappings",
+                    ));
                 }
                 if let Some(console) = any.downcast_ref::<Console>() {
                     console.check_snapshot_support().map_err(other)?;
@@ -238,57 +225,31 @@ impl Vmm {
         Ok(result)
     }
 
-    /// Save and resume a VM. Must be called by its event-loop thread with no
-    /// concurrent event dispatch or external guest-memory aliases. The runtime
-    /// C request path provides that ownership; direct Rust callers must too.
-    pub fn save_checkpoint(&mut self, path: &Path, flatten: &mut Flatten<'_>) -> io::Result<()> {
-        let result = self.save_checkpoint_inner(path, flatten);
-        if !self.vcpus_failed {
-            let recovery = (|| {
-                if let Some(bus) = self.mmio_device_manager.get_device(
-                    devices::DeviceType::Virtio(devices::virtio::TYPE_VSOCK),
-                    "vsock",
-                ) {
-                    let bus = bus.lock().unwrap();
-                    let device = bus
-                        .as_any()
-                        .downcast_ref::<MmioTransport>()
-                        .unwrap()
-                        .device();
-                    if let Some(vsock) = device.lock().unwrap().as_mut_any().downcast_mut::<Vsock>()
-                    {
-                        vsock.recover_quiesced()?;
-                    };
-                }
-                Ok(())
-            })();
-            if let Err(error) = recovery {
-                let devices = self.checkpoint_devices().unwrap_or_default();
-                self.abort_checkpoint(&devices);
-                return Err(error);
-            }
-        }
-        result
+    pub fn is_paused(&self) -> bool {
+        self.vcpus_paused
     }
 
-    fn save_checkpoint_inner(&mut self, path: &Path, flatten: &mut Flatten<'_>) -> io::Result<()> {
-        if !self.checkpoint_enabled || self.vcpus_failed || self.vcpus_paused {
-            return Err(invalid("checkpoint requires an enabled, running VM"));
+    /// Called by the event-loop owner, which must keep event dispatch stopped
+    /// until resume. The C runtime also quiesces vsock before taking VM locks.
+    pub fn pause(&mut self) -> io::Result<()> {
+        if self.vcpus_failed {
+            return Err(io::Error::from_raw_os_error(libc::ESHUTDOWN));
         }
-        let devices = self.checkpoint_devices()?;
-        let bindings = self.irq_bindings(&devices)?;
-        if path.exists() {
-            return Err(io::Error::from_raw_os_error(libc::EEXIST));
+        if self.vcpus_paused {
+            return Ok(());
         }
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let staging = utils::tempdir::TempDir::new_with_prefix(
-            parent.canonicalize()?.join(".krun-checkpoint-"),
-        )
-        .map_err(other)?;
-        // Online hotplug targets join the same boundary as guest requests.
+        let devices = match self.checkpoint_devices().and_then(|devices| {
+            if !self.checkpoint_supported {
+                return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+            }
+            Ok(devices)
+        }) {
+            Ok(devices) => devices,
+            Err(error) => {
+                self.recover_quiesced_vsock()?;
+                return Err(error);
+            }
+        };
         #[cfg(target_os = "linux")]
         for device in &devices {
             if let Some(memory) = device
@@ -302,17 +263,87 @@ impl Vmm {
             }
         }
         let deadline = Instant::now() + CONTROL_TIMEOUT;
-        if let Err(error) = self.pause_vcpus(deadline) {
+        let result = (|| {
+            self.pause_vcpus(deadline).map_err(other)?;
+            for device in &devices {
+                freeze_device(&mut *device.device.lock().unwrap(), deadline)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
             self.abort_checkpoint(&devices);
-            return Err(other(error));
         }
-        for device in &devices {
-            let frozen = freeze_device(&mut *device.device.lock().unwrap(), deadline);
-            if let Err(error) = frozen {
-                self.abort_checkpoint(&devices);
-                return Err(error);
+        result
+    }
+
+    fn recover_quiesced_vsock(&mut self) -> io::Result<()> {
+        if let Some(bus) = self.mmio_device_manager.get_device(
+            devices::DeviceType::Virtio(devices::virtio::TYPE_VSOCK),
+            "vsock",
+        ) {
+            let bus = bus.lock().unwrap();
+            let device = bus
+                .as_any()
+                .downcast_ref::<MmioTransport>()
+                .unwrap()
+                .device();
+            let mut device = device.lock().unwrap();
+            if let Some(vsock) = device.as_mut_any().downcast_mut::<Vsock>() {
+                if let Err(error) = vsock.recover_quiesced() {
+                    drop(device);
+                    drop(bus);
+                    let devices = self.checkpoint_devices().unwrap_or_default();
+                    self.abort_checkpoint(&devices);
+                    return Err(error);
+                }
             }
         }
+        Ok(())
+    }
+
+    pub fn resume(&mut self) -> io::Result<()> {
+        if self.vcpus_failed {
+            return Err(io::Error::from_raw_os_error(libc::ESHUTDOWN));
+        }
+        if !self.vcpus_paused {
+            return Ok(());
+        }
+        let devices = self.checkpoint_devices()?;
+        let result = (|| {
+            for device in &devices {
+                resume_device(&mut *device.device.lock().unwrap())?;
+            }
+            self.resume_vcpus().map_err(other)
+        })();
+        if result.is_err() {
+            self.abort_checkpoint(&devices);
+        }
+        result
+    }
+
+    /// Save a confirmed paused VM. Storage failures and success both preserve
+    /// the pause so the application can capture disks at the same boundary.
+    pub fn save_checkpoint(&mut self, path: &Path) -> io::Result<()> {
+        if self.vcpus_failed {
+            return Err(io::Error::from_raw_os_error(libc::ESHUTDOWN));
+        }
+        if !self.vcpus_paused {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        let devices = self.checkpoint_devices()?;
+        let bindings = self.irq_bindings(&devices)?;
+        if path.try_exists()? {
+            return Err(io::Error::from_raw_os_error(libc::EEXIST));
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let staging = utils::tempdir::TempDir::new_with_prefix(
+            parent.canonicalize()?.join(".krun-checkpoint-"),
+        )
+        .map_err(other)?;
+        let staged_file = staging.as_path().join("checkpoint");
         #[cfg(target_os = "linux")]
         let mut detached = 0;
         let mut counts = Vec::new();
@@ -325,14 +356,10 @@ impl Vmm {
                 }
                 counts.push(drain(event)?);
             }
-            self.write_checkpoint(staging.as_path(), &devices, counts.clone(), flatten)
+            self.write_checkpoint(&staged_file, &devices, counts.clone())
         })();
-        if let Err(error) = &saved {
-            error!("checkpoint capture failed: {error}");
-        }
-        // Even storage/flatten failure releases a confirmed barrier. An unknown
-        // control/IRQ outcome instead permanently disables and stops the VM.
-        let resumed = (|| {
+        // Restore IRQ delivery without restarting CPU/device writers.
+        let recovered: io::Result<()> = (|| {
             #[cfg(target_os = "linux")]
             for (index, (event, irq)) in bindings.iter().take(detached).enumerate() {
                 if let Some(&count) = counts.get(index) {
@@ -342,19 +369,15 @@ impl Vmm {
                 }
                 self.vm.fd().register_irqfd(event, *irq).map_err(other)?;
             }
-            for device in &devices {
-                resume_device(&mut *device.device.lock().unwrap())?;
-            }
-            self.resume_vcpus().map_err(other)
+            Ok(())
         })();
-        if let Err(error) = resumed {
+        if let Err(error) = recovered {
             self.abort_checkpoint(&devices);
             return Err(error);
         }
         saved?;
-        publish(staging.as_path(), path)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        publish(&staged_file, path)?;
+        File::open(parent)?.sync_all()
     }
 
     fn abort_checkpoint(&mut self, devices: &[LiveDevice]) {
@@ -404,10 +427,9 @@ impl Vmm {
 
     fn write_checkpoint(
         &mut self,
-        directory: &Path,
+        path: &Path,
         devices: &[LiveDevice],
         irq_counts: Vec<u64>,
-        _flatten: &mut Flatten<'_>,
     ) -> io::Result<()> {
         if self.exit_code.load(std::sync::atomic::Ordering::Acquire) != i32::MAX {
             return Err(invalid("VM is exiting"));
@@ -419,7 +441,7 @@ impl Vmm {
         }
         let ordinary_memory = without_dax(&self.guest_memory, devices)?;
         #[cfg(target_os = "linux")]
-        let (memory_device, memory_guard, memory_state, accessible, ram, hotplug_artifact) = {
+        let (memory_device, memory_guard, memory_state, accessible, boot) = {
             let memory_device = devices
                 .iter()
                 .find(|d| d.device.lock().unwrap().as_any().is::<Mem>());
@@ -437,33 +459,18 @@ impl Vmm {
                 Some(device) => unsafe { device.accessible_memory(&self.guest_memory)? },
                 None => boot.clone(),
             };
-            let ram = write_ram(directory, &boot)?;
-            let hotplug_artifact = if let Some(device) = hotplug {
-                let mut file = create_file(&directory.join("hotplug.bin"))?;
-                device.save_memory(&mut file)?;
-                file.sync_all()?;
-                Some(artifact(directory, "hotplug.bin")?)
-            } else {
-                None
-            };
             let memory_state = hotplug.map(Mem::save_state).transpose()?;
-            (
-                memory_device,
-                memory_guard,
-                memory_state,
-                accessible,
-                ram,
-                hotplug_artifact,
-            )
+            (memory_device, memory_guard, memory_state, accessible, boot)
         };
         #[cfg(target_os = "macos")]
-        let (accessible, ram, hotplug_artifact) = (
-            self.guest_memory.clone(),
-            write_ram(directory, &ordinary_memory)?,
-            None,
-        );
+        let (accessible, boot) = (self.guest_memory.clone(), ordinary_memory);
+        let ram_len = crate::ram_snapshot::file_size(&boot)?;
+        #[cfg(target_os = "linux")]
+        let hotplug_len = memory_state.as_ref().map(MemState::memory_bytes);
+        #[cfg(target_os = "macos")]
+        let hotplug_len = None;
         let mut records = Vec::new();
-        for (_index, live) in devices.iter().enumerate() {
+        for live in devices {
             let transport = {
                 let bus = self
                     .mmio_device_manager
@@ -536,32 +543,7 @@ impl Vmm {
                         .ok_or_else(|| invalid("unsupported checkpoint device"))?;
                     let state = block.save_state()?;
                     let queues = state.queue.clone().map(|q| vec![q]);
-                    let (source, format) = block.checkpoint_source()?;
-                    let format = match format {
-                        ImageType::Raw => 0,
-                        ImageType::Qcow2 => 1,
-                        ImageType::Vmdk => {
-                            return Err(invalid("standalone VMDK export is not implemented"))
-                        }
-                    };
-                    let name = format!("disk-{_index}.img");
-                    _flatten(&live.id, source, &directory.join(&name), format)?;
-                    block.checkpoint_source()?;
-                    let image = open_file(&directory.join(&name))?;
-                    validate_disk(&image, format, &state)?;
-                    use std::os::unix::fs::MetadataExt;
-                    let source_meta = std::fs::metadata(source)?;
-                    let target_meta = image.metadata()?;
-                    if source_meta.dev() == target_meta.dev()
-                        && source_meta.ino() == target_meta.ino()
-                    {
-                        return Err(invalid("flatten output aliases the source disk"));
-                    }
-                    image.sync_all()?;
-                    (
-                        DeviceSnapshot::Block(state, artifact(directory, &name)?, format),
-                        queues,
-                    )
+                    (DeviceSnapshot::Block(state), queues)
                 }
                 #[cfg(not(feature = "blk"))]
                 {
@@ -667,8 +649,8 @@ impl Vmm {
                 info.firmware_addr,
                 0,
             ],
-            ram,
-            hotplug: hotplug_artifact,
+            ram_len,
+            hotplug_len,
             #[cfg(target_os = "linux")]
             vm: self.vm.save_state().map_err(other)?,
             #[cfg(target_os = "macos")]
@@ -682,13 +664,24 @@ impl Vmm {
         if bytes.len() > MAX_METADATA {
             return Err(invalid("checkpoint metadata exceeds limit"));
         }
-        let mut file = create_file(&directory.join("state.bin"))?;
+        let mut file = create_file(path)?;
         file.write_all(MAGIC)?;
         file.write_all(&VERSION.to_le_bytes())?;
         file.write_all(&(bytes.len() as u32).to_le_bytes())?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
-        File::open(directory)?.sync_all()
+        let ram_offset = file.stream_position()?;
+        crate::ram_snapshot::save_file_at(&boot, &mut file, ram_offset)?;
+        file.seek(SeekFrom::Start(ram_offset + ram_len))?;
+        #[cfg(target_os = "linux")]
+        if let Some(live) = memory_device {
+            let device = live.device.lock().unwrap();
+            device
+                .as_any()
+                .downcast_ref::<Mem>()
+                .unwrap()
+                .save_memory(&mut file)?;
+        }
+        file.sync_all()
     }
 }
 
@@ -783,41 +776,6 @@ fn create_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-#[cfg(feature = "blk")]
-fn validate_disk(file: &File, format: u32, state: &BlockState) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let capacity = state
-        .config
-        .get(..8)
-        .ok_or_else(|| invalid("missing block capacity"))?;
-    let capacity = u64::from_le_bytes(capacity.try_into().unwrap())
-        .checked_mul(512)
-        .ok_or_else(|| invalid("block capacity overflow"))?;
-    let virtual_size = match format {
-        0 => file.metadata()?.len(),
-        1 => {
-            let mut header = [0; 104];
-            file.read_exact_at(&mut header, 0)?;
-            let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
-            if &header[..4] != b"QFI\xfb"
-                || !matches!(version, 2 | 3)
-                || header[8..20] != [0; 12]
-                || (version == 3
-                    && u64::from_be_bytes(header[72..80].try_into().unwrap()) & (1 << 2) != 0)
-            {
-                return Err(invalid(
-                    "flatten must produce standalone QCOW2 without an external data file",
-                ));
-            }
-            u64::from_be_bytes(header[24..32].try_into().unwrap())
-        }
-        _ => return Err(invalid("unsupported independent disk format")),
-    };
-    if virtual_size < capacity || virtual_size - capacity >= 512 {
-        return Err(invalid("flatten changed guest disk capacity"));
-    }
-    Ok(())
-}
 fn open_file(path: &Path) -> io::Result<File> {
     // Reject FIFOs by descriptor without waiting for a peer during open.
     let file = OpenOptions::new()
@@ -828,12 +786,6 @@ fn open_file(path: &Path) -> io::Result<File> {
         return Err(invalid("checkpoint artifact is not a regular file"));
     }
     Ok(file)
-}
-fn artifact(directory: &Path, name: &str) -> io::Result<Artifact> {
-    Ok(Artifact {
-        name: name.into(),
-        len: open_file(&directory.join(name))?.metadata()?.len(),
-    })
 }
 fn without_dax(
     memory: &vm_memory::GuestMemoryMmap,
@@ -857,12 +809,6 @@ fn without_dax(
     Ok(ram)
 }
 
-fn write_ram(directory: &Path, memory: &vm_memory::GuestMemoryMmap) -> io::Result<Artifact> {
-    let mut file = create_file(&directory.join("ram.bin"))?;
-    crate::ram_snapshot::save_file(memory, &mut file)?;
-    file.sync_all()?;
-    artifact(directory, "ram.bin")
-}
 fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     let source = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(other)?;
     let destination = std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(other)?;

@@ -9,9 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <spawn.h>
-#include <sys/wait.h>
-extern char **environ;
 
 static uint32_t context;
 static const char *destination;
@@ -19,32 +16,6 @@ static sigset_t signals;
 static const char *root;
 static int hotplug;
 static void check(int result, const char *operation);
-
-static int32_t fail_then_copy(const char *id, const char *source, const char *target, uint32_t format, void *opaque) {
-    (void)id; (void)opaque;
-    static int first = 1;
-    if (first) { first = 0; return -EIO; }
-    if (format != 0) return -ENOTSUP;
-    FILE *in = fopen(source, "rb"), *out = fopen(target, "wbx");
-    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return -EIO; }
-    char bytes[65536]; size_t count;
-    while ((count = fread(bytes, 1, sizeof(bytes), in))) if (fwrite(bytes, 1, count, out) != count) break;
-    int failed = ferror(in) || ferror(out) || fflush(out) || fsync(fileno(out));
-    fclose(in); fclose(out);
-    return failed ? -EIO : 0;
-}
-
-// Calls the application's existing flatten implementation synchronously.
-static int32_t flatten_disk(const char *id, const char *source, const char *target, uint32_t format, void *opaque) {
-    (void)id; (void)opaque;
-    if (format != KRUN_DISK_FORMAT_QCOW2) return -ENOTSUP;
-    char *args[] = {getenv("KRUN_TEST_FLATTEN"), "flatten", (char *)source, (char *)target, NULL};
-    pid_t pid; int status;
-    int error = posix_spawn(&pid, args[0], NULL, NULL, args, environ);
-    if (error) return -error;
-    while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return -errno;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -EIO;
-}
 
 static void grow_memory(void) {
 #ifdef __linux__
@@ -80,12 +51,35 @@ static void check(int result, const char *operation) {
 
 static void *save(void *unused) {
     (void)unused;
+    int first = 1;
     for (;;) {
         int signal;
         if (sigwait(&signals, &signal)) abort();
-        if (hotplug) grow_memory();
-        int result = krun_save_checkpoint(context, destination, getenv("KRUN_TEST_FLATTEN") ? flatten_disk : (getenv("KRUN_TEST_FAIL_EXPORT") ? fail_then_copy : NULL), NULL);
-        fprintf(stderr, "CHECKPOINT %d\n", result);
+        if (signal == SIGUSR2) {
+            int result = krun_resume(context);
+            if (!result) result = krun_resume(context); /* Idempotent. */
+            fprintf(stderr, "RESUME %d\n", result);
+        } else {
+            if (hotplug && first) grow_memory();
+            if (first) {
+                int result = krun_save_checkpoint(context, destination);
+                if (result != -EBUSY) abort();
+                fprintf(stderr, "RUNNING_SAVE %d\n", result);
+            }
+            int result = krun_pause(context);
+            if (!result) result = krun_pause(context); /* Idempotent. */
+            if (!result) {
+                if (first && getenv("KRUN_TEST_FAIL_EXPORT")) {
+                    char invalid[4096];
+                    snprintf(invalid, sizeof(invalid), "%s/missing/checkpoint", destination);
+                    result = krun_save_checkpoint(context, invalid);
+                } else {
+                    result = krun_save_checkpoint(context, destination);
+                }
+            }
+            first = 0;
+            fprintf(stderr, "CHECKPOINT %d\n", result);
+        }
         fflush(stderr);
     }
 }
@@ -93,10 +87,14 @@ static void *save(void *unused) {
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: %s boot|restore rootfs checkpoint console [raw-disk]\n", argv[0]); return 2; }
     root = argv[2]; hotplug = getenv("KRUN_TEST_HOTPLUG") != NULL;
-    sigemptyset(&signals); sigaddset(&signals, SIGUSR1);
+    sigemptyset(&signals); sigaddset(&signals, SIGUSR1); sigaddset(&signals, SIGUSR2);
     if (pthread_sigmask(SIG_BLOCK, &signals, NULL)) abort();
     check(krun_set_log_level(3), "log");
     int ctx = krun_create_ctx(); check(ctx, "create"); context = ctx;
+    if (krun_pause(context) != -EAGAIN || krun_resume(context) != -EAGAIN ||
+        krun_save_checkpoint(context, NULL) != -EINVAL ||
+        krun_save_checkpoint(context, "") != -EINVAL ||
+        krun_build_from_checkpoint(context, "") != -EINVAL) abort();
     check(krun_set_vm_config(context, 2, 256), "vm config");
     if (hotplug) {
 #ifdef __linux__
@@ -129,12 +127,12 @@ int main(int argc, char **argv) {
     const char *args[] = {NULL};
     const char *env[] = {"PATH=/bin:/usr/bin", NULL};
     check(krun_set_exec(context, "/checkpoint-guest", args, env), "exec");
+    if (argc == 6 && !getenv("KRUN_TEST_MISSING_DISK"))
+        check(krun_add_disk2(context, "data", argv[5], getenv("KRUN_TEST_FLATTEN") ? KRUN_DISK_FORMAT_QCOW2 : KRUN_DISK_FORMAT_RAW, false), "disk");
     if (strcmp(argv[1], "restore") == 0) {
-        check(krun_set_checkpoint_restore(context, argv[3]), "restore configuration");
+        check(krun_build_from_checkpoint(context, argv[3]), "restore configuration");
     } else {
-        if (argc == 6) check(krun_add_disk2(context, "data", argv[5], getenv("KRUN_TEST_FLATTEN") ? KRUN_DISK_FORMAT_QCOW2 : KRUN_DISK_FORMAT_RAW, false), "disk");
         if (block_root) check(krun_set_root_disk_remount(context, "/dev/vda", "ext4", NULL), "block rootfs");
-        check(krun_set_checkpointing(context, true), "checkpoint configuration");
     }
     destination = getenv("KRUN_TEST_NEXT_CHECKPOINT");
     if (!destination) destination = argv[3];
