@@ -526,6 +526,31 @@ fn host_connect(vsock: &mut Vsock, guest: &mut Guest, path: &Path) -> (UnixStrea
     (peer, request.src_port)
 }
 
+#[test]
+fn snapshot_vsock_guest_reset_is_unsupported_and_keeps_backend_running() {
+    let dir = test_dir("guest-reset");
+    let path = dir.join("host.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let mem = guest_memory();
+    let mut guest = Guest::new(&mem);
+    let mut device = new_vsock(&[(HOST_PORT, &path, false)], TsiFlags::empty());
+    device
+        .activate(mem.clone(), interrupt(), guest.queues())
+        .unwrap();
+
+    assert!(!device.reset());
+    assert!(device.is_activated());
+    let mut peer = guest_connect(&mut device, &mut guest, &listener, (GUEST_PORT, HOST_PORT));
+    guest.send(uapi::VSOCK_OP_RW, GUEST_PORT, HOST_PORT, 4);
+    device.process_stream_tx();
+    let mut received = [0xff; 4];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(received, [0; 4]);
+
+    device.stop_backend().unwrap();
+    assert_peer_closed(&mut peer);
+}
+
 /// Quiescing through the gate taken before the device lock interrupts a
 /// guest-initiated connection's send blocked under that lock. The stop
 /// completes the rest of the ring empty, and the restart delivers the

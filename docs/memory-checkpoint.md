@@ -138,7 +138,6 @@ one legacy serial endpoint are unsupported; virtio console ports remain supporte
 
 
 The container is versioned but is not yet a stable cross-release migration ABI.
-This does not claim all originally requested platforms/configurations complete.
 
 ## Validation
 
@@ -197,7 +196,6 @@ cargo test -p krun-hvf -p krun-vmm -p krun-devices --features blk,net
 The fixture signs its native host binary with the repository's Hypervisor
 entitlement and retains logs/results under `target/run-*`. It uses the local
 Linux sysroot to compile its guest. Firmware and the BoxLite checkout are read only.
-The old cold-boot-only fixture has been replaced by this shared checkpoint runner.
 
 ### Export/import baseline before sparse RAM (2026-11-06)
 

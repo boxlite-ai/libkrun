@@ -154,6 +154,12 @@ impl Drop for Vmm {
 }
 
 fn join_device(device: &mut dyn VirtioDevice) {
+    if let Some(vsock) = device.as_mut_any().downcast_mut::<Vsock>() {
+        if let Err(error) = vsock.stop_backend() {
+            error!("failed to stop vsock backend during teardown: {error:?}");
+        }
+        return;
+    }
     #[cfg(feature = "net")]
     if let Some(net) = device.as_mut_any().downcast_mut::<Net>() {
         net.stop_worker();

@@ -105,8 +105,8 @@ pub struct Unixstream {
 impl Unixstream {
     /// Create the backend with a pre-established connection to the userspace network proxy.
     pub fn new(fd: OwnedFd) -> Self {
-        // Every read and write must return instead of blocking the worker,
-        // including the remainder of a frame the peer has not sent yet.
+        // macOS Unix stream sends can block under backpressure despite
+        // MSG_DONTWAIT; keep the descriptor nonblocking for worker controls.
         match fcntl(&fd, FcntlArg::F_GETFL) {
             Ok(flags) => {
                 let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;

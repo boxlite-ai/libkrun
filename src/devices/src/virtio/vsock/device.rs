@@ -620,17 +620,6 @@ impl VirtioDevice for Vsock {
         self.activate_impl(mem, interrupt, queues, false)
     }
 
-    fn reset(&mut self) -> bool {
-        if self.muxer.stop().is_err() {
-            return false;
-        }
-        self.queue_rx = None;
-        self.queue_tx = None;
-        self.queue_ev = None;
-        self.device_state = DeviceState::Inactive;
-        true
-    }
-
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
