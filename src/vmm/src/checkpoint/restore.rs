@@ -49,7 +49,7 @@ fn metadata(directory: &Path) -> io::Result<Metadata> {
         || state.platform != PLATFORM
         || state.cpus.is_empty()
         || state.cpus.len() > 128
-        || state.devices.len() > 24
+        || state.devices.len() > (arch::IRQ_MAX - arch::IRQ_BASE + 1) as usize
         || state.arch_memory[7] != 0
     {
         return Err(invalid("incompatible checkpoint platform or topology"));

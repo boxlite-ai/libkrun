@@ -274,6 +274,9 @@ try:
         wait(lambda: len(ticks()) > progress + 3, source, [log, console])
         source.send_signal(signal.SIGUSR1)
     wait(lambda: "CHECKPOINT 0" in text(log), source, [log, console])
+    if os.environ.get("KRUN_TEST_EXTRA_FS"):
+        saved = json.loads((first / "state.bin").read_bytes()[16:])
+        assert len(saved["devices"]) > 24, "fixture did not exceed the previous device limit"
     if os.environ.get("KRUN_TEST_TSI"):
         wait(lambda: ticks()[-1][9] > 0 and ticks()[-1][10] > 0, source, [log, console])
     if os.environ.get("KRUN_TEST_DAX"):

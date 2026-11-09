@@ -113,6 +113,11 @@ int main(int argc, char **argv) {
         char path[4096]; snprintf(path, sizeof(path), "%s/dax-share", root);
         check(krun_add_virtiofs2(context, "dax-test", path, 8 * 1024 * 1024), "DAX share");
     }
+    const char *extra_fs = getenv("KRUN_TEST_EXTRA_FS");
+    for (unsigned i = 0; extra_fs && i < strtoul(extra_fs, NULL, 10); ++i) {
+        char tag[64]; snprintf(tag, sizeof(tag), "checkpoint-extra-%u", i);
+        check(krun_add_virtiofs2(context, tag, root, 0), "extra share");
+    }
     // Network lifecycle is tested separately; this fixture isolates the CPU,
     // virtio-fs, console and disk continuation boundary.
     if (!getenv("KRUN_TEST_TSI")) check(krun_disable_implicit_vsock(context), "disable implicit vsock");
