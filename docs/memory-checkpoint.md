@@ -245,9 +245,21 @@ python3 tests/checkpoint/benchmark.py --firmware /path/to/libkrunfw-directory
 LD_LIBRARY_PATH=/path/to/libkrunfw-directory python3 tests/checkpoint/benchmark.py
 ```
 
-The runner retains individual samples, medians/ranges, library hashes and logs
-in `target/checkpoint-benchmark-*`; verified snapshot images are removed after
-each iteration to bound disk use.
+The runner enables `KRUN_CHECKPOINT_TIMINGS` to collect pause, save and restore
+phases, including CPU/device barriers, state capture, RAM streaming, file sync,
+publication, validation, VM/device construction, and CPU/device resume. Tracing
+is disabled during normal library use. Phase records are buffered until each
+operation completes; end-to-end times include the cost of emitting those records.
+Any remaining control/dispatch/logging and guest-response latency is reported
+separately, so each sample's phase durations account for the full API duration.
+
+It also records process launch and context setup before `start_enter`, plus the
+additional host-observed wait from guest response to completed integrity
+verification. These times include polling/scheduling latency. The runner retains
+`results.json` (samples, medians/ranges and environment/library/firmware hashes),
+`phases.csv` (every phase of every iteration), `report.md` (summary and phase
+tables), and process logs in `target/checkpoint-benchmark-*`. Verified snapshot
+files are removed after each iteration to bound disk use.
 
 Measured hosts: HVF uses the local Apple M5 Max (128 GiB RAM, macOS 27.2,
 native GIC, APFS). KVM uses an Intel Xeon 2.80 GHz host (8 logical CPUs,

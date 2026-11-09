@@ -51,6 +51,50 @@ const VERSION: u32 = 2;
 const MAX_METADATA: usize = 16 * 1024 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Optional benchmark tracing. Collect first, then emit once to avoid logging
+/// between measured phases. Disabled unless KRUN_CHECKPOINT_TIMINGS is set.
+struct PhaseTimings {
+    operation: &'static str,
+    last: Option<Instant>,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl PhaseTimings {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            operation,
+            last: std::env::var_os("KRUN_CHECKPOINT_TIMINGS").map(|_| Instant::now()),
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        if let Some(last) = &mut self.last {
+            let now = Instant::now();
+            self.phases
+                .push((phase, now.duration_since(*last).as_nanos()));
+            *last = now;
+        }
+    }
+}
+
+impl Drop for PhaseTimings {
+    fn drop(&mut self) {
+        use std::fmt::Write as _;
+        let mut output = String::new();
+        for (phase, ns) in &self.phases {
+            let _ = writeln!(
+                output,
+                "KRUN_CHECKPOINT_PHASE {} {phase} {ns}",
+                self.operation
+            );
+        }
+        if !output.is_empty() {
+            eprint!("{output}");
+        }
+    }
+}
+
 fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
@@ -232,6 +276,7 @@ impl Vmm {
     /// Called by the event-loop owner, which must keep event dispatch stopped
     /// until resume. The C runtime also quiesces vsock before taking VM locks.
     pub fn pause(&mut self) -> io::Result<()> {
+        let mut timings = PhaseTimings::new("pause");
         if self.vcpus_failed {
             return Err(io::Error::from_raw_os_error(libc::ESHUTDOWN));
         }
@@ -262,12 +307,15 @@ impl Vmm {
                 memory.freeze();
             }
         }
+        timings.mark("validate_devices_and_hotplug");
         let deadline = Instant::now() + CONTROL_TIMEOUT;
         let result = (|| {
             self.pause_vcpus(deadline).map_err(other)?;
+            timings.mark("pause_vcpus");
             for device in &devices {
                 freeze_device(&mut *device.device.lock().unwrap(), deadline)?;
             }
+            timings.mark("freeze_devices");
             Ok(())
         })();
         if result.is_err() {
@@ -324,6 +372,7 @@ impl Vmm {
     /// Save a confirmed paused VM. Storage failures and success both preserve
     /// the pause so the application can capture disks at the same boundary.
     pub fn save_checkpoint(&mut self, path: &Path) -> io::Result<()> {
+        let mut timings = PhaseTimings::new("save");
         if self.vcpus_failed {
             return Err(io::Error::from_raw_os_error(libc::ESHUTDOWN));
         }
@@ -344,6 +393,7 @@ impl Vmm {
         )
         .map_err(other)?;
         let staged_file = staging.as_path().join("checkpoint");
+        timings.mark("prepare_staging");
         #[cfg(target_os = "linux")]
         let mut detached = 0;
         let mut counts = Vec::new();
@@ -356,7 +406,8 @@ impl Vmm {
                 }
                 counts.push(drain(event)?);
             }
-            self.write_checkpoint(&staged_file, &devices, counts.clone())
+            timings.mark("suspend_irqs");
+            self.write_checkpoint(&staged_file, &devices, counts.clone(), &mut timings)
         })();
         // Restore IRQ delivery without restarting CPU/device writers.
         let recovered: io::Result<()> = (|| {
@@ -375,9 +426,15 @@ impl Vmm {
             self.abort_checkpoint(&devices);
             return Err(error);
         }
+        timings.mark("restore_irqs");
         saved?;
         publish(&staged_file, path)?;
-        File::open(parent)?.sync_all()
+        timings.mark("publish");
+        File::open(parent)?.sync_all()?;
+        timings.mark("sync_directory");
+        drop(staging);
+        timings.mark("cleanup");
+        Ok(())
     }
 
     fn abort_checkpoint(&mut self, devices: &[LiveDevice]) {
@@ -430,6 +487,7 @@ impl Vmm {
         path: &Path,
         devices: &[LiveDevice],
         irq_counts: Vec<u64>,
+        timings: &mut PhaseTimings,
     ) -> io::Result<()> {
         if self.exit_code.load(std::sync::atomic::Ordering::Acquire) != i32::MAX {
             return Err(invalid("VM is exiting"));
@@ -588,6 +646,7 @@ impl Vmm {
             });
         }
         records.sort_by_key(|record| record.address);
+        timings.mark("capture_devices");
         let mut cpus = Vec::new();
         let deadline = Instant::now() + CONTROL_TIMEOUT;
         for handle in &mut self.vcpus_handles {
@@ -596,6 +655,7 @@ impl Vmm {
                 _ => return Err(invalid("missing vCPU state")),
             }
         }
+        timings.mark("capture_vcpus");
         #[cfg(target_os = "linux")]
         let legacy = {
             let cmos = self.pio_device_manager.cmos.lock().unwrap().save_state();
@@ -660,6 +720,7 @@ impl Vmm {
             legacy,
             irq_counts,
         };
+        timings.mark("capture_vm_and_legacy");
         let bytes = serde_json::to_vec(&metadata).map_err(other)?;
         if bytes.len() > MAX_METADATA {
             return Err(invalid("checkpoint metadata exceeds limit"));
@@ -670,7 +731,9 @@ impl Vmm {
         file.write_all(&(bytes.len() as u32).to_le_bytes())?;
         file.write_all(&bytes)?;
         let ram_offset = file.stream_position()?;
+        timings.mark("write_metadata");
         crate::ram_snapshot::save_file_at(&boot, &mut file, ram_offset)?;
+        timings.mark("write_ram");
         file.seek(SeekFrom::Start(ram_offset + ram_len))?;
         #[cfg(target_os = "linux")]
         if let Some(live) = memory_device {
@@ -681,7 +744,10 @@ impl Vmm {
                 .unwrap()
                 .save_memory(&mut file)?;
         }
-        file.sync_all()
+        timings.mark("write_hotplug");
+        file.sync_all()?;
+        timings.mark("sync_file");
+        Ok(())
     }
 }
 

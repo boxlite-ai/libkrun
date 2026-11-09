@@ -109,6 +109,7 @@ pub fn restore(
     events: &mut EventManager,
     #[cfg(target_os = "macos")] shutdown_efd: Option<EventFd>,
 ) -> io::Result<Arc<Mutex<Vmm>>> {
+    let mut timings = PhaseTimings::new("restore");
     let mut file = open_file(path)?;
     let mut saved = metadata(&mut file)?;
     let ram_offset = file.stream_position()?;
@@ -172,6 +173,7 @@ pub fn restore(
     if saved.ram_len > budget.saturating_add(1024 * 1024) {
         return Err(invalid("checkpoint exceeds configured boot RAM budget"));
     }
+    timings.mark("read_metadata_and_validate_resources");
     let ram_layout = crate::ram_snapshot::file_metadata_at(&mut file, ram_offset, saved.ram_len)?;
     if ram_layout.memory_bytes > budget || ram_layout.regions.len() > 64 {
         return Err(invalid("checkpoint RAM layout exceeds configured budget"));
@@ -189,7 +191,9 @@ pub fn restore(
             return Err(invalid("invalid RAM mapping or MMIO overlap"));
         }
     }
+    timings.mark("validate_ram_layout");
     let mut memory = crate::ram_snapshot::restore_file_at(&file, &ram_layout, ram_offset)?;
+    timings.mark("load_ram");
     // DAX windows are address-space reservations, not RAM payload. Never read
     // their file-backed/protected pages through the RAM codec.
     for record in &saved.devices {
@@ -302,6 +306,7 @@ pub fn restore(
     };
     #[cfg(target_os = "macos")]
     let (mut vmm, intc) = hvf::build(&saved, memory, resources, events, shutdown_efd)?;
+    timings.mark("build_vm_and_memory_map");
     // Track devices before activation/registration: a later MMIO validation or
     // registration error must also join the worker that has just been started.
     let mut constructed: Vec<Arc<Mutex<dyn VirtioDevice>>> = Vec::new();
@@ -342,6 +347,7 @@ pub fn restore(
         } else {
             None
         };
+        timings.mark("restore_hotplug");
         // Memory slots exist before validating any queue, including queues whose
         // rings live in hotplug RAM. Raw aliases do not outlive the frozen Mem.
         #[cfg(target_os = "linux")]
@@ -636,6 +642,7 @@ pub fn restore(
                 )
                 .map_err(other)?;
         }
+        timings.mark("restore_devices");
         #[cfg(target_os = "linux")]
         {
             {
@@ -689,12 +696,14 @@ pub fn restore(
         }
         #[cfg(target_os = "macos")]
         hvf::restore_platform(&mut vmm, &saved)?;
+        timings.mark("restore_platform_and_create_vcpus");
         let deadline = Instant::now() + CONTROL_TIMEOUT;
         for (handle, state) in vmm.vcpus_handles.iter_mut().zip(saved.cpus.drain(..)) {
             handle
                 .control(Command::Restore(state), deadline)
                 .map_err(other)?;
         }
+        timings.mark("restore_vcpu_registers");
         let devices = vmm.checkpoint_devices()?;
         for ((event, _), count) in vmm.irq_bindings(&devices)?.iter().zip(&saved.irq_counts) {
             if *count != 0 {
@@ -707,10 +716,14 @@ pub fn restore(
                 .try_signal_used_queue()
                 .map_err(|e| invalid(&format!("net interrupt: {e:?}")))?;
         }
+        timings.mark("restore_irqs");
         for device in &devices {
             resume_device(&mut *device.device.lock().unwrap())?;
         }
-        vmm.resume_vcpus().map_err(other)
+        timings.mark("resume_devices");
+        vmm.resume_vcpus().map_err(other)?;
+        timings.mark("resume_vcpus");
+        Ok(())
     })();
     if let Err(error) = build {
         let devices = vmm.checkpoint_devices().unwrap_or_default();
@@ -727,6 +740,7 @@ pub fn restore(
         locked.abort_checkpoint(&devices);
         return Err(other(error));
     }
+    timings.mark("register_event_loop");
     Ok(vmm)
 }
 
