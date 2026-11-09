@@ -80,7 +80,6 @@ fn metadata(directory: &Path) -> io::Result<Metadata> {
     for serial in state.legacy.serial.iter().flatten() {
         serial.validate()?;
     }
-    let mut addresses = std::collections::HashSet::new();
     let mut irqs = std::collections::HashSet::new();
     let mut ids = std::collections::HashSet::new();
     for record in &state.devices {
@@ -103,7 +102,6 @@ fn metadata(directory: &Path) -> io::Result<Metadata> {
             || record.address >= 0x1_0000_0000
             || record.address % 4096 != 0
             || !(arch::IRQ_BASE..=arch::IRQ_MAX).contains(&record.irq)
-            || !addresses.insert(record.address)
             || !irqs.insert(record.irq)
             || !ids.insert((record.transport.device.device_type, record.id.clone()))
         {

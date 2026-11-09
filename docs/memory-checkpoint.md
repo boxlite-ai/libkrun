@@ -197,10 +197,7 @@ The fixture signs its native host binary with the repository's Hypervisor
 entitlement and retains logs/results under `target/run-*`. It uses the local
 Linux sysroot to compile its guest. Firmware and the BoxLite checkout are read only.
 
-### Export/import baseline before sparse RAM (2026-11-06)
-
-The following measurements were taken at commit `e93ecf6`, before removing
-SHA-256 and adding sparse RAM export/import.
+### Export/import benchmark
 
 `tests/checkpoint/benchmark.py` runs the same public-API workload on both
 platforms, with a release `blk,net` build, two vCPUs, and 256/512/1024/2048 MiB
@@ -208,10 +205,10 @@ configured RAM. Each size has one excluded warmup followed by five measurements.
 The guest fills half its configured RAM with pseudorandom data; the checkpoint
 contains all configured RAM, CPU and device state. This workload uses virtio-fs
 and has no attached block image or network backend, so it excludes disk-image
-copying/flattening. There is no RAM compression or sparse-page optimization.
+copying/flattening. There is no RAM compression.
 
 Export is host monotonic time around `krun_save_checkpoint`, including freeze,
-RAM serialization/checksum, file sync, publication and source resume. Import is
+RAM serialization, file sync, publication and source resume. Import is
 host monotonic time from immediately before `krun_start_enter` until a restored
 guest writes its response through virtio-fs (100 us host polling interval and
 1 ms guest polling interval). Process startup and configuration are excluded.
@@ -239,29 +236,6 @@ a virtual machine, so this run uses nested virtualization. Neither host was
 reserved exclusively for this benchmark. These are deployment-specific latency
 measurements, not an isolated comparison of hypervisor overhead.
 
-Seconds, median of five measurements; parentheses show minimum–maximum:
-
-| Platform | RAM (MiB) | Export (s) | Warm-cache import (s) |
-| --- | ---: | ---: | ---: |
-| KVM | 256 | 2.514 (2.491–2.519) | 3.076 (3.051–3.209) |
-| KVM | 512 | 5.067 (5.053–5.130) | 6.200 (6.106–6.396) |
-| KVM | 1024 | 10.146 (10.084–10.360) | 12.606 (12.219–13.028) |
-| KVM | 2048 | 19.970 (19.832–20.606) | 25.955 (25.694–27.659) |
-| HVF | 256 | 0.507 (0.507–0.509) | 0.984 (0.978–0.986) |
-| HVF | 512 | 1.010 (1.000–1.015) | 1.939 (1.932–1.953) |
-| HVF | 1024 | 1.944 (1.938–1.956) | 3.870 (3.860–3.884) |
-| HVF | 2048 | 3.852 (3.844–3.878) | 7.720 (7.628–7.734) |
-
-All 40 measured restores and eight warmups passed the full guest-pattern scan.
-
-A separate one-second sampling window during the beginning of a 1 GiB HVF
-import found 667 of 677 main-thread samples in SHA-256 compression (98.5%).
-This diagnostic run is excluded from the table. That build's `sha2 0.10.9`
-feature set does not enable `asm`, which selects its software backend on
-AArch64. Import also hashes RAM twice: the artifact scan and verification of
-the bytes actually read into memory. These identify concrete optimization
-opportunities; the measurements above use the unchanged snapshot implementation.
-
 ### Sparse anonymous RAM
 
 Whole-VM export streams RAM through a 1 MiB buffer instead of constructing a
@@ -287,10 +261,10 @@ with the sparse RAM file. The whole-VM container remains experimental version 1:
 16 bytes, followed by JSON metadata, and artifacts record names and lengths only.
 
 The benchmark now reports both logical snapshot bytes and `st_blocks * 512`
-allocated bytes. Earlier baseline results above retain their original meanings.
+allocated bytes.
 
-Post-change performance uses the same hosts, release build, two vCPUs,
-half-filled pseudorandom guest memory and warm-cache import as the baseline.
+The following measurements use the hosts and benchmark method described above,
+a release build, two vCPUs, half-filled pseudorandom guest memory and warm-cache import.
 Each value is the median of five measured iterations. Allocated MiB includes
 RAM and state files; logical file size is still approximately configured RAM.
 

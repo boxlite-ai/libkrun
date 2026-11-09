@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{defs, muxer::MuxerRx, packet::TsiGetnameRsp, packet::VsockPacket, Vsock};
+use crate::virtio::linux_errno::linux_errno_raw;
 use crate::virtio::persist::{invalid, QueueState, VirtioDeviceState};
 use crate::virtio::VirtioDevice;
 use std::io;
@@ -39,7 +40,7 @@ impl ControlReply {
     pub fn response(&self) -> MuxerRx {
         let local_port = self.operation;
         let peer_port = self.port;
-        let result = -libc::ECONNRESET;
+        let result = -linux_errno_raw(libc::ECONNRESET);
         match self.operation {
             defs::TSI_CONNECT => MuxerRx::ConnResponse {
                 local_port,
@@ -164,6 +165,8 @@ impl Vsock {
 pub(super) enum SocketAddress {
     Inet(std::net::SocketAddr),
     Unix(std::path::PathBuf),
+    #[cfg(target_os = "linux")]
+    UnixAbstract(Vec<u8>),
 }
 impl SocketAddress {
     pub fn capture(addr: nix::sys::socket::SockaddrStorage) -> io::Result<Self> {
@@ -180,20 +183,25 @@ impl SocketAddress {
         } else if let Some(path) = addr.as_unix_addr().and_then(|a| a.path()) {
             Ok(Self::Unix(path.to_owned()))
         } else {
+            #[cfg(target_os = "linux")]
+            if let Some(name) = addr.as_unix_addr().and_then(|a| a.as_abstract()) {
+                return Ok(Self::UnixAbstract(name.to_vec()));
+            }
             Err(invalid("unsupported UDP endpoint address"))
         }
     }
     pub fn address(&self) -> io::Result<nix::sys::socket::SockaddrStorage> {
         use nix::sys::socket::{SockaddrLike, SockaddrStorage, UnixAddr};
-        match self {
-            Self::Inet(address) => Ok((*address).into()),
-            Self::Unix(path) => {
-                let address = UnixAddr::new(path).map_err(io::Error::other)?;
-                // Copy exactly the initialized UnixAddr bytes into owned storage.
-                unsafe { SockaddrStorage::from_raw(address.as_ptr().cast(), Some(address.len())) }
-                    .ok_or_else(|| invalid("invalid Unix datagram address"))
-            }
+        let address = match self {
+            Self::Inet(address) => return Ok((*address).into()),
+            Self::Unix(path) => UnixAddr::new(path),
+            #[cfg(target_os = "linux")]
+            Self::UnixAbstract(name) => UnixAddr::new_abstract(name),
         }
+        .map_err(io::Error::other)?;
+        // Copy exactly the initialized UnixAddr bytes into owned storage.
+        unsafe { SockaddrStorage::from_raw(address.as_ptr().cast(), Some(address.len())) }
+            .ok_or_else(|| invalid("invalid Unix datagram address"))
     }
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

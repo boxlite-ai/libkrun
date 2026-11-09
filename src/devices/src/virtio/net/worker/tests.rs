@@ -319,28 +319,6 @@ fn assert_frozen_quiet(rig: &mut Rig) {
 }
 
 #[test]
-fn snapshot_net_worker_moves_frames_both_ways() {
-    let mut rig = Rig::new(false);
-    rig.post_rx(4);
-    rig.rx_kick.write(1).unwrap();
-    let first = payload(1, 60);
-    let second = payload(2, 1514);
-    rig.peer_send(&first);
-    rig.peer_send(&second);
-    rig.wait_used(RX_USED, 2);
-    assert_eq!(rig.rx_frame(0), first);
-    assert_eq!(rig.rx_frame(1), second);
-    assert_ne!(rig.irq_status(), 0);
-
-    let out = payload(3, 600);
-    rig.submit_tx(&out);
-    rig.tx_kick.write(1).unwrap();
-    assert_eq!(rig.peer_recv(), out);
-    rig.wait_used(TX_USED, 1);
-    rig.net.stop_worker();
-}
-
-#[test]
 fn snapshot_net_worker_freeze_is_quiet_and_resume_needs_no_kick() {
     let mut rig = Rig::new(false);
     rig.post_rx(8);

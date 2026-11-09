@@ -527,6 +527,84 @@ fn host_connect(vsock: &mut Vsock, guest: &mut Guest, path: &Path) -> (UnixStrea
 }
 
 #[test]
+fn snapshot_vsock_interrupted_controls_use_linux_errno() {
+    use super::defs::{TSI_ACCEPT, TSI_CONNECT, TSI_GETNAME, TSI_LISTEN};
+    use super::muxer::MuxerRx;
+    use super::snapshot::ControlReply;
+
+    for operation in [TSI_CONNECT, TSI_LISTEN, TSI_ACCEPT, TSI_GETNAME] {
+        let reply = ControlReply {
+            operation,
+            port: GUEST_PORT,
+        };
+        let (local_port, peer_port, result) = match reply.response() {
+            MuxerRx::ConnResponse {
+                local_port,
+                peer_port,
+                result,
+            }
+            | MuxerRx::ListenResponse {
+                local_port,
+                peer_port,
+                result,
+            }
+            | MuxerRx::AcceptResponse {
+                local_port,
+                peer_port,
+                result,
+            } => (local_port, peer_port, result),
+            MuxerRx::GetnameResponse {
+                local_port,
+                peer_port,
+                data,
+            } => {
+                assert_eq!(data.addr_len, 0);
+                (local_port, peer_port, data.result)
+            }
+            _ => panic!("unexpected control reply"),
+        };
+        assert_eq!((local_port, peer_port), (operation, GUEST_PORT));
+        // The guest wire ABI uses Linux ECONNRESET, including on macOS.
+        assert_eq!(result, -104);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_vsock_unbound_unix_datagram_survives_freeze() {
+    use super::defs;
+
+    let mem = guest_memory();
+    let mut guest = Guest::new(&mem);
+    let mut device = new_vsock(&[], TsiFlags::HIJACK_UNIX);
+    device
+        .activate(mem.clone(), interrupt(), guest.queues())
+        .unwrap();
+    guest.send(uapi::VSOCK_OP_RW, GUEST_PORT, defs::TSI_PROXY_CREATE, 8);
+    mem.write_obj(uapi::VSOCK_TYPE_DGRAM, GuestAddress(TX_HDRS + 28))
+        .unwrap();
+    mem.write_obj(GUEST_PORT, GuestAddress(TX_DATA)).unwrap();
+    mem.write_obj(defs::LINUX_AF_UNIX, GuestAddress(TX_DATA + 4))
+        .unwrap();
+    mem.write_obj(defs::SOCK_DGRAM, GuestAddress(TX_DATA + 6))
+        .unwrap();
+    assert!(device.process_stream_tx());
+
+    for _ in 0..2 {
+        device.freeze(Instant::now() + WAIT).unwrap();
+        device.save_state().unwrap();
+        assert_eq!(device.muxer.datagrams.len(), 1);
+        let endpoint = &device.muxer.datagrams[0];
+        assert_eq!(endpoint.family, defs::LINUX_AF_UNIX);
+        assert!(endpoint.local.is_none());
+        assert!(endpoint.peer.is_none());
+        guest.offer_event_buffer();
+        device.resume().unwrap();
+        assert!(device.muxer.is_running());
+    }
+}
+
+#[test]
 fn snapshot_vsock_guest_reset_is_unsupported_and_keeps_backend_running() {
     let dir = test_dir("guest-reset");
     let path = dir.join("host.sock");

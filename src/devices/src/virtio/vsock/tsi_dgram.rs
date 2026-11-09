@@ -240,6 +240,7 @@ impl Proxy for TsiDgramProxy {
             nix::sys::socket::getsockname(self.fd.as_raw_fd()).map_err(std::io::Error::other)?;
         let local = if local.as_sockaddr_in().is_some_and(|a| a.port() == 0)
             || local.as_sockaddr_in6().is_some_and(|a| a.port() == 0)
+            || local.as_unix_addr().is_some_and(|a| a.path_len() == 0)
         {
             None
         } else {
@@ -530,5 +531,55 @@ impl TsiDgramProxy {
         self.peer_buf_alloc = state.counters[2];
         self.peer_fwd_cnt = Wrapping(state.counters[3]);
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use nix::sys::socket::UnixAddr;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn snapshot_vsock_unix_datagram_restores_abstract_peer() {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        // Linux autobind chooses an unused abstract name.
+        bind(listener.as_raw_fd(), &UnixAddr::new("").unwrap()).unwrap();
+        let peer: SockaddrStorage = nix::sys::socket::getsockname(listener.as_raw_fd()).unwrap();
+        assert!(peer.as_unix_addr().unwrap().as_abstract().is_some());
+        let new_proxy = || {
+            TsiDgramProxy::new(
+                1,
+                3,
+                defs::LINUX_AF_UNIX,
+                5,
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap(),
+                Arc::new(Mutex::new(VirtQueue::new(16))),
+                Arc::new(Mutex::new(MuxerRxQ::new())),
+            )
+            .unwrap()
+        };
+        let original = new_proxy();
+        connect(original.as_raw_fd(), &peer).unwrap();
+        let state = original.datagram_state().unwrap().unwrap();
+        assert!(state.local.is_none());
+        let state: DatagramState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(original);
+        let mut restored = new_proxy();
+        restored.restore_endpoint(&state).unwrap();
+        send(restored.as_raw_fd(), b"restored", MsgFlags::empty()).unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(
+            recv(listener.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT).unwrap(),
+            8
+        );
+        assert_eq!(&bytes, b"restored");
     }
 }
