@@ -337,9 +337,10 @@ impl Console {
 
         for port_id in ports_to_start {
             log::trace!("Starting port io for port {port_id}");
-            if let Err(e) = self.start_port(port_id, PortProgress::default(), false) {
-                error!("Cannot start console port {port_id}: {e:?}");
-            }
+            // Starting consumes the queues even on failure; continuing would
+            // leave an inactive port with no queues to retry or snapshot.
+            self.start_port(port_id, PortProgress::default(), false)
+                .unwrap_or_else(|e| panic!("Cannot start console port {port_id}: {e:?}"));
         }
 
         raise_irq

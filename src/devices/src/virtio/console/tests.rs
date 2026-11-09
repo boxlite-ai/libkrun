@@ -661,6 +661,66 @@ fn snapshot_console_eof_survives_restore_without_rereading() {
 }
 
 #[test]
+fn snapshot_console_port_start_failure_is_fatal() {
+    const CHILD: &str = "KRUN_CONSOLE_START_FAILURE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "virtio::console::tests::snapshot_console_port_start_failure_is_fatal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    for resume in [false, true] {
+        let mut rig = Rig::new(
+            vec![PortDescription::output_pipe(
+                "log",
+                port_io::output_to_log_as_err(),
+            )],
+            0,
+        );
+        rig.guest
+            .post_control(0, control_event::VIRTIO_CONSOLE_PORT_OPEN, 1);
+        if resume {
+            rig.console.snapshot_freeze_with_timeout(WAIT).unwrap();
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let exhausted = libc::rlimit {
+            rlim_cur: 0,
+            ..limit
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+            0
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if resume {
+                rig.console.snapshot_resume().unwrap();
+            } else {
+                rig.console.process_control_tx();
+            }
+        }));
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let panic = result.expect_err("port startup failure must not be ignored");
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("Cannot start console port 0"), "{message}");
+    }
+}
+
+#[test]
 fn snapshot_console_control_backlog_and_deferred_resize() {
     let ports = || {
         vec![PortDescription::console(
