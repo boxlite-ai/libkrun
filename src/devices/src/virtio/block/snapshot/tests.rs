@@ -35,6 +35,31 @@ fn irq() -> InterruptTransport {
     InterruptTransport::new(DummyIrqChip::new().into(), "block-test".into()).unwrap()
 }
 
+#[test]
+fn checkpoint_source_pins_absolute_path_and_rejects_missing_or_replaced_disk() {
+    let cwd = std::env::current_dir().unwrap();
+    let dir = utils::tempdir::TempDir::new_with_prefix(cwd.join(".block-checkpoint-")).unwrap();
+    let relative = std::path::Path::new(dir.as_path().file_name().unwrap()).join("disk.raw");
+    std::fs::write(&relative, [0x37; 4096]).unwrap();
+    let source = block(relative.to_str().unwrap());
+    let (path, format) = source.checkpoint_source().unwrap();
+    assert!(path.is_absolute());
+    assert_eq!(path, cwd.join(&relative));
+    assert!(matches!(format, ImageType::Raw));
+
+    std::fs::rename(&relative, dir.as_path().join("live.raw")).unwrap();
+    assert_eq!(
+        source.checkpoint_source().unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::write(&relative, [0xe5; 4096]).unwrap();
+    assert!(source
+        .checkpoint_source()
+        .unwrap_err()
+        .to_string()
+        .contains("replaced"));
+}
+
 // A real write request, followed by a pending read across worker destruction
 // and recreation. No guest kick is issued in the importing process's equivalent
 // path; resume must discover the available descriptor itself.

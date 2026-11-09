@@ -243,6 +243,29 @@ try:
         (work / "result.json").write_text(json.dumps(result, indent=2))
         print(json.dumps(result, indent=2))
         raise SystemExit(0)
+    if os.environ.get("KRUN_TEST_REPLACED_DISK"):
+        # The live block worker retains its original open image. Replacing
+        # the source pathname must never silently export the new file.
+        original_disk = disk.with_name("renamed-live.raw")
+        disk.rename(original_disk)
+        with disk.open("wb") as replacement:
+            replacement.truncate(original_disk.stat().st_size)
+            replacement.write(bytes([0xe5]) * 512)
+        source.send_signal(signal.SIGUSR1)
+        wait(lambda: "CHECKPOINT " in text(log), source, [log, console])
+        if "CHECKPOINT 0" in text(log):
+            artifacts = list(first.glob("disk-*.img"))
+            assert len(artifacts) == 1, artifacts
+            with artifacts[0].open("rb") as image, original_disk.open("rb") as live:
+                assert image.read(512) == live.read(512), "checkpoint exported replacement path instead of live disk"
+        else:
+            assert not first.exists(), "rejected export published a checkpoint"
+            progress = len(ticks())
+            wait(lambda: len(ticks()) > progress + 3, source, [log, console])
+        result = {"status": "passed", "replaced_disk_safe": True, "work": str(work)}
+        (work / "result.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0)
     source.send_signal(signal.SIGUSR1)
     if os.environ.get("KRUN_TEST_FAIL_EXPORT"):
         wait(lambda: "CHECKPOINT -5" in text(log), source, [log, console])

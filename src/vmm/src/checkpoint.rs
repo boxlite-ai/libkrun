@@ -536,7 +536,7 @@ impl Vmm {
                         .ok_or_else(|| invalid("unsupported checkpoint device"))?;
                     let state = block.save_state()?;
                     let queues = state.queue.clone().map(|q| vec![q]);
-                    let (source, format) = block.checkpoint_source();
+                    let (source, format) = block.checkpoint_source()?;
                     let format = match format {
                         ImageType::Raw => 0,
                         ImageType::Qcow2 => 1,
@@ -545,7 +545,8 @@ impl Vmm {
                         }
                     };
                     let name = format!("disk-{_index}.img");
-                    _flatten(&live.id, Path::new(source), &directory.join(&name), format)?;
+                    _flatten(&live.id, source, &directory.join(&name), format)?;
+                    block.checkpoint_source()?;
                     let image = open_file(&directory.join(&name))?;
                     validate_disk(&image, format, &state)?;
                     use std::os::unix::fs::MetadataExt;

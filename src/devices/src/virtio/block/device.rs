@@ -6,14 +6,10 @@
 // found in the THIRD-PARTY file.
 
 use std::cmp;
-use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-#[cfg(target_os = "linux")]
-use std::os::linux::fs::MetadataExt;
-#[cfg(target_os = "macos")]
-use std::os::macos::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::result;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -114,9 +110,9 @@ impl DiskProperties {
         // This is how kvmtool does it.
         let device_id = format!(
             "{}{}{}",
-            blk_metadata.st_dev(),
-            blk_metadata.st_rdev(),
-            blk_metadata.st_ino()
+            blk_metadata.dev(),
+            blk_metadata.rdev(),
+            blk_metadata.ino()
         );
         Ok(device_id)
     }
@@ -216,7 +212,8 @@ pub struct Block {
     pub(super) snapshot_queue: Arc<Mutex<Option<QueueState>>>,
     pub(super) frozen: bool,
     pub(super) snapshot_failed: bool,
-    checkpoint_source: String,
+    checkpoint_source: PathBuf,
+    checkpoint_identity: (u64, u64),
     checkpoint_format: ImageType,
 
     // Virtio fields.
@@ -247,12 +244,16 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
     ) -> io::Result<Block> {
+        let disk_image_path = std::path::absolute(disk_image_path)?;
         let checkpoint_source = disk_image_path.clone();
         let checkpoint_format = disk_image_format.clone();
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
-            .open(PathBuf::from(&disk_image_path))?;
+            .open(&disk_image_path)?;
+
+        let metadata = disk_image.metadata()?;
+        let checkpoint_identity = (metadata.dev(), metadata.ino());
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
 
@@ -327,6 +328,7 @@ impl Block {
 
         Ok(Block {
             checkpoint_source,
+            checkpoint_identity,
             checkpoint_format,
             id,
             partuuid,
@@ -352,8 +354,12 @@ impl Block {
         &self.id
     }
 
-    pub fn checkpoint_source(&self) -> (&str, &ImageType) {
-        (&self.checkpoint_source, &self.checkpoint_format)
+    pub fn checkpoint_source(&self) -> io::Result<(&Path, &ImageType)> {
+        let metadata = std::fs::metadata(&self.checkpoint_source)?;
+        if (metadata.dev(), metadata.ino()) != self.checkpoint_identity {
+            return Err(io::Error::other("checkpoint source disk was replaced"));
+        }
+        Ok((&self.checkpoint_source, &self.checkpoint_format))
     }
 
     /// Provides the PARTUUID of this block device.
