@@ -355,6 +355,7 @@ impl Default for Config {
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
 pub struct PassthroughFs {
+    dax: std::sync::Mutex<crate::virtio::fs::dax::DaxMappings>,
     // File descriptors for various points in the file system tree. These fds are always opened with
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
@@ -439,6 +440,7 @@ impl PassthroughFs {
         let proc_self_fd = unsafe { File::from_raw_fd(fd) };
 
         Ok(PassthroughFs {
+            dax: Default::default(),
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 2),
             init_inode: fuse::ROOT_ID + 1,
@@ -2069,74 +2071,29 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::O_RDWR
+        let writable = flags & fuse::SetupmappingFlags::WRITE.bits() != 0;
+        let file = if inode == self.init_inode {
+            None
         } else {
-            libc::O_RDONLY
+            Some(self.open_inode(
+                inode,
+                if writable {
+                    libc::O_RDWR
+                } else {
+                    libc::O_RDONLY
+                },
+            )?)
         };
-
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::PROT_READ | libc::PROT_WRITE
-        } else {
-            libc::PROT_READ
-        };
-
-        if (moffset + len) > shm_size {
-            return Err(einval());
-        }
-
-        let addr = host_shm_base + moffset;
-
-        debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
-
-        if inode == self.init_inode {
-            let ret = unsafe {
-                libc::mmap(
-                    addr as *mut libc::c_void,
-                    len as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
-                    -1,
-                    0,
-                )
-            };
-            if std::ptr::eq(ret, libc::MAP_FAILED) {
-                return Err(io::Error::last_os_error());
-            }
-
-            let to_copy = if len as usize > INIT_BINARY.len() {
-                INIT_BINARY.len()
-            } else {
-                len as usize
-            };
-            unsafe {
-                libc::memcpy(
-                    addr as *mut libc::c_void,
-                    INIT_BINARY.as_ptr() as *const _,
-                    to_copy,
-                )
-            };
-            return Ok(());
-        }
-
-        let file = self.open_inode(inode, open_flags)?;
-        let fd = file.as_raw_fd();
-
-        let ret = unsafe {
-            libc::mmap(
-                addr as *mut libc::c_void,
-                len as usize,
-                prot_flags,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                fd,
-                foffset as libc::off_t,
-            )
-        };
-        if std::ptr::eq(ret, libc::MAP_FAILED) {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
+        self.dax.lock().unwrap().map(
+            host_shm_base,
+            shm_size,
+            moffset,
+            len,
+            foffset,
+            writable,
+            file,
+            INIT_BINARY,
+        )
     }
 
     fn removemapping(
@@ -2146,27 +2103,10 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
-                return Err(einval());
-            }
-            debug!("removemapping: addr={:x} len={:?}", addr, req.len);
-            let ret = unsafe {
-                libc::mmap(
-                    addr as *mut libc::c_void,
-                    req.len as usize,
-                    libc::PROT_NONE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
-                    -1,
-                    0_i64,
-                )
-            };
-            if std::ptr::eq(ret, libc::MAP_FAILED) {
-                return Err(io::Error::last_os_error());
-            }
+        let mut dax = self.dax.lock().unwrap();
+        for request in requests {
+            dax.remove(host_shm_base, shm_size, request.moffset, request.len)?;
         }
-
         Ok(())
     }
 

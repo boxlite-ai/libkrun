@@ -128,8 +128,8 @@ pub enum VsockConfig {
 /// held in the Vmm.
 #[derive(Default)]
 pub struct VmResources {
-    /// Own kernel RAM and use FUSE I/O instead of host DAX aliases. Required by
-    /// the checkpoint owner; ordinary boot keeps its existing mapping policy.
+    /// Own kernel RAM and register checkpoint control. DAX windows retain their
+    /// normal configuration and are restored separately from ordinary RAM.
     pub checkpoint_enabled: bool,
     #[cfg(all(target_os = "linux", not(feature = "tee")))]
     pub memory_hotplug: Option<std::sync::Arc<devices::virtio::mem::MemoryControl>>,

@@ -44,6 +44,8 @@ pub struct FsState {
     pub announce_submounts: bool,
     pub inodes: Vec<InodeState>,
     pub handles: Vec<HandleState>,
+    #[serde(default)]
+    pub mappings: Vec<crate::virtio::fs::dax::DaxMappingState>,
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -58,7 +60,12 @@ fn object_unavailable(error: &io::Error) -> bool {
 }
 
 impl Object {
-    fn capture(file: &File, root: &Path) -> io::Result<Self> {
+    pub(crate) fn reopen_mapping(&self, root: &File, _writable: bool) -> io::Result<File> {
+        // HVF requires writable host pages even for read-only guest mappings.
+        self.reopen(root, libc::O_RDWR)
+    }
+
+    pub(crate) fn capture(file: &File, root: &Path) -> io::Result<Self> {
         let metadata = file.metadata()?;
         let mut path = [0i8; libc::PATH_MAX as usize];
         let path = if metadata.nlink() == 0 {
@@ -90,7 +97,7 @@ impl Object {
             identity_time: [metadata.st_birthtime(), metadata.st_birthtime_nsec()],
         })
     }
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         if let Some(path) = &self.path {
             if path.contains(&0)
                 || Path::new(std::ffi::OsStr::from_bytes(path))
@@ -197,13 +204,26 @@ impl FsState {
     }
 }
 impl PassthroughFs {
+    pub(crate) fn restore_mappings(
+        &self,
+        state: &FsState,
+        base: u64,
+        size: u64,
+        read_only: bool,
+    ) -> io::Result<()> {
+        let root = File::open(&self.cfg.root_dir)?;
+        self.dax
+            .lock()
+            .unwrap()
+            .restore(&state.mappings, &root, base, size, INIT_BINARY, read_only)
+    }
+
     pub fn save_state(&self) -> io::Result<FsState> {
-        if !self.map_windows.lock().unwrap().is_empty()
-            || self
-                .cfg
-                .export_table
-                .as_ref()
-                .is_some_and(|t| !t.lock().unwrap().is_empty())
+        if self
+            .cfg
+            .export_table
+            .as_ref()
+            .is_some_and(|t| !t.lock().unwrap().is_empty())
         {
             return Err(invalid("fs mappings cannot be checkpointed"));
         }
@@ -272,6 +292,7 @@ impl PassthroughFs {
             announce_submounts: self.announce_submounts.load(Ordering::Acquire),
             inodes,
             handles,
+            mappings: self.dax.lock().unwrap().capture(&root)?,
         };
         state.validate()?;
         Ok(state)

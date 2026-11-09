@@ -1092,8 +1092,6 @@ pub fn build_microvm(
         export_table,
         intc.clone(),
         exit_code,
-        #[cfg(target_os = "macos")]
-        _sender,
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
@@ -1597,9 +1595,6 @@ pub fn create_guest_memory(
 
     #[cfg(not(feature = "tee"))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
-        if vm_resources.checkpoint_enabled {
-            continue;
-        }
         if let Some(shm_size) = fs.shm_size {
             shm_manager
                 .create_fs_region(index, shm_size)
@@ -1996,7 +1991,6 @@ fn attach_fs_devices(
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -2029,9 +2023,6 @@ fn attach_fs_devices(
         if let Some(export_table) = export_table.as_ref() {
             fs.lock().unwrap().set_export_table(export_table.clone());
         }
-
-        #[cfg(target_os = "macos")]
-        fs.lock().unwrap().set_map_sender(map_sender.clone());
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
@@ -2380,7 +2371,6 @@ fn attach_gpu_device(
     virgl_flags: u32,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
-    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 

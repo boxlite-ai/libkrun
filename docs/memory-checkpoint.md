@@ -82,9 +82,19 @@ recreated internally; the restore caller need not configure that retired root.
   handle tables. Cached guest pages remain part of guest RAM: this is not a
   transactional directory snapshot, and cached
   reads need not immediately notice host changes. Without inode birth times,
-  identity checking conservatively treats changed ctimes as stale. DAX and
-  exported guest-memory aliases are excluded; checkpoint-enabled boot does not
-  allocate fs DAX windows.
+  identity checking conservatively treats changed ctimes as stale.
+  DAX windows keep their configured size. Checkpoints record live mapping ranges,
+  file offsets, permissions and backing-file identities, excluding the windows
+  from RAM export. Restore reopens the same files and reinstalls the mappings
+  before vCPUs run; file contents remain live, including host edits while the VM
+  is absent. Missing/replaced files or truncation below the saved mapped extent
+  reject restore, because direct memory access cannot return a FUSE error.
+  Restore requires matching shares with at least the saved DAX window sizes.
+  On macOS, HVF requires shared backing files to be openable for host read/write
+  access, including guest read-only mappings. Guest read-only permissions are
+  enforced by HVF; inaccessible backing files fail explicitly. Private copies
+  are not substituted because they would break shared-file coherence.
+  Exported guest-memory aliases remain unsupported.
 - TSI/vsock closes stream sockets, sends transport reset, and completes pending
   connect/listen/accept/getname control requests with errors. Fresh connections
   can then be established. UDP endpoints are reopened from address configuration;
@@ -114,7 +124,7 @@ recreated internally; the restore caller need not configure that retired root.
 | Linux x86_64, KVM, ordinary RAM | Implemented; actual SSH/KVM execution tested |
 | console, block raw/QCOW2, fs, TSI/vsock, virtio-net, rng, balloon free-page reporting, virtio-mem | Connected to capture/restore |
 | nested virtualization, split irqchip, TEE | Unsupported |
-| GPU/input/sound and unrecognized devices, exported/shared guest mappings | Rejected; device/resource state is not silently discarded |
+| GPU/input/sound and unrecognized devices, exported guest-memory aliases | Rejected; device/resource state is not silently discarded |
 | VMDK checkpoint export | Unsupported |
 | Linux aarch64 | Whole-VM checkpoint API returns `-ENOTSUP`; cross-compilation is not runtime validation |
 | macOS ARM64/HVF | Implemented; native and software GIC, 2-vCPU process-exit/repeated restore tested |
@@ -154,6 +164,7 @@ cargo build -p libkrun --features blk,net
 LD_LIBRARY_PATH=/path/to/firmware python3 tests/checkpoint/run.py
 KRUN_TEST_NET=1 KRUN_TEST_FAIL_EXPORT=1 LD_LIBRARY_PATH=/path/to/firmware python3 tests/checkpoint/run.py
 KRUN_TEST_TSI=1 KRUN_TEST_FREEZE_FAILURE=1 LD_LIBRARY_PATH=/path/to/firmware python3 tests/checkpoint/run.py
+KRUN_TEST_DAX=1 KRUN_TEST_FAIL_EXPORT=1 LD_LIBRARY_PATH=/path/to/firmware python3 tests/checkpoint/run.py
 ```
 
 For QCOW2, build the adapter around the existing BoxLite source; it applies the
@@ -190,6 +201,7 @@ KRUN_TEST_TSI=1 KRUN_TEST_FAIL_EXPORT=1 python3 tests/checkpoint/run-hvf.py /pat
 KRUN_HVF_GIC=software KRUN_TEST_NET=1 python3 tests/checkpoint/run-hvf.py /path/to/libkrunfw-directory
 KRUN_TEST_TSI=1 KRUN_TEST_FLATTEN=/path/to/checkpoint-flatten python3 tests/checkpoint/run-hvf.py /path/to/libkrunfw-directory
 KRUN_TEST_FREEZE_FAILURE=1 python3 tests/checkpoint/run-hvf.py /path/to/libkrunfw-directory
+KRUN_TEST_DAX=1 KRUN_TEST_FAIL_EXPORT=1 python3 tests/checkpoint/run-hvf.py /path/to/libkrunfw-directory
 cargo test -p krun-hvf -p krun-vmm -p krun-devices --features blk,net
 ```
 

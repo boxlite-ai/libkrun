@@ -1,8 +1,3 @@
-#[cfg(target_os = "macos")]
-use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
-use utils::worker_message::WorkerMessage;
-
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicI32;
@@ -37,25 +32,10 @@ impl FsServer {
         w: Writer,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> super::Result<usize> {
         match self {
-            FsServer::ReadWrite(s) => s.handle_message(
-                r,
-                w,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
-            FsServer::ReadOnly(s) => s.handle_message(
-                r,
-                w,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
+            FsServer::ReadWrite(s) => s.handle_message(r, w, shm_region, exit_code),
+            FsServer::ReadOnly(s) => s.handle_message(r, w, shm_region, exit_code),
         }
     }
 }
@@ -71,8 +51,6 @@ pub struct FsWorker {
 
     checkpoint: WorkerCheckpoint,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")]
-    map_sender: Option<Sender<WorkerMessage>>,
 }
 
 impl FsWorker {
@@ -88,7 +66,6 @@ impl FsWorker {
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         checkpoint: WorkerCheckpoint,
-        #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let server = if read_only {
             FsServer::ReadOnly(Server::new(PassthroughFsRo::new(passthrough_cfg)?))
@@ -99,14 +76,19 @@ impl FsWorker {
         let server = {
             let mut server = server;
             if let Some(saved) = &checkpoint.restore {
-                match &mut server {
-                    FsServer::ReadWrite(server) => server
-                        .restore_options(saved.options)?
-                        .restore_state(&saved.filesystem)?,
-                    FsServer::ReadOnly(server) => server
-                        .restore_options(saved.options)?
-                        .inner
-                        .restore_state(&saved.filesystem)?,
+                let fs = match &mut server {
+                    FsServer::ReadWrite(server) => server.restore_options(saved.options)?,
+                    FsServer::ReadOnly(server) => &mut server.restore_options(saved.options)?.inner,
+                };
+                fs.restore_state(&saved.filesystem)?;
+                if let Some(window) = &shm_region {
+                    #[cfg(target_os = "linux")]
+                    let base = window.host_addr;
+                    #[cfg(target_os = "macos")]
+                    let base = window.guest_addr;
+                    fs.restore_mappings(&saved.filesystem, base, window.size as u64, read_only)?;
+                } else if !saved.filesystem.mappings.is_empty() {
+                    return Err(invalid("DAX mappings require a window"));
                 }
             }
             server
@@ -122,8 +104,6 @@ impl FsWorker {
 
             checkpoint,
             exit_code,
-            #[cfg(target_os = "macos")]
-            map_sender,
         })
     }
 
@@ -300,14 +280,10 @@ impl FsWorker {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            if let Err(e) = self.server.handle_message(
-                reader,
-                writer,
-                &self.shm_region,
-                &self.exit_code,
-                #[cfg(target_os = "macos")]
-                &self.map_sender,
-            ) {
+            if let Err(e) =
+                self.server
+                    .handle_message(reader, writer, &self.shm_region, &self.exit_code)
+            {
                 error!("error handling message: {e:?}");
             }
 

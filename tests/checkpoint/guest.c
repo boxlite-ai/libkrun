@@ -17,6 +17,9 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 
 static void test_abort(int line) {
     int saved_errno = errno;
@@ -117,6 +120,31 @@ int main(void) {
     uint64_t nonce;
     if (getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce)) abort();
     for (size_t i = 0; i < sizeof(memory); ++i) memory[i] = (unsigned char)(i ^ nonce);
+    volatile unsigned char *dax = NULL;
+    const volatile unsigned char *dax_readonly = NULL;
+    size_t dax_page = (size_t)sysconf(_SC_PAGESIZE);
+    if (access("/dax-test", F_OK) == 0) {
+        if (mkdir("/dax", 0700) && errno != EEXIST) abort();
+        if (mount("dax-test", "/dax", "virtiofs", 0, "dax=always")) abort();
+        int fd = open("/dax/mapped", O_CREAT | O_RDWR, 0600);
+        if (fd < 0 || ftruncate(fd, 3 * dax_page)) abort();
+        struct statx st;
+        if (statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &st)
+            || !(st.stx_attributes & STATX_ATTR_DAX)) abort();
+        dax = mmap(NULL, 3 * dax_page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (dax == MAP_FAILED) abort();
+        dax[0] = (unsigned char)nonce;
+        dax[2 * dax_page] = (unsigned char)(nonce >> 8);
+        dax[2 * dax_page + 32] = 0;
+        if (msync((void *)dax, 3 * dax_page, MS_SYNC)) abort();
+        close(fd);
+        if (munmap((void *)(dax + dax_page), dax_page)) abort();
+        fd = open("/dax/readonly", O_RDONLY);
+        if (fd < 0) abort();
+        dax_readonly = mmap(NULL, dax_page, PROT_READ, MAP_SHARED, fd, 0);
+        if (dax_readonly == MAP_FAILED || dax_readonly[0] != 'R') abort();
+        close(fd);
+    }
     int log = open("/progress", O_CREAT | O_WRONLY | O_APPEND, 0600);
     int kept = open("/kept", O_CREAT | O_RDWR, 0600);
     int gone = open("/gone", O_CREAT | O_RDWR, 0600);
@@ -157,6 +185,20 @@ int main(void) {
     pthread_t threads[2];
     for (uintptr_t i = 0; i < 2; ++i) if (pthread_create(&threads[i], NULL, count, (void *)i)) abort();
     for (;;) {
+        if (dax) {
+            if (dax_readonly[0] != 'R') abort();
+            if (dax[0] != (unsigned char)nonce || dax[2 * dax_page] != (unsigned char)(nonce >> 8)) abort();
+            dax[2 * dax_page + 16]++;
+            if (dax[2 * dax_page + 32] == 0x5a) {
+                if (dax_readonly[1] != 0x6b) abort();
+                int seen = open("/dax-observed", O_CREAT | O_WRONLY, 0600);
+                if (seen < 0) abort(); close(seen);
+                if (dax_readonly[2] == 0x7c) {
+                    seen = open("/dax-live-observed", O_CREAT | O_WRONLY, 0600);
+                    if (seen < 0) abort(); close(seen);
+                }
+            }
+        }
         if (!hot_memory && access("/allocate-hotplug", F_OK) == 0) {
             // Host plugged accounting can precede the guest's memory-online
             // work. Wait for the guest allocator to see the new capacity.

@@ -1,3 +1,4 @@
+mod dax;
 mod device;
 #[allow(dead_code)]
 mod filesystem;

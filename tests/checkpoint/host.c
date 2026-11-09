@@ -109,6 +109,10 @@ int main(int argc, char **argv) {
     int block_root = getenv("KRUN_TEST_BLOCK_ROOT") != NULL;
     if (!block_root) check(krun_set_root(context, argv[2]), "root");
     check(krun_set_console_output(context, argv[4]), "console");
+    if (getenv("KRUN_TEST_DAX")) {
+        char path[4096]; snprintf(path, sizeof(path), "%s/dax-share", root);
+        check(krun_add_virtiofs2(context, "dax-test", path, 8 * 1024 * 1024), "DAX share");
+    }
     // Network lifecycle is tested separately; this fixture isolates the CPU,
     // virtio-fs, console and disk continuation boundary.
     if (!getenv("KRUN_TEST_TSI")) check(krun_disable_implicit_vsock(context), "disable implicit vsock");

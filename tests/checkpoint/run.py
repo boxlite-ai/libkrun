@@ -24,6 +24,10 @@ root = work / "root"
 root.mkdir()
 for name in ("dev", "proc", "sys", "tmp", "run", "etc"):
     (root / name).mkdir()
+if os.environ.get("KRUN_TEST_DAX"):
+    (root / "dax-test").touch()
+    (root / "dax-share").mkdir()
+    (root / "dax-share/readonly").write_bytes(b"R" + bytes(65535))
 library = work / "lib"
 library.mkdir()
 hvf = platform.system() == "Darwin"
@@ -249,11 +253,28 @@ try:
     wait(lambda: "CHECKPOINT 0" in text(log), source, [log, console])
     if os.environ.get("KRUN_TEST_TSI"):
         wait(lambda: ticks()[-1][9] > 0 and ticks()[-1][10] > 0, source, [log, console])
+    if os.environ.get("KRUN_TEST_DAX"):
+        saved = json.loads((first / "state.bin").read_bytes()[16:])
+        fs = next(d["state"]["state"] for d in saved["devices"]
+                  if d["state"]["kind"] == "Fs" and d["state"]["state"]["tag"] == "dax-test")
+        assert fs["dax_window"]["size"] == 8 * 1024 * 1024
+        mappings = fs["worker"]["filesystem"]["mappings"]
+        assert any(m["writable"] for m in mappings), "missing writable DAX mapping"
+        assert any(not m["writable"] for m in mappings), "missing read-only DAX mapping"
+        assert saved["ram"]["len"] < 257 * 1024 * 1024, "DAX windows entered RAM export"
     at_save = len(ticks())
     wait(lambda: len(ticks()) > at_save + 3, source, [log, console])
     source.send_signal(signal.SIGUSR1)
     wait(lambda: f"CHECKPOINT {-errno.EEXIST}" in text(log), source, [log, console])
     stop(source)  # Source process has exited before any restore starts.
+    if os.environ.get("KRUN_TEST_DAX"):
+        # The shared directory stays live; restored CPU mappings must observe host edits.
+        # Derive the guest's page size from the three-page test file.
+        page = (root / "dax-share/mapped").stat().st_size // 3
+        with (root / "dax-share/mapped").open("r+b") as file:
+            file.seek(2 * page + 32); file.write(b"\x5a")
+        with (root / "dax-share/readonly").open("r+b") as file:
+            file.seek(1); file.write(b"\x6b")
     before_restore = len(ticks())
     if not os.environ.get("KRUN_TEST_BLOCK_ROOT"):
         (root / "gone").unlink()
@@ -271,6 +292,11 @@ try:
     # Debug builds hash and copy every RAM artifact before entering KVM. Keep
     # startup separate from the short deadline for an already-running guest.
     wait(lambda: len(ticks()) > before_restore + 5, target, [log, console], timeout=180)
+    if os.environ.get("KRUN_TEST_DAX"):
+        wait(lambda: (root / "dax-observed").exists(), target, [log, console])
+        with (root / "dax-share/readonly").open("r+b") as file:
+            file.seek(2); file.write(b"\x7c")
+        wait(lambda: (root / "dax-live-observed").exists(), target, [log, console])
     after = ticks()[before_restore:]
     if hvf:
         assert after[0][3] - ticks()[before_restore - 1][3] < 750_000_000, after[0]
@@ -339,6 +365,21 @@ try:
     assert len(ticks()) == progress
     if os.environ.get("KRUN_TEST_NET"):
         wait(lambda: backends[-1].closed, bad_cpu, [log, console])
+    if os.environ.get("KRUN_TEST_DAX"):
+        mapped = root / "dax-share/mapped"
+        contents = mapped.read_bytes()
+        mapped.write_bytes(b"truncated")
+        progress = len(ticks())
+        bad_dax, log, console = start("restore", first)
+        assert bad_dax.wait(timeout=30) != 0
+        assert len(ticks()) == progress, "vCPUs resumed with truncated DAX backing"
+        mapped.write_bytes(contents)
+        mapped.rename(mapped.with_name("original"))
+        mapped.write_bytes(contents)
+        bad_dax, log, console = start("restore", first)
+        assert bad_dax.wait(timeout=30) != 0
+        assert len(ticks()) == progress, "vCPUs resumed with replaced DAX backing"
+
     result = {"status": "passed", "platform": "macos-aarch64-hvf" if hvf else "linux-x86_64-kvm", "source_pid": source.pid, "restore_pid": target.pid, "repeat_pid": repeated.pid,
               "nonce": original[0], "vcpus": 2, "virtio_fs_stale_handle": not bool(os.environ.get("KRUN_TEST_BLOCK_ROOT")), "independent_disk": "qcow2-flatten" if os.environ.get("KRUN_TEST_FLATTEN") else "raw",
               "corrupt_metadata_rejected": True, "truncated_ram_rejected": True, "failed_restore_joined": True, "work": str(work)}
@@ -346,6 +387,7 @@ try:
         saved_platform = json.loads((first / "state.bin").read_bytes()[16:])["vm"]
         result["gic"] = "native" if saved_platform["native_gic"] else "software"
         result["virtual_clock_excludes_offline"] = True
+    result["dax_mapping_restore"] = bool(os.environ.get("KRUN_TEST_DAX"))
     result["ext4_rootfs"] = bool(os.environ.get("KRUN_TEST_BLOCK_ROOT"))
     result["tsi_tcp_accept_udp"] = bool(os.environ.get("KRUN_TEST_TSI"))
     result["hotplug_384_mib"] = bool(os.environ.get("KRUN_TEST_HOTPLUG"))

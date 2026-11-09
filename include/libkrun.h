@@ -27,10 +27,11 @@ int32_t krun_request_memory(uint32_t ctx_id, uint32_t total_mib);
 int32_t krun_get_memory_status(uint32_t ctx_id, struct krun_memory_status *status);
 
 /* Experimental checkpoint container version 1, Linux x86_64/KVM and macOS ARM64/HVF.
- * Configure before start_enter. Checkpoint mode owns the kernel's RAM and uses
- * ordinary virtio-fs I/O instead of a DAX window. Unsupported platforms return
- * -ENOTSUP. External virtio-fs contents are live; missing/replaced objects yield
- * guest I/O errors on subsequent FUSE requests rather than binding replacements.
+ * Configure before start_enter. Checkpoint mode owns the kernel's RAM and
+ * preserves virtio-fs DAX mappings. Unsupported platforms return -ENOTSUP.
+ * External virtio-fs contents remain live. Missing/replaced objects yield guest
+ * FUSE errors; missing/replaced/truncated DAX backing files reject restore.
+ * HVF DAX backing files require host read/write access even for read-only guests.
  */
 int32_t krun_set_checkpointing(uint32_t ctx_id, bool enabled);
 /* Restore uses start_enter with the existing ctx lifecycle, bypassing all boot

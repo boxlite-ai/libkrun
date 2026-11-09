@@ -10,6 +10,13 @@ use crate::virtio::control::{Command, WorkerControl};
 use crate::virtio::persist::{invalid, QueueState, VirtioDeviceState};
 use crate::virtio::VirtioDevice;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaxWindowState {
+    pub guest_addr: u64,
+    pub size: u64,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FsDeviceState {
@@ -17,6 +24,8 @@ pub struct FsDeviceState {
     pub tag: String,
     pub read_only: bool,
     pub retired_root: bool,
+    #[serde(default)]
+    pub dax_window: Option<DaxWindowState>,
     pub worker: Option<FsWorkerState>,
 }
 
@@ -37,11 +46,6 @@ pub(super) struct WorkerCheckpoint {
 
 impl Fs {
     pub fn freeze(&mut self, deadline: Instant) -> io::Result<()> {
-        if self.shm_region.is_some() {
-            return Err(invalid(
-                "checkpoint requires virtio-fs without a DAX window",
-            ));
-        }
         if self.snapshot_failed {
             return Err(invalid("fs checkpoint requires teardown"));
         }
@@ -73,6 +77,10 @@ impl Fs {
         Ok(FsDeviceState {
             device: VirtioDeviceState::save(self)?,
             tag: self.tag().into(),
+            dax_window: self.shm_region.as_ref().map(|r| DaxWindowState {
+                guest_addr: r.guest_addr,
+                size: r.size as u64,
+            }),
             read_only: self.read_only,
             retired_root: self.snapshot_retired_root
                 || (self.passthrough_cfg.allow_root_dir_delete
@@ -87,7 +95,11 @@ impl Fs {
         if self.is_activated()
             || self.worker_thread.is_some()
             || self.snapshot_failed
-            || self.shm_region.is_some()
+            || state.dax_window
+                != self.shm_region.as_ref().map(|r| DaxWindowState {
+                    guest_addr: r.guest_addr,
+                    size: r.size as u64,
+                })
             || state.tag != self.tag()
             || state.read_only != self.read_only
             || state.worker.is_some() != state.device.activated
@@ -96,6 +108,10 @@ impl Fs {
         }
         if let Some(worker) = &state.worker {
             worker.filesystem.validate()?;
+            super::dax::validate_states(
+                &worker.filesystem.mappings,
+                state.dax_window.as_ref().map_or(0, |w| w.size),
+            )?;
             if state.retired_root
                 && (worker
                     .filesystem
@@ -106,7 +122,12 @@ impl Fs {
                         .filesystem
                         .handles
                         .iter()
-                        .any(|h| h.object.path.is_some()))
+                        .any(|h| h.object.path.is_some())
+                    || worker
+                        .filesystem
+                        .mappings
+                        .iter()
+                        .any(|m| m.object.is_some()))
             {
                 return Err(invalid("retired bootstrap root contains live host objects"));
             }

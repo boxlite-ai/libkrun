@@ -215,7 +215,7 @@ impl Vmm {
                         ),
                     ));
                 }
-                if locked.shm_region().is_some() {
+                if locked.shm_region().is_some() && !any.is::<Fs>() {
                     return Err(invalid("checkpoint cannot capture shared host mappings"));
                 }
                 if let Some(console) = any.downcast_ref::<Console>() {
@@ -417,6 +417,7 @@ impl Vmm {
             self.exit_evt.write(exiting)?;
             return Err(invalid("VM is exiting"));
         }
+        let ordinary_memory = without_dax(&self.guest_memory, devices)?;
         #[cfg(target_os = "linux")]
         let (memory_device, memory_guard, memory_state, accessible, ram, hotplug_artifact) = {
             let memory_device = devices
@@ -427,8 +428,8 @@ impl Vmm {
                 .as_ref()
                 .map(|d| d.as_any().downcast_ref::<Mem>().unwrap());
             let boot = match hotplug {
-                Some(device) => device.boot_memory(&self.guest_memory)?,
-                None => self.guest_memory.clone(),
+                Some(device) => device.boot_memory(&ordinary_memory)?,
+                None => ordinary_memory.clone(),
             };
             // Raw aliases remain under the frozen memory-device lock until every
             // queue validation is complete, and cannot escape this function.
@@ -458,7 +459,7 @@ impl Vmm {
         #[cfg(target_os = "macos")]
         let (accessible, ram, hotplug_artifact) = (
             self.guest_memory.clone(),
-            write_ram(directory, &self.guest_memory)?,
+            write_ram(directory, &ordinary_memory)?,
             None,
         );
         let mut records = Vec::new();
@@ -833,6 +834,28 @@ fn artifact(directory: &Path, name: &str) -> io::Result<Artifact> {
         len: open_file(&directory.join(name))?.metadata()?.len(),
     })
 }
+fn without_dax(
+    memory: &vm_memory::GuestMemoryMmap,
+    devices: &[LiveDevice],
+) -> io::Result<vm_memory::GuestMemoryMmap> {
+    let mut ram = memory.clone();
+    for live in devices {
+        let device = live.device.lock().unwrap();
+        if device.as_any().is::<Fs>() {
+            if let Some(window) = device.shm_region() {
+                ram = ram
+                    .remove_region(
+                        vm_memory::GuestAddress(window.guest_addr),
+                        window.size as u64,
+                    )
+                    .map_err(other)?
+                    .0;
+            }
+        }
+    }
+    Ok(ram)
+}
+
 fn write_ram(directory: &Path, memory: &vm_memory::GuestMemoryMmap) -> io::Result<Artifact> {
     let mut file = create_file(&directory.join("ram.bin"))?;
     crate::ram_snapshot::save_file(memory, &mut file)?;

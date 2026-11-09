@@ -2,11 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(target_os = "macos")]
-use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
-use utils::worker_message::WorkerMessage;
-
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -100,7 +95,6 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -164,15 +158,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 let shm_base_addr = shm.host_addr;
                 #[cfg(target_os = "macos")]
                 let shm_base_addr = shm.guest_addr;
-                self.setupmapping(
-                    in_header,
-                    r,
-                    w,
-                    shm_base_addr,
-                    shm.size as u64,
-                    #[cfg(target_os = "macos")]
-                    map_sender,
-                )
+                self.setupmapping(in_header, r, w, shm_base_addr, shm.size as u64)
             }
             x if (x == Opcode::RemoveMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
@@ -180,15 +166,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 let shm_base_addr = shm.host_addr;
                 #[cfg(target_os = "macos")]
                 let shm_base_addr = shm.guest_addr;
-                self.removemapping(
-                    in_header,
-                    r,
-                    w,
-                    shm_base_addr,
-                    shm.size as u64,
-                    #[cfg(target_os = "macos")]
-                    map_sender,
-                )
+                self.removemapping(in_header, r, w, shm_base_addr, shm.size as u64)
             }
             _ => reply_error(
                 linux_error(io::Error::from_raw_os_error(libc::ENOSYS)),
@@ -1367,7 +1345,6 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> Result<usize> {
         let SetupmappingIn {
             fh,
@@ -1387,8 +1364,6 @@ impl<F: FileSystem + Sync> Server<F> {
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
@@ -1402,7 +1377,6 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> Result<usize> {
         let RemovemappingIn { count } = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -1430,14 +1404,10 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
 
-        match self.fs.removemapping(
-            Context::from(in_header),
-            requests,
-            host_shm_base,
-            shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
-        ) {
+        match self
+            .fs
+            .removemapping(Context::from(in_header), requests, host_shm_base, shm_size)
+        {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }

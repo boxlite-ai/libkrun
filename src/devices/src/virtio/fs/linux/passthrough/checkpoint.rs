@@ -2,7 +2,7 @@
 
 //! Rebinding to the same host directory, with guest-visible errors for objects
 //! that disappeared or were replaced. File contents intentionally remain live.
-//! The owner must stop the fs worker and exclude exported/DAX aliases first.
+//! The owner must stop the fs worker and exclude exported guest-memory aliases first.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -49,6 +49,8 @@ pub struct FsState {
     pub announce_submounts: bool,
     pub inodes: Vec<InodeState>,
     pub handles: Vec<HandleState>,
+    #[serde(default)]
+    pub mappings: Vec<crate::virtio::fs::dax::DaxMappingState>,
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -64,6 +66,21 @@ fn object_unavailable(error: &io::Error) -> bool {
 }
 
 impl Object {
+    pub(crate) fn reopen_mapping(&self, root: &File, writable: bool) -> io::Result<File> {
+        let pinned = self.reopen(root)?;
+        let path = CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd())).unwrap();
+        let flags = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
     fn identity_time(file: &File) -> io::Result<(bool, [i64; 2])> {
         let mut stat = MaybeUninit::<libc::statx>::zeroed();
         if unsafe {
@@ -91,7 +108,7 @@ impl Object {
         Ok((birth, [time.tv_sec, i64::from(time.tv_nsec)]))
     }
 
-    fn capture(file: &File, root: &Path) -> io::Result<Self> {
+    pub(crate) fn capture(file: &File, root: &Path) -> io::Result<Self> {
         let metadata = file.metadata()?;
         let (birth_time, identity_time) = Self::identity_time(file)?;
         let path = if metadata.nlink() == 0 {
@@ -117,7 +134,7 @@ impl Object {
         })
     }
 
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         if let Some(bytes) = &self.path {
             let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
             if bytes.contains(&0)
@@ -218,6 +235,20 @@ impl FsState {
 }
 
 impl PassthroughFs {
+    pub(crate) fn restore_mappings(
+        &self,
+        state: &FsState,
+        base: u64,
+        size: u64,
+        read_only: bool,
+    ) -> io::Result<()> {
+        let root = File::open(&self.cfg.root_dir)?;
+        self.dax
+            .lock()
+            .unwrap()
+            .restore(&state.mappings, &root, base, size, INIT_BINARY, read_only)
+    }
+
     pub fn save_state(&self) -> io::Result<FsState> {
         if self
             .cfg
@@ -280,6 +311,7 @@ impl PassthroughFs {
             announce_submounts: self.announce_submounts.load(Ordering::Acquire),
             inodes,
             handles,
+            mappings: self.dax.lock().unwrap().capture(&root)?,
         };
         state.validate()?;
         Ok(state)

@@ -170,7 +170,53 @@ pub fn restore(
             return Err(invalid("invalid RAM mapping or MMIO overlap"));
         }
     }
-    let memory = crate::ram_snapshot::restore_file(&ram, &ram_layout)?;
+    let mut memory = crate::ram_snapshot::restore_file(&ram, &ram_layout)?;
+    // DAX windows are address-space reservations, not RAM payload. Never read
+    // their file-backed/protected pages through the RAM codec.
+    for record in &saved.devices {
+        if let DeviceSnapshot::Fs(fs) = &record.state {
+            if let Some(window) = &fs.dax_window {
+                // The block-root bootstrap share is recreated internally. Its
+                // window has the fixed 512 MiB size used by set_root_disk_remount.
+                let configured = if fs.retired_root {
+                    1 << 29
+                } else {
+                    resources
+                        .fs
+                        .iter()
+                        .find(|f| f.fs_id == fs.tag)
+                        .and_then(|f| f.shm_size)
+                        .unwrap_or(0) as u64
+                };
+                let end = window
+                    .guest_addr
+                    .checked_add(window.size)
+                    .ok_or_else(|| invalid("DAX window overflow"))?;
+                let page = saved.arch_memory[4];
+                let configured = configured
+                    .checked_add(page - 1)
+                    .ok_or_else(|| invalid("DAX size budget overflow"))?
+                    / page
+                    * page;
+                if window.size == 0
+                    || window.size > configured
+                    || window.guest_addr % page != 0
+                    || window.size % page != 0
+                    || window.guest_addr < saved.arch_memory[3]
+                    || !valid_ram_range(window.guest_addr, end)
+                {
+                    return Err(invalid("invalid DAX window or missing size budget"));
+                }
+                let region = vm_memory::GuestRegionMmap::from_range(
+                    vm_memory::GuestAddress(window.guest_addr),
+                    window.size as usize,
+                    None,
+                )
+                .map_err(other)?;
+                memory = memory.insert_region(Arc::new(region)).map_err(other)?;
+            }
+        }
+    }
     drop(ram);
     #[cfg(target_os = "linux")]
     let (mut vmm, intc) = {
@@ -377,6 +423,18 @@ pub fn restore(
                             config.read_only,
                         )
                         .map_err(|e| invalid(&format!("fs: {e:?}")))?;
+                        if let Some(window) = &state.dax_window {
+                            use vm_memory::GuestMemory;
+                            fs.set_shm_region(devices::virtio::VirtioShmRegion {
+                                host_addr: vmm
+                                    .guest_memory
+                                    .get_host_address(vm_memory::GuestAddress(window.guest_addr))
+                                    .map_err(other)?
+                                    as u64,
+                                guest_addr: window.guest_addr,
+                                size: window.size as usize,
+                            });
+                        }
                         fs.restore_state(state)?;
                         let device = Arc::new(Mutex::new(fs));
                         (device, state.worker.as_ref().map(|w| w.queues.clone()))
