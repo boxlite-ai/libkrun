@@ -3,7 +3,7 @@
 use std::io;
 
 pub(super) fn allocated(address: usize, len: usize, page_size: usize) -> io::Result<Vec<bool>> {
-    if address % page_size != 0 {
+    if !address.is_multiple_of(page_size) {
         return Err(io::Error::other("unaligned RAM mapping"));
     }
     query(address, len.div_ceil(page_size), page_size)

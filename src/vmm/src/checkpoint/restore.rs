@@ -492,11 +492,11 @@ pub fn restore(
                                     }
                                     _ => None,
                                 };
-                                if implicit && resources.console_output.is_some() {
-                                    let file = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(resources.console_output.as_ref().unwrap())?;
+                                if let Some(path) =
+                                    resources.console_output.as_ref().filter(|_| implicit)
+                                {
+                                    let file =
+                                        OpenOptions::new().create(true).append(true).open(path)?;
                                     use devices::virtio::{port_io, PortDescription};
                                     let terminal =
                                         if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {

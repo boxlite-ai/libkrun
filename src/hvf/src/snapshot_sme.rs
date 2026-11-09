@@ -107,7 +107,7 @@ impl SmeState {
             zt0: Vec::new(),
         };
         check(unsafe { (api.svl)(&mut state.svl) })?;
-        if !(16..=256).contains(&state.svl) || state.svl % 16 != 0 {
+        if !(16..=256).contains(&state.svl) || !state.svl.is_multiple_of(16) {
             return Err(io::Error::other("invalid SME vector length"));
         }
         check(unsafe { (api.get_mode)(cpu, &mut state.mode) })?;

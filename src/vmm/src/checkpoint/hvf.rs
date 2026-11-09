@@ -162,7 +162,7 @@ pub(super) fn build(
     for region in memory.iter() {
         let start = region.start_addr().raw_value();
         let end = start + region.len();
-        for pair in properties.chunks_exact(2) {
+        for pair in properties.as_chunks::<2>().0 {
             if start < pair[0] + pair[1] && end > pair[0] {
                 return Err(invalid("RAM overlaps GIC"));
             }

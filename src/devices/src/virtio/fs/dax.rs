@@ -25,7 +25,7 @@ pub struct DaxMappingState {
 impl DaxMappingState {
     pub fn validate(&self, window_size: u64) -> io::Result<()> {
         validate_range(self.offset, self.len, window_size)?;
-        if self.file_offset % page_size() != 0
+        if !self.file_offset.is_multiple_of(page_size())
             || self
                 .file_offset
                 .checked_add(self.len)
@@ -62,8 +62,8 @@ fn page_size() -> u64 {
 
 fn validate_range(offset: u64, len: u64, size: u64) -> io::Result<()> {
     if len == 0
-        || offset % page_size() != 0
-        || len % page_size() != 0
+        || !offset.is_multiple_of(page_size())
+        || !len.is_multiple_of(page_size())
         || offset.checked_add(len).is_none_or(|end| end > size)
     {
         return Err(invalid("invalid DAX window range"));
@@ -121,7 +121,7 @@ impl DaxMappings {
         if self.failed
             || base.checked_add(size).is_none()
             || self.base.is_some_and(|previous| previous != base)
-            || file_offset % page_size() != 0
+            || !file_offset.is_multiple_of(page_size())
             || file_offset
                 .checked_add(len)
                 .is_none_or(|end| end > i64::MAX as u64)

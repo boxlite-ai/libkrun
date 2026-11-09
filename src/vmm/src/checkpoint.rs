@@ -111,6 +111,8 @@ struct Metadata {
     ram_len: u64,
     hotplug_len: Option<u64>,
     vm: VmState,
+    // Keep the boxed states transferred from their owning vCPU threads.
+    #[allow(clippy::vec_box)]
     cpus: Vec<Box<VcpuState>>,
     devices: Vec<DeviceRecord>,
     legacy: LegacyState,
@@ -170,7 +172,7 @@ impl Drop for Vmm {
         for handle in &mut self.vcpus_handles {
             handle.stop_and_join();
         }
-        for ((kind, id), _) in self.mmio_device_manager.get_device_info() {
+        for (kind, id) in self.mmio_device_manager.get_device_info().keys() {
             if let Some(bus) = self.mmio_device_manager.get_device(*kind, id) {
                 let bus = bus.lock().unwrap();
                 if let Some(transport) = bus.as_any().downcast_ref::<MmioTransport>() {
@@ -410,6 +412,8 @@ impl Vmm {
             self.write_checkpoint(&staged_file, &devices, counts.clone(), &mut timings)
         })();
         // Restore IRQ delivery without restarting CPU/device writers.
+        // On Linux, isolate fallible IRQ recovery so errors reach cleanup below.
+        #[cfg_attr(not(target_os = "linux"), allow(clippy::redundant_closure_call))]
         let recovered: io::Result<()> = (|| {
             #[cfg(target_os = "linux")]
             for (index, (event, irq)) in bindings.iter().take(detached).enumerate() {

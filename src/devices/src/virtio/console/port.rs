@@ -148,6 +148,8 @@ impl PortQueue {
     }
 }
 
+// Active ports always own both queues; keep their state inline.
+#[allow(clippy::large_enum_variant)]
 enum PortState {
     Inactive,
     Active { rx: PortQueue, tx: PortQueue },
