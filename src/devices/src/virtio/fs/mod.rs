@@ -1,3 +1,4 @@
+mod dax;
 mod device;
 #[allow(dead_code)]
 mod filesystem;
@@ -6,7 +7,9 @@ pub mod fuse;
 mod multikey;
 mod read_only;
 mod server;
+mod snapshot;
 mod worker;
+pub use snapshot::FsDeviceState;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

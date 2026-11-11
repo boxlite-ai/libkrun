@@ -12,13 +12,20 @@ use std::io;
 use std::result;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+static TEST_VM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub mod control;
+pub use control::VcpuState;
+pub type VmState = crate::checkpoint::hvf::VmState;
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
@@ -47,6 +54,7 @@ pub enum Error {
     VcpuCountNotInitialized,
     /// Cannot run the VCPUs.
     VcpuRun,
+    Checkpoint(io::Error),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
@@ -67,6 +75,7 @@ impl Display for Error {
             GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
             VmSetup(e) => write!(f, "Cannot configure the microvm: {e:?}"),
+            Checkpoint(e) => write!(f, "HVF checkpoint: {e}"),
             VcpuRun => write!(f, "Cannot run the VCPUs"),
             NotEnoughMemorySlots => write!(
                 f,
@@ -179,8 +188,8 @@ type VcpuCell = Cell<Option<*const Vcpu>>;
 pub struct Vcpu {
     id: u8,
     boot_entry_addr: u64,
-    boot_receiver: Option<Receiver<u64>>,
-    boot_senders: Option<HashMap<u64, Sender<u64>>>,
+    boot_receiver: Option<Receiver<(u64, u64)>>,
+    boot_senders: Option<HashMap<u64, Sender<(u64, u64)>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -200,6 +209,7 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    pub(crate) native_gic: bool,
 }
 
 impl Vcpu {
@@ -270,7 +280,7 @@ impl Vcpu {
     pub fn new_aarch64(
         id: u8,
         boot_entry_addr: GuestAddress,
-        boot_receiver: Option<Receiver<u64>>,
+        boot_receiver: Option<Receiver<(u64, u64)>>,
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
@@ -293,6 +303,7 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            native_gic: false,
         })
     }
 
@@ -311,7 +322,7 @@ impl Vcpu {
         self.mmio_bus = Some(mmio_bus);
     }
 
-    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
+    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<(u64, u64)>>) {
         self.boot_senders = Some(boot_senders);
     }
 
@@ -343,14 +354,13 @@ impl Vcpu {
             })
             .map_err(Error::VcpuSpawn)?;
 
-        init_tls_receiver
-            .recv()
-            .expect("Error waiting for TLS initialization.");
+        let hvf_id = init_tls_receiver.recv().map_err(|_| Error::VcpuRun)??;
 
         Ok(VcpuHandle::new(
             event_sender,
             response_receiver,
             vcpu_thread,
+            hvf_id,
         ))
     }
 
@@ -372,7 +382,7 @@ impl Vcpu {
                     debug!("CpuOn: mpidr=0x{mpidr:x} entry=0x{entry:x} context_id={context_id}");
                     if let Some(boot_senders) = &self.boot_senders {
                         if let Some(sender) = boot_senders.get(&mpidr) {
-                            sender.send(entry).unwrap()
+                            sender.send((entry, context_id)).unwrap()
                         }
                     } else {
                         error!("CpuOn request coming from an unexpected vCPU={}", self.id);
@@ -434,79 +444,171 @@ impl Vcpu {
         }
     }
 
-    /// Main loop of the vCPU thread.
-    pub fn run(&mut self, init_tls_sender: Sender<bool>) {
-        let mut hvf_vcpu =
-            HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
-        let hvf_vcpuid = hvf_vcpu.id();
-
-        init_tls_sender
-            .send(true)
-            .expect("Cannot notify vcpu TLS initialization.");
-
-        let (wfe_sender, wfe_receiver) = unbounded();
-        self.vcpu_list.register(hvf_vcpuid, wfe_sender);
-
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
-        } else {
-            self.boot_entry_addr
+    /// All HVF register operations and destruction stay on this owning thread.
+    pub fn run(&mut self, ready: Sender<Result<u64>>) {
+        let mut cpu = match HvfVcpu::new(self.mpidr, self.nested_enabled) {
+            Ok(cpu) => cpu,
+            Err(e) => {
+                let _ = ready.send(Err(Error::VmSetup(e)));
+                return;
+            }
         };
-
-        hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
-
+        let id = cpu.id();
+        let (wake, wakes) = unbounded();
+        if let Err(e) = cpu.set_initial_state(self.boot_entry_addr, self.fdt_addr) {
+            let _ = ready.send(Err(Error::VmSetup(e)));
+            return;
+        }
+        self.vcpu_list.register(id, wake);
+        let _ = ready.send(Ok(id));
+        let mut powered = self.boot_receiver.is_none();
+        let mut paused = true;
+        let mut failed = false;
+        let mut has_run = false;
+        let mut wait_until: Option<Option<Instant>> = None;
         loop {
-            match self.run_emulation(&mut hvf_vcpu) {
-                // Emulation ran successfully, continue.
-                Ok(VcpuEmulation::Handled) => (),
-                // Emulation was interrupted by a breakpoint.
-                Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
-                // Wait for an external event.
+            // A CPU_ON queued just before the barrier is part of CPU power state.
+            if !powered {
+                if let Some((entry, context)) =
+                    self.boot_receiver.as_ref().and_then(|r| r.try_recv().ok())
+                {
+                    if cpu.set_initial_state(entry, context).is_err() {
+                        break;
+                    }
+                    powered = true;
+                }
+            }
+            let event = if paused {
+                match self.event_receiver.recv() {
+                    Ok(event) => Some(event),
+                    Err(_) => break,
+                }
+            } else if !powered {
+                crossbeam_channel::select! {
+                    recv(self.event_receiver) -> event => match event { Ok(event) => Some(event), Err(_) => break },
+                    recv(self.boot_receiver.as_ref().unwrap()) -> boot => {
+                        let Ok((entry, context)) = boot else { break; };
+                        if cpu.set_initial_state(entry, context).is_err() { break; }
+                        powered = true;
+                        None
+                    }
+                }
+            } else if let Some(deadline) = wait_until {
+                let timer = deadline
+                    .map(|t| crossbeam_channel::after(t.saturating_duration_since(Instant::now())))
+                    .unwrap_or_else(crossbeam_channel::never);
+                crossbeam_channel::select! {
+                    recv(self.event_receiver) -> event => match event { Ok(event) => Some(event), Err(_) => break },
+                    recv(wakes) -> _ => { wait_until = None; None },
+                    recv(timer) -> _ => { wait_until = None; None },
+                }
+            } else {
+                self.event_receiver.try_recv().ok()
+            };
+            if let Some(event) = event {
+                match event {
+                    VcpuEvent::Stop => break,
+                    VcpuEvent::Pause => paused = true,
+                    VcpuEvent::Resume if !failed => paused = false,
+                    VcpuEvent::Resume => (),
+                    VcpuEvent::Checkpoint(request) => {
+                        use control::{Command, Reply};
+                        let mut resume = false;
+                        let result = if failed || Instant::now() >= request.deadline {
+                            Err(io::Error::other("expired or failed CPU control"))
+                        } else {
+                            match request.command {
+                                Command::Pause => {
+                                    paused = true;
+                                    cpu.complete_exit()
+                                        .map_err(|e| io::Error::other(e.to_string()))
+                                        .map(|_| Reply::Done)
+                                }
+                                Command::Resume => {
+                                    resume = true;
+                                    Ok(Reply::Done)
+                                }
+                                Command::Capture if paused => {
+                                    if !powered {
+                                        if let Some((entry, context)) = self
+                                            .boot_receiver
+                                            .as_ref()
+                                            .and_then(|r| r.try_recv().ok())
+                                        {
+                                            cpu.set_initial_state(entry, context)
+                                                .expect("CPU_ON initial state");
+                                            powered = true;
+                                        }
+                                    }
+                                    cpu.save_state(self.native_gic).map(|cpu| {
+                                        Reply::Saved(Box::new(VcpuState { cpu, powered }))
+                                    })
+                                }
+                                Command::Restore(state) if paused && !has_run => {
+                                    powered = state.powered;
+                                    wait_until = None;
+                                    cpu.restore_state(&state.cpu, self.native_gic)
+                                        .map(|_| Reply::Done)
+                                }
+                                Command::AdjustClock(delta) if paused => cpu
+                                    .adjust_clock(delta, self.native_gic)
+                                    .map(|_| Reply::Done),
+                                _ => Err(io::Error::other("CPU state requires a pause")),
+                            }
+                        };
+                        failed |= result.is_err() || Instant::now() >= request.deadline;
+                        if request
+                            .reply
+                            .try_send(result.map_err(Error::Checkpoint))
+                            .is_err()
+                        {
+                            failed = true;
+                        }
+                        if resume && !failed {
+                            paused = false;
+                            wait_until = None;
+                        }
+                        if failed {
+                            paused = true;
+                        }
+                    }
+                }
+            }
+            if paused || !powered {
+                continue;
+            }
+            if let Some(deadline) = wait_until {
+                if wakes.try_recv().is_err() && deadline.is_none_or(|t| Instant::now() < t) {
+                    continue;
+                }
+                wait_until = None;
+            }
+            has_run = true;
+            match self.run_emulation(&mut cpu) {
+                Ok(VcpuEmulation::Handled | VcpuEmulation::WaitForEventExpired) => (),
+                Ok(VcpuEmulation::Interrupted) => paused = true,
                 Ok(VcpuEmulation::WaitForEvent) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None)
+                    if self.vcpu_list.should_wait(id) {
+                        wait_until = Some(None);
+                    }
                 }
-                Ok(VcpuEmulation::WaitForEventExpired) => (),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout))
+                    if self.vcpu_list.should_wait(id) {
+                        wait_until = Some(Some(Instant::now() + timeout));
+                    }
                 }
-                // The guest was rebooted or halted.
                 Ok(VcpuEmulation::Stopped) => {
                     self.exit(FC_EXIT_CODE_OK);
                     break;
                 }
-                // Emulation errors lead to vCPU exit.
                 Err(_) => {
                     self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                     break;
                 }
             }
         }
+        self.vcpu_list.unregister(id);
     }
-
-    fn wait_for_event(
-        &mut self,
-        hvf_vcpuid: u64,
-        receiver: &Receiver<u32>,
-        timeout: Option<Duration>,
-    ) {
-        if self.vcpu_list.should_wait(hvf_vcpuid) {
-            if let Some(timeout) = timeout {
-                match receiver.recv_timeout(timeout) {
-                    Ok(_) => {}
-                    Err(e) => match e {
-                        RecvTimeoutError::Timeout => {}
-                        RecvTimeoutError::Disconnected => panic!("WFE channel closed unexpectedly"),
-                    },
-                }
-            } else {
-                receiver.recv().unwrap();
-            }
-        }
-    }
-
-    fn wait_for_resume(&mut self) {}
 
     fn exit(&mut self, exit_code: u8) {
         self.response_sender
@@ -525,7 +627,7 @@ impl Drop for Vcpu {
     }
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
+// Legacy notifications coexist with acknowledged checkpoint control.
 #[allow(unused)]
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
@@ -534,7 +636,8 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    Stop,
+    Checkpoint(control::Request),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -550,6 +653,9 @@ pub enum VcpuResponse {
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
+    vcpu_thread: Option<thread::JoinHandle<()>>,
+    hvf_id: u64,
+    control_failed: bool,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
 }
@@ -558,29 +664,21 @@ impl VcpuHandle {
     pub fn new(
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
-        _vcpu_thread: thread::JoinHandle<()>,
+        vcpu_thread: thread::JoinHandle<()>,
+        hvf_id: u64,
     ) -> Self {
         Self {
+            vcpu_thread: Some(vcpu_thread),
+            hvf_id,
+            control_failed: false,
             event_sender,
             response_receiver,
         }
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
-        // Use expect() to crash if the other thread closed this channel.
-        self.event_sender
-            .send(event)
-            .expect("event sender channel closed on vcpu end.");
-        // Kick the vcpu so it picks up the message.
-        /*
-        self.vcpu_thread
-            .as_ref()
-            // Safe to unwrap since constructor make this 'Some'.
-            .unwrap()
-            .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
-            .map_err(Error::SignalVcpu)?;
-        */
-        Ok(())
+        self.event_sender.send(event).map_err(|_| Error::VcpuRun)?;
+        hvf::vcpu_request_exit(self.hvf_id).map_err(Error::VmSetup)
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
@@ -631,6 +729,7 @@ mod tests {
 
     #[test]
     fn test_vm_memory_init() {
+        let _guard = TEST_VM_LOCK.lock().unwrap();
         let mut vm = Vm::new(false).expect("Cannot create new vm");
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.

@@ -7,7 +7,11 @@ description = "Apple Hypervisor.framework backend for libkrun"
 license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 crossbeam-channel = ">=0.5.15"
 libloading = "0.8"
 log = "0.4.0"

@@ -10,7 +10,7 @@ pub const BLOCK_SIZE: u64 = 2 * MIB;
 
 /// Absolute sizes, including boot RAM. Published atomically under the control lock.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryStatus {
     pub max_mib: u32,
     pub requested_mib: u32,
@@ -20,12 +20,41 @@ pub struct MemoryStatus {
     pub active: u32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freeze_excludes_targets_and_resume_rearms_an_unprocessed_target() {
+        let control = MemoryControl::new(256, 512).unwrap();
+        control.activate();
+        control.request(384).unwrap();
+        control.freeze();
+        let before = control.status();
+        assert_eq!(
+            control.request(512).unwrap_err().raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        assert_eq!(control.status(), before);
+        control.event.read().unwrap();
+        control.resume().unwrap();
+        assert_eq!(control.event.read().unwrap(), 1);
+        assert_eq!(control.status().requested_mib, 384);
+        control.request(512).unwrap();
+    }
+}
+
 /// Only the event-loop thread mutates the device. API threads submit monotonic
 /// targets through this mailbox and read progress without taking its device lock.
 pub struct MemoryControl {
     pub(crate) event: EventFd,
     pub initial_mib: u32,
-    state: Mutex<MemoryStatus>,
+    state: Mutex<ControlState>,
+}
+
+struct ControlState {
+    status: MemoryStatus,
+    frozen: bool,
 }
 
 impl MemoryControl {
@@ -36,22 +65,29 @@ impl MemoryControl {
         Ok(Self {
             event: EventFd::new(EFD_NONBLOCK)?,
             initial_mib,
-            state: Mutex::new(MemoryStatus {
-                max_mib,
-                requested_mib: initial_mib,
-                plugged_mib: initial_mib,
-                mapped_mib: initial_mib,
-                ..Default::default()
+            state: Mutex::new(ControlState {
+                frozen: false,
+                status: MemoryStatus {
+                    max_mib,
+                    requested_mib: initial_mib,
+                    plugged_mib: initial_mib,
+                    mapped_mib: initial_mib,
+                    ..Default::default()
+                },
             }),
         })
     }
 
     pub fn status(&self) -> MemoryStatus {
-        *self.state.lock().unwrap()
+        self.state.lock().unwrap().status
     }
 
     pub fn request(&self, total_mib: u32) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
+        if state.frozen {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        let state = &mut state.status;
         if state.active == 0 {
             return Err(io::Error::from_raw_os_error(libc::EAGAIN));
         }
@@ -68,17 +104,39 @@ impl MemoryControl {
     }
 
     pub(crate) fn initialize(&self, region_size: u64) {
-        self.state.lock().unwrap().max_mib = self.initial_mib + (region_size / MIB) as u32;
+        self.state.lock().unwrap().status.max_mib = self.initial_mib + (region_size / MIB) as u32;
     }
 
     pub(crate) fn activate(&self) {
-        self.state.lock().unwrap().active = 1;
+        self.state.lock().unwrap().status.active = 1;
     }
 
     pub(crate) fn progress(&self, plugged: u64, mapped: u64, error: i32) {
         let mut state = self.state.lock().unwrap();
+        let state = &mut state.status;
         state.plugged_mib = self.initial_mib + (plugged / MIB) as u32;
         state.mapped_mib = self.initial_mib + (mapped / MIB) as u32;
         state.error = error;
+    }
+
+    // Called under the device lock. The same lock as request() establishes
+    // whether an online target belongs before or after the snapshot boundary.
+    pub(crate) fn freeze(&self) {
+        self.state.lock().unwrap().frozen = true;
+    }
+
+    pub(crate) fn resume(&self) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        // A request accepted just before freeze may not yet have reached the
+        // event loop. Always re-arm it, including after cross-process restore.
+        self.event.write(1)?;
+        state.frozen = false;
+        Ok(())
+    }
+
+    pub(crate) fn restore(&self, status: MemoryStatus) {
+        let mut state = self.state.lock().unwrap();
+        assert!(state.frozen);
+        state.status = status;
     }
 }

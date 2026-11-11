@@ -67,6 +67,9 @@ impl Vsock {
 
         if let Err(e) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {e:?}");
+        } else {
+            // Raises its own interrupt for what it completes.
+            self.process_evq();
         }
         false
     }
@@ -110,6 +113,19 @@ impl Vsock {
             });
 
         event_manager
+            .register(
+                self.queue_events[EVQ_INDEX].as_raw_fd(),
+                EpollEvent::new(
+                    EventSet::IN,
+                    self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
+                ),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register vsock evq with event manager: {e:?}");
+            });
+
+        event_manager
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
                 error!("Failed to unregister vsock activate evt: {e:?}");
@@ -119,6 +135,9 @@ impl Vsock {
 
 impl Subscriber for Vsock {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        if self.frozen {
+            return;
+        }
         let source = event.fd();
         let rxq = self.queue_events[RXQ_INDEX].as_raw_fd();
         let txq = self.queue_events[TXQ_INDEX].as_raw_fd();

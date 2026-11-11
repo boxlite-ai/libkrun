@@ -22,12 +22,14 @@ use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::snapshot::{DatagramState, SocketAddress};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
 
 pub struct TsiDgramProxy {
     pub id: u64,
+    family: u16,
     cid: u64,
     local_port: u32,
     peer_port: u32,
@@ -54,6 +56,7 @@ impl TsiDgramProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
+        let linux_family = family;
         let family = match family {
             defs::LINUX_AF_INET => AddressFamily::Inet,
             defs::LINUX_AF_INET6 => AddressFamily::Inet6,
@@ -94,6 +97,7 @@ impl TsiDgramProxy {
         }
 
         Ok(TsiDgramProxy {
+            family: linux_family,
             id,
             cid,
             local_port: 0,
@@ -231,6 +235,39 @@ impl TsiDgramProxy {
 }
 
 impl Proxy for TsiDgramProxy {
+    fn datagram_state(&self) -> std::io::Result<Option<DatagramState>> {
+        let local: SockaddrStorage =
+            nix::sys::socket::getsockname(self.fd.as_raw_fd()).map_err(std::io::Error::other)?;
+        let local = if local.as_sockaddr_in().is_some_and(|a| a.port() == 0)
+            || local.as_sockaddr_in6().is_some_and(|a| a.port() == 0)
+            || local.as_unix_addr().is_some_and(|a| a.path_len() == 0)
+        {
+            None
+        } else {
+            Some(SocketAddress::capture(local)?)
+        };
+        let peer = match getpeername::<SockaddrStorage>(self.fd.as_raw_fd()) {
+            Ok(address) => Some(SocketAddress::capture(address)?),
+            Err(nix::errno::Errno::ENOTCONN) => None,
+            Err(error) => return Err(std::io::Error::other(error)),
+        };
+        Ok(Some(DatagramState {
+            id: self.id,
+            family: self.family,
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            local,
+            peer,
+            sendto: self.sendto_addr.map(SocketAddress::capture).transpose()?,
+            counters: [
+                self.rx_cnt.0,
+                self.tx_cnt.0,
+                self.peer_buf_alloc,
+                self.peer_fwd_cnt.0,
+            ],
+        }))
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -467,5 +504,82 @@ impl Proxy for TsiDgramProxy {
 impl AsRawFd for TsiDgramProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+impl TsiDgramProxy {
+    pub(super) fn restore_endpoint(&mut self, state: &DatagramState) -> std::io::Result<()> {
+        if state.id != self.id || state.family != self.family || state.peer_port != self.peer_port {
+            return Err(std::io::Error::other("UDP endpoint identity mismatch"));
+        }
+        if let Some(local) = &state.local {
+            bind(self.fd.as_raw_fd(), &local.address()?).map_err(std::io::Error::other)?;
+            self.listening = true;
+        }
+        if let Some(peer) = &state.peer {
+            connect(self.fd.as_raw_fd(), &peer.address()?).map_err(std::io::Error::other)?;
+            self.status = ProxyStatus::Connected;
+        }
+        self.local_port = state.local_port;
+        self.sendto_addr = state
+            .sendto
+            .as_ref()
+            .map(SocketAddress::address)
+            .transpose()?;
+        self.rx_cnt = Wrapping(state.counters[0]);
+        self.tx_cnt = Wrapping(state.counters[1]);
+        self.peer_buf_alloc = state.counters[2];
+        self.peer_fwd_cnt = Wrapping(state.counters[3]);
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use nix::sys::socket::UnixAddr;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn snapshot_vsock_unix_datagram_restores_abstract_peer() {
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        // Linux autobind chooses an unused abstract name.
+        bind(listener.as_raw_fd(), &UnixAddr::new("").unwrap()).unwrap();
+        let peer: SockaddrStorage = nix::sys::socket::getsockname(listener.as_raw_fd()).unwrap();
+        assert!(peer.as_unix_addr().unwrap().as_abstract().is_some());
+        let new_proxy = || {
+            TsiDgramProxy::new(
+                1,
+                3,
+                defs::LINUX_AF_UNIX,
+                5,
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap(),
+                Arc::new(Mutex::new(VirtQueue::new(16))),
+                Arc::new(Mutex::new(MuxerRxQ::new())),
+            )
+            .unwrap()
+        };
+        let original = new_proxy();
+        connect(original.as_raw_fd(), &peer).unwrap();
+        let state = original.datagram_state().unwrap().unwrap();
+        assert!(state.local.is_none());
+        let state: DatagramState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(original);
+        let mut restored = new_proxy();
+        restored.restore_endpoint(&state).unwrap();
+        send(restored.as_raw_fd(), b"restored", MsgFlags::empty()).unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(
+            recv(listener.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT).unwrap(),
+            8
+        );
+        assert_eq!(&bytes, b"restored");
     }
 }

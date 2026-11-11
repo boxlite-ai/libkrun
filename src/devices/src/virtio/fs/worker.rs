@@ -1,8 +1,3 @@
-#[cfg(target_os = "macos")]
-use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
-use utils::worker_message::WorkerMessage;
-
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicI32;
@@ -19,6 +14,10 @@ use super::descriptor_utils::{Reader, Writer};
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
+
+use super::snapshot::{FsWorkerState, WorkerCheckpoint};
+
+use crate::virtio::{control::Command, persist::invalid};
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
 enum FsServer {
@@ -33,25 +32,10 @@ impl FsServer {
         w: Writer,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> super::Result<usize> {
         match self {
-            FsServer::ReadWrite(s) => s.handle_message(
-                r,
-                w,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
-            FsServer::ReadOnly(s) => s.handle_message(
-                r,
-                w,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
+            FsServer::ReadWrite(s) => s.handle_message(r, w, shm_region, exit_code),
+            FsServer::ReadOnly(s) => s.handle_message(r, w, shm_region, exit_code),
         }
     }
 }
@@ -64,9 +48,9 @@ pub struct FsWorker {
     shm_region: Option<VirtioShmRegion>,
     server: FsServer,
     stop_fd: EventFd,
+
+    checkpoint: WorkerCheckpoint,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")]
-    map_sender: Option<Sender<WorkerMessage>>,
 }
 
 impl FsWorker {
@@ -81,12 +65,33 @@ impl FsWorker {
         read_only: bool,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+        checkpoint: WorkerCheckpoint,
     ) -> Result<Self, io::Error> {
         let server = if read_only {
             FsServer::ReadOnly(Server::new(PassthroughFsRo::new(passthrough_cfg)?))
         } else {
             FsServer::ReadWrite(Server::new(PassthroughFs::new(passthrough_cfg)?))
+        };
+
+        let server = {
+            let mut server = server;
+            if let Some(saved) = &checkpoint.restore {
+                let fs = match &mut server {
+                    FsServer::ReadWrite(server) => server.restore_options(saved.options)?,
+                    FsServer::ReadOnly(server) => &mut server.restore_options(saved.options)?.inner,
+                };
+                fs.restore_state(&saved.filesystem)?;
+                if let Some(window) = &shm_region {
+                    #[cfg(target_os = "linux")]
+                    let base = window.host_addr;
+                    #[cfg(target_os = "macos")]
+                    let base = window.guest_addr;
+                    fs.restore_mappings(&saved.filesystem, base, window.size as u64, read_only)?;
+                } else if !saved.filesystem.mappings.is_empty() {
+                    return Err(invalid("DAX mappings require a window"));
+                }
+            }
+            server
         };
         Ok(Self {
             queues,
@@ -96,74 +101,147 @@ impl FsWorker {
             shm_region,
             server,
             stop_fd,
+
+            checkpoint,
             exit_code,
-            #[cfg(target_os = "macos")]
-            map_sender,
         })
     }
 
     pub fn run(self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("fs worker".into())
-            .spawn(|| self.work())
+            .spawn(|| {
+                if let Err(error) = self.work() {
+                    error!("fs worker stopped: {error}");
+                }
+            })
             .unwrap()
     }
 
-    fn work(mut self) {
-        let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
-        let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
-        let stop_ev_fd = self.stop_fd.as_raw_fd();
-
-        let epoll = Epoll::new().unwrap();
-
-        let _ = epoll.ctl(
+    fn work(mut self) -> io::Result<()> {
+        let stop_fd = self.stop_fd.as_raw_fd();
+        let epoll = Epoll::new()?;
+        epoll.ctl(
             ControlOperation::Add,
-            virtq_hpq_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_hpq_ev_fd as u64),
-        );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_req_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_req_ev_fd as u64),
-        );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            stop_ev_fd,
-            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
-        );
+            stop_fd,
+            &EpollEvent::new(EventSet::IN, stop_fd as u64),
+        )?;
 
+        let control_fd = self.checkpoint.control.event().as_raw_fd();
+
+        epoll.ctl(
+            ControlOperation::Add,
+            control_fd,
+            &EpollEvent::new(EventSet::IN, control_fd as u64),
+        )?;
+        if !self.checkpoint.frozen {
+            for index in [HPQ_INDEX, REQ_INDEX] {
+                let event = &self.queue_evts[index];
+                epoll.ctl(
+                    ControlOperation::Add,
+                    event.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64),
+                )?;
+            }
+        }
+        let mut events = vec![EpollEvent::default(); 8];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
-                Ok(ev_cnt) => {
-                    for event in &epoll_events[0..ev_cnt] {
-                        let source = event.fd();
-                        let event_set = event.event_set();
-                        match event_set {
-                            EventSet::IN if source == virtq_hpq_ev_fd => {
-                                self.handle_event(HPQ_INDEX);
-                            }
-                            EventSet::IN if source == virtq_req_ev_fd => {
-                                self.handle_event(REQ_INDEX);
-                            }
-                            EventSet::IN if source == stop_ev_fd => {
-                                debug!("stopping worker thread");
-                                let _ = self.stop_fd.read();
-                                return;
-                            }
-                            _ => {
-                                log::warn!(
-                                    "Received unknown event: {event_set:?} from fd: {source:?}"
-                                );
-                            }
-                        }
+            let count = match epoll.wait(events.len(), -1, &mut events) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if events[..count].iter().any(|event| event.fd() == stop_fd) {
+                let _ = self.stop_fd.read();
+                return Ok(());
+            }
+
+            if events[..count].iter().any(|event| event.fd() == control_fd) {
+                let _ = self.checkpoint.control.event().read();
+                while let Ok(request) = self.checkpoint.control.try_recv() {
+                    if request.is_expired() {
+                        return Err(invalid("fs control deadline elapsed"));
+                    }
+                    let result = match request.command() {
+                        Command::Freeze => self.freeze(&epoll),
+                        Command::Resume => self.resume(&epoll),
+                    };
+                    if !request.respond(result) {
+                        return Err(invalid("fs control outcome unknown"));
                     }
                 }
-                Err(e) => {
-                    debug!("failed to consume muxer epoll event: {e}");
+            }
+            if self.checkpoint.frozen {
+                continue;
+            }
+            for event in &events[..count] {
+                if let Some(index) = self
+                    .queue_evts
+                    .iter()
+                    .position(|queue| queue.as_raw_fd() == event.fd())
+                {
+                    self.handle_event(index);
                 }
             }
         }
+    }
+
+    fn freeze(&mut self, epoll: &Epoll) -> io::Result<()> {
+        if !self.checkpoint.frozen {
+            for event in &self.queue_evts {
+                epoll.ctl(
+                    ControlOperation::Delete,
+                    event.as_raw_fd(),
+                    &EpollEvent::default(),
+                )?;
+            }
+            self.checkpoint.frozen = true;
+        }
+        let queues = self
+            .queues
+            .iter()
+            .map(|queue| queue.save_state(&self.mem, true))
+            .collect::<io::Result<Vec<_>>>()?;
+        if queues
+            .iter()
+            .any(|queue| queue.next_avail != queue.next_used)
+        {
+            return Err(invalid("fs has unfinished requests"));
+        }
+        let (filesystem, options) = match &self.server {
+            FsServer::ReadWrite(server) => {
+                let (fs, options) = server.checkpoint_parts();
+                (fs.save_state()?, options)
+            }
+            FsServer::ReadOnly(server) => {
+                let (fs, options) = server.checkpoint_parts();
+                (fs.inner.save_state()?, options)
+            }
+        };
+        *self.checkpoint.state.lock().unwrap() = Some(FsWorkerState {
+            queues,
+            filesystem,
+            options,
+        });
+        Ok(())
+    }
+
+    fn resume(&mut self, epoll: &Epoll) -> io::Result<()> {
+        if !self.checkpoint.frozen {
+            return Err(invalid("fs worker is not frozen"));
+        }
+        for event in &self.queue_evts {
+            epoll.ctl(
+                ControlOperation::Add,
+                event.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64),
+            )?;
+        }
+        self.checkpoint.frozen = false;
+        for index in [HPQ_INDEX, REQ_INDEX] {
+            self.rescan(index);
+        }
+        Ok(())
     }
 
     fn handle_event(&mut self, queue_index: usize) {
@@ -172,6 +250,10 @@ impl FsWorker {
             error!("Failed to get queue event: {e:?}");
         }
 
+        self.rescan(queue_index);
+    }
+
+    fn rescan(&mut self, queue_index: usize) {
         loop {
             self.queues[queue_index]
                 .disable_notification(&self.mem)
@@ -198,14 +280,10 @@ impl FsWorker {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            if let Err(e) = self.server.handle_message(
-                reader,
-                writer,
-                &self.shm_region,
-                &self.exit_code,
-                #[cfg(target_os = "macos")]
-                &self.map_sender,
-            ) {
+            if let Err(e) =
+                self.server
+                    .handle_message(reader, writer, &self.shm_region, &self.exit_code)
+            {
                 error!("error handling message: {e:?}");
             }
 

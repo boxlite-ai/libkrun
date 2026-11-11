@@ -130,8 +130,31 @@ impl ConsoleControl {
         queue.pop_front()
     }
 
+    /// Put back a message `queue_pop` returned that could not be delivered.
+    pub fn queue_unpop(&self, payload: Payload) {
+        let mut queue = self.queue.lock().expect("Poisoned lock");
+        queue.push_front(payload);
+    }
+
     pub fn queue_evt(&self) -> &EventFd {
         &self.queue_evt
+    }
+
+    /// Copies of the messages the guest has not received yet, in order;
+    /// nothing is consumed.
+    pub fn snapshot_pending(&self) -> Vec<Vec<u8>> {
+        let queue = self.queue.lock().expect("Poisoned lock");
+        queue.iter().map(|payload| payload.to_vec()).collect()
+    }
+
+    /// Replace the pending messages with saved ones, without a notification:
+    /// the restored device delivers them when it resumes.
+    pub fn restore_pending(&self, messages: &[Vec<u8>]) {
+        let mut queue = self.queue.lock().expect("Poisoned lock");
+        *queue = messages
+            .iter()
+            .map(|message| Payload::Bytes(message.clone()))
+            .collect();
     }
 
     fn push_msg(&self, msg: VirtioConsoleControl) {

@@ -389,6 +389,29 @@ impl GicV3 {
 }
 
 impl IrqChipT for GicV3 {
+    fn save_state(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(&(
+            self.gicd_ctlr,
+            self.revision,
+            self.edge_trigger,
+            self.gicr_waker,
+            self.gicd_irouter.to_vec(),
+        ))
+        .map_err(io::Error::other)
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let (ctlr, revision, edge, waker, routes): (u32, u8, [u32; BITMAP_SZ], u32, Vec<u64>) =
+            serde_json::from_slice(bytes).map_err(io::Error::other)?;
+        self.gicd_irouter = routes
+            .try_into()
+            .map_err(|_| io::Error::other("invalid GIC routes"))?;
+        self.gicd_ctlr = ctlr;
+        self.revision = revision;
+        self.edge_trigger = edge;
+        self.gicr_waker = waker;
+        Ok(())
+    }
+
     fn get_mmio_addr(&self) -> u64 {
         self.redists_addr
     }

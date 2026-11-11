@@ -1,6 +1,9 @@
+use std::io;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time;
+
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use super::super::Queue as VirtQueue;
 use super::defs::uapi;
@@ -58,7 +61,8 @@ impl TimesyncThread {
         }
     }
 
-    fn work(&mut self) {
+    /// Runs until `stop` is disconnected: the backend stopped.
+    fn work(&mut self, stop: Receiver<()>) {
         let mut last_update = 0u64;
         let mut last_awake = utils::time::get_time(utils::time::ClockType::Real);
         loop {
@@ -75,14 +79,16 @@ impl TimesyncThread {
             }
 
             last_awake = utils::time::get_time(utils::time::ClockType::Real);
-            thread::sleep(time::Duration::from_nanos(SLEEP_NSECS));
+            match stop.recv_timeout(time::Duration::from_nanos(SLEEP_NSECS)) {
+                Err(RecvTimeoutError::Timeout) => {}
+                _ => return,
+            }
         }
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self, stop: Receiver<()>) -> io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock timesync".into())
-            .spawn(move || self.work())
-            .unwrap();
+            .spawn(move || self.work(stop))
     }
 }

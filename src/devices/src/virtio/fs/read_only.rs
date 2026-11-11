@@ -9,16 +9,11 @@
 // so the wrapper fails closed -- but new methods should still be explicitly
 // handled here for correct error semantics.
 
-#[cfg(target_os = "macos")]
-use crossbeam_channel::Sender;
 use std::ffi::CStr;
 use std::io;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::time::Duration;
-
-#[cfg(target_os = "macos")]
-use utils::worker_message::WorkerMessage;
 
 use super::filesystem::{
     Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply,
@@ -56,7 +51,7 @@ fn read_only_open_flags(flags: u32) -> io::Result<u32> {
 }
 
 pub struct PassthroughFsRo {
-    inner: PassthroughFs,
+    pub(super) inner: PassthroughFs,
 }
 
 impl PassthroughFsRo {
@@ -267,7 +262,6 @@ impl FileSystem for PassthroughFsRo {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         // Reject writable mappings.
         if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
@@ -283,8 +277,6 @@ impl FileSystem for PassthroughFsRo {
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
         )
     }
 
@@ -294,16 +286,9 @@ impl FileSystem for PassthroughFsRo {
         requests: Vec<fuse::RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
-        self.inner.removemapping(
-            ctx,
-            requests,
-            host_shm_base,
-            shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
-        )
+        self.inner
+            .removemapping(ctx, requests, host_shm_base, shm_size)
     }
 
     fn ioctl(

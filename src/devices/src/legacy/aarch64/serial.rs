@@ -95,6 +95,54 @@ pub struct Serial {
 }
 
 impl Serial {
+    #[cfg(target_os = "macos")]
+    pub fn save_state(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(&(
+            [
+                self.flags,
+                self.lcr,
+                self.rsr,
+                self.cr,
+                self.dmacr,
+                self.debug,
+                self.int_enabled,
+                self.int_level,
+                self.ilpr,
+                self.ibrd,
+                self.fbrd,
+                self.ifl,
+                self.read_count,
+                self.read_trigger,
+            ],
+            &self.read_fifo,
+        ))
+        .map_err(std::io::Error::other)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn restore_state(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let (registers, fifo): ([u32; 14], VecDeque<u8>) =
+            serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+        if fifo.len() > 1024 * 1024 {
+            return Err(io::Error::other("invalid UART FIFO"));
+        }
+        self.read_fifo = fifo;
+        self.flags = registers[0];
+        self.lcr = registers[1];
+        self.rsr = registers[2];
+        self.cr = registers[3];
+        self.dmacr = registers[4];
+        self.debug = registers[5];
+        self.int_enabled = registers[6];
+        self.int_level = registers[7];
+        self.ilpr = registers[8];
+        self.ibrd = registers[9];
+        self.fbrd = registers[10];
+        self.ifl = registers[11];
+        self.read_count = registers[12];
+        self.read_trigger = registers[13];
+        Ok(())
+    }
+
     /// Constructs an AMBA PL011 UART device.
     pub fn new(
         interrupt_evt: EventFd,

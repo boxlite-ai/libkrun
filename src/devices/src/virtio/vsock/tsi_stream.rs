@@ -25,6 +25,7 @@ use super::super::linux_errno::linux_errno_raw;
 use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
+use super::gate::{GateRegistration, VsockGate};
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
@@ -33,6 +34,7 @@ use super::packet::{
 use super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
+use super::snapshot::ControlReply;
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -58,6 +60,7 @@ pub struct TsiStreamProxy {
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
     unixsock_path: Option<PathBuf>,
+    shutdown: GateRegistration,
 }
 
 impl TsiStreamProxy {
@@ -72,6 +75,7 @@ impl TsiStreamProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
+        gate: &Arc<VsockGate>,
     ) -> Result<Self, ProxyError> {
         let family = match family {
             defs::LINUX_AF_INET => AddressFamily::Inet,
@@ -117,6 +121,7 @@ impl TsiStreamProxy {
             };
         }
 
+        let shutdown = gate.register(&fd)?;
         Ok(TsiStreamProxy {
             id,
             cid,
@@ -138,6 +143,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            shutdown,
         })
     }
 
@@ -153,9 +159,11 @@ impl TsiStreamProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
-    ) -> Self {
+        gate: &Arc<VsockGate>,
+    ) -> Result<Self, ProxyError> {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
-        TsiStreamProxy {
+        let shutdown = gate.register(&fd)?;
+        Ok(TsiStreamProxy {
             id,
             cid,
             parent_id,
@@ -176,7 +184,8 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
-        }
+            shutdown,
+        })
     }
 
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
@@ -458,6 +467,18 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn pending_control(&self) -> Option<ControlReply> {
+        let operation = match self.status {
+            ProxyStatus::Connecting => defs::TSI_CONNECT,
+            ProxyStatus::WaitingOnAccept => defs::TSI_ACCEPT,
+            _ => return None,
+        };
+        Some(ControlReply {
+            operation,
+            port: self.control_port,
+        })
+    }
+
     fn id(&self) -> u64 {
         self.id
     }
@@ -587,7 +608,9 @@ impl Proxy for TsiStreamProxy {
 
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if !self.shutdown.is_gate_open() {
+            -libc::EPIPE
+        } else if let Some(buf) = pkt.buf() {
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]
