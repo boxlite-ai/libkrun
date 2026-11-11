@@ -283,6 +283,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", not(feature = "tee")))]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info

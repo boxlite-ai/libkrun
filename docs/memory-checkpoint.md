@@ -164,6 +164,24 @@ exits the original process before restore, and repeats save/restore. Missing or
 wrong-capacity disks, duplicate destinations and corrupt inputs are rejected.
 JSON results and logs remain under `target/run-*`.
 
+The `blk,net` E2E fixture does not cover every build configuration. Also run
+the feature-matrix checks used by Code Quality; checking only `-p libkrun`
+with `blk,net` is not a substitute:
+
+```sh
+# Linux x86_64
+cargo clippy --locked -- -D warnings
+cargo clippy --locked --features amd-sev -- -D warnings
+cargo clippy --locked --features tdx -- -D warnings
+
+# macOS ARM64
+cargo clippy --locked --features gpu -- -D warnings
+```
+
+Whole-VM checkpoint capture/restore and its private file helpers are excluded
+from TEE builds. These Clippy commands validate compilation, not execution of
+SEV/TDX guests or GPU rendering.
+
 On Linux x86_64 with `/dev/kvm` and a matching `libkrunfw.so.5`:
 
 ```sh

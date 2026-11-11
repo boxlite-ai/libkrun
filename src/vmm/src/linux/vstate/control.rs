@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Sender};
 use utils::sm::StateMachine;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use super::VcpuState;
 use super::{Error, Result, Vcpu, VcpuEvent, VcpuHandle};
 
@@ -18,16 +18,16 @@ use super::{Error, Result, Vcpu, VcpuEvent, VcpuHandle};
 pub(crate) enum Command {
     Pause,
     Resume,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     Capture,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     Restore(Box<VcpuState>),
 }
 
 #[derive(Debug)]
 pub(crate) enum Reply {
     Done,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     Saved(Box<VcpuState>),
 }
 
@@ -72,15 +72,15 @@ impl Vcpu {
                     resume = true;
                     Ok(Reply::Done)
                 }
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
                 Command::Capture if _paused => {
                     self.save_state().map(|state| Reply::Saved(Box::new(state)))
                 }
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
                 Command::Restore(state) if _paused && !self.checkpoint_has_run => {
                     self.restore_state(*state).map(|()| Reply::Done)
                 }
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
                 _ => Err(failed("vCPU state access requires a confirmed pause")),
             }
         };

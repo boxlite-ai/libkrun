@@ -893,7 +893,7 @@ impl Vm {
     /// Preserve every CPU's relative TSC offset using one clock sample for
     /// the entire destination VM (KVM's vcpu.rst migration formula). Restoring
     /// independently sampled IA32_TSC MSRs alone introduces per-CPU skew.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     pub(crate) fn rebase_tsc(&self, source: &VmState, cpus: &mut [Box<VcpuState>]) -> Result<()> {
         let destination = self.fd.get_clock().map_err(Error::VmGetClock)?;
         if source.clock.flags & kvm_bindings::KVM_CLOCK_HOST_TSC == 0
@@ -1819,7 +1819,7 @@ impl Vcpu {
                 let _ = self
                     .response_sender
                     .send(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR));
-                return StateMachine::next(Self::paused);
+                StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::Resume) => {
                 self.checkpoint_has_run = true;

@@ -10,7 +10,21 @@ use std::io::{self, Read};
 
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
+#[cfg(all(
+    not(feature = "tee"),
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 mod file;
+#[cfg(all(
+    not(feature = "tee"),
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
 pub(crate) use file::{file_metadata_at, file_size, restore_file_at, save_file_at};
 
 const MAGIC: &[u8; 8] = b"KRUNRAM\0";

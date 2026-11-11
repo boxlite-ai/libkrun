@@ -15,10 +15,11 @@ fn query(address: usize, count: usize, page_size: usize) -> io::Result<Vec<bool>
     let file = std::fs::File::open("/proc/self/pagemap")?;
     let mut entries = vec![0; count * 8];
     file.read_exact_at(&mut entries, (address / page_size) as u64 * 8)?;
+    let (entries, _) = entries.as_chunks::<8>();
     Ok(entries
-        .chunks_exact(8)
+        .iter()
         .map(|bytes| {
-            let entry = u64::from_ne_bytes(bytes.try_into().unwrap());
+            let entry = u64::from_ne_bytes(*bytes);
             // Present OR swapped: neither a swapped-out page nor a resident zero
             // page is omitted. PFNs are not needed (and may be hidden by the kernel).
             entry & ((1 << 63) | (1 << 62)) != 0

@@ -2344,6 +2344,7 @@ fn attach_gpu_device(
     virgl_flags: u32,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 

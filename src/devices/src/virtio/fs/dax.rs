@@ -35,7 +35,7 @@ impl DaxMappingState {
         }
         if let Some(object) = &self.object {
             object.validate()?;
-            if object.kind != libc::S_IFREG as u32 {
+            if u64::from(object.kind) != u64::from(libc::S_IFREG) {
                 return Err(invalid("DAX backing object is not a regular file"));
             }
         }
