@@ -354,6 +354,42 @@ pub struct Queue {
 }
 
 impl Queue {
+    /// Complete available network buffers as dropped without reading payloads.
+    /// The owner must first validate this queue against accessible frozen RAM.
+    pub fn discard_available(&mut self, memory: &GuestMemoryMmap) -> std::io::Result<u16> {
+        if !self.ready {
+            return Ok(0);
+        }
+        let size = self.actual_size();
+        if size == 0 {
+            return Err(std::io::Error::other("empty active queue"));
+        }
+        let available: u16 = memory
+            .read_obj(self.avail_ring.unchecked_add(2))
+            .map_err(std::io::Error::other)?;
+        let count = available.wrapping_sub(self.next_avail.0);
+        if count > size {
+            return Err(std::io::Error::other("overcommitted available ring"));
+        }
+        let mut heads = Vec::with_capacity(count as usize);
+        for offset in 0..count {
+            let slot = self.next_avail.0.wrapping_add(offset) % size;
+            let head: u16 = memory
+                .read_obj(self.avail_ring.unchecked_add(4 + u64::from(slot) * 2))
+                .map_err(std::io::Error::other)?;
+            if head >= size {
+                return Err(std::io::Error::other("invalid available descriptor head"));
+            }
+            heads.push(head);
+        }
+        for head in heads {
+            self.add_used(memory, head, 0)
+                .map_err(std::io::Error::other)?;
+            self.next_avail += Wrapping(1);
+        }
+        Ok(count)
+    }
+
     /// Constructs an empty virtio queue with the given `max_size`.
     pub fn new(max_size: u16) -> Queue {
         Queue {

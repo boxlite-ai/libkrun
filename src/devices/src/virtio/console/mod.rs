@@ -1,14 +1,19 @@
 mod console_control;
 mod device;
 mod event_handler;
+pub mod persist;
 mod port;
 pub mod port_io;
 mod port_queue_mapping;
 mod process_rx;
 mod process_tx;
+#[cfg(test)]
+mod tests;
+mod worker;
 
 pub use self::defs::uapi::VIRTIO_ID_CONSOLE as TYPE_CONSOLE;
 pub use self::device::Console;
+pub use self::persist::{ConsolePortState, ConsoleState, SnapshotError, TerminalSize, TxProgress};
 pub use self::port::PortDescription;
 
 mod defs {

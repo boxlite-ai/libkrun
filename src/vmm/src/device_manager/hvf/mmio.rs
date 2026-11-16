@@ -102,6 +102,31 @@ impl MMIODeviceManager {
         }
     }
 
+    pub(crate) fn register_checkpoint_device(
+        &mut self,
+        mut transport: devices::virtio::MmioTransport,
+        kind: u32,
+        id: String,
+        address: u64,
+        irq: u32,
+    ) -> Result<()> {
+        transport.set_irq_line(irq);
+        self.bus
+            .insert(Arc::new(Mutex::new(transport)), address, MMIO_LEN)
+            .map_err(Error::BusError)?;
+        self.id_to_dev_info.insert(
+            (DeviceType::Virtio(kind), id),
+            MMIODeviceInfo {
+                addr: address,
+                irq,
+                len: MMIO_LEN,
+            },
+        );
+        self.mmio_base = self.mmio_base.max(address + MMIO_LEN);
+        self.irq = self.irq.max(irq + 1);
+        Ok(())
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,
@@ -304,9 +329,9 @@ impl MMIODeviceManager {
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
 #[derive(Clone, Debug)]
 pub struct MMIODeviceInfo {
-    addr: u64,
-    irq: u32,
-    len: u64,
+    pub addr: u64,
+    pub irq: u32,
+    pub len: u64,
 }
 
 #[cfg(target_arch = "aarch64")]

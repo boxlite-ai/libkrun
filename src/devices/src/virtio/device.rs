@@ -78,6 +78,17 @@ pub struct VirtioShmRegion {
 /// during activation, transferring ownership. After reset, the transport recreates queues
 /// from queue_config() for the next negotiation cycle.
 pub trait VirtioDevice: AsAny + Send {
+    /// Restore activation must not start memory writers until the owner releases
+    /// its barrier. Devices opt in only after implementing that lifecycle.
+    fn activate_frozen(
+        &mut self,
+        _mem: GuestMemoryMmap,
+        _interrupt: InterruptTransport,
+        _queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        Err(super::ActivateError::BadActivate)
+    }
+
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 

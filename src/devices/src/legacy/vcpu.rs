@@ -32,6 +32,9 @@ impl PerCPUInterruptControllerState {
             self.vcpuid, irq
         );
         self.pending_irqs.push_back(irq);
+        if self.wfe_sender.is_none() {
+            return;
+        }
 
         match self.status {
             VcpuStatus::Waiting => {
@@ -85,6 +88,26 @@ impl VcpuList {
         Self { cpu_count, vcpus }
     }
 
+    pub fn save_pending(&self) -> Vec<Vec<u32>> {
+        self.vcpus
+            .iter()
+            .map(|cpu| cpu.lock().unwrap().pending_irqs.iter().copied().collect())
+            .collect()
+    }
+    pub fn restore_pending(&self, pending: &[Vec<u32>]) -> std::io::Result<()> {
+        if pending.len() != self.vcpus.len() || pending.iter().flatten().any(|&irq| irq >= 1020) {
+            return Err(std::io::Error::other(
+                "invalid software GIC pending interrupts",
+            ));
+        }
+        for (cpu, irqs) in self.vcpus.iter().zip(pending) {
+            let mut cpu = cpu.lock().unwrap();
+            cpu.pending_irqs = irqs.iter().copied().collect();
+            cpu.status = VcpuStatus::Running;
+        }
+        Ok(())
+    }
+
     pub fn get_cpu_count(&self) -> u64 {
         self.cpu_count
     }
@@ -104,6 +127,10 @@ impl VcpuList {
             .lock()
             .unwrap()
             .set_irq_common(irq);
+    }
+
+    pub fn unregister(&self, vcpuid: u64) {
+        self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = None;
     }
 
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {

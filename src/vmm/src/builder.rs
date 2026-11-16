@@ -804,7 +804,8 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -897,7 +898,12 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            let native = if std::env::var("KRUN_HVF_GIC").as_deref() == Ok("software") {
+                Err(hvf::Error::VmCreate)
+            } else {
+                HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64)
+            };
+            let gic = match native {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -915,6 +921,9 @@ pub fn build_microvm(
         )
         .map_err(StartMicrovmError::Internal)?;
 
+        for cpu in &mut vcpus {
+            cpu.native_gic = intc.lock().unwrap().is_native();
+        }
         attach_legacy_devices(
             &vm,
             &mut mmio_device_manager,
@@ -958,6 +967,21 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        #[cfg(all(
+            not(feature = "tee"),
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
+        ))]
+        checkpoint_supported: !vm_resources.nested_enabled
+            && !vm_resources.split_irqchip
+            && (cfg!(target_os = "linux") || vm_resources.serial_consoles.len() <= 1),
+        #[cfg(target_os = "macos")]
+        hvf_state: crate::checkpoint::hvf::Runtime::new(intc.clone(), vcpu_list.clone()),
+        checkpoint_dirs: Vec::new(),
+        vcpus_paused: true,
+        vcpus_failed: false,
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
@@ -1051,8 +1075,6 @@ pub fn build_microvm(
         export_table,
         intc.clone(),
         exit_code,
-        #[cfg(target_os = "macos")]
-        _sender,
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
@@ -1344,10 +1366,16 @@ fn load_payload(
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
 
-            let kernel_region = unsafe {
-                MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
-                    .map_err(StartMicrovmError::InvalidKernelBundle)?
-            };
+            let kernel_region =
+                MmapRegion::new(kernel_size).map_err(StartMicrovmError::InvalidKernelBundle)?;
+            // Every VM owns its kernel RAM so it can be checkpointed.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    kernel_host_addr as *const u8,
+                    kernel_region.as_ptr(),
+                    kernel_size,
+                );
+            }
 
             Ok((
                 guest_mem
@@ -1667,7 +1695,7 @@ pub fn setup_serial_device(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn attach_legacy_devices(
+pub(crate) fn attach_legacy_devices(
     vm: &Vm,
     split_irqchip: bool,
     pio_device_manager: &mut PortIODeviceManager,
@@ -1735,7 +1763,7 @@ fn attach_legacy_devices(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn attach_legacy_devices(
+pub(crate) fn attach_legacy_devices(
     vm: &Vm,
     mmio_device_manager: &mut MMIODeviceManager,
     kernel_cmdline: &mut kernel::cmdline::Cmdline,
@@ -1831,7 +1859,7 @@ fn create_vcpus_aarch64(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn create_vcpus_aarch64(
+pub(crate) fn create_vcpus_aarch64(
     _vm: &Vm,
     vcpu_config: &VcpuConfig,
     mem_info: &ArchMemoryInfo,
@@ -1841,7 +1869,7 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut boot_senders: HashMap<u64, Sender<(u64, u64)>> = HashMap::new();
 
     for cpu_index in 0..vcpu_config.vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {
@@ -1936,7 +1964,6 @@ fn attach_fs_devices(
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -1970,9 +1997,6 @@ fn attach_fs_devices(
             fs.lock().unwrap().set_export_table(export_table.clone());
         }
 
-        #[cfg(target_os = "macos")]
-        fs.lock().unwrap().set_map_sender(map_sender.clone());
-
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
     }
@@ -1980,7 +2004,7 @@ fn attach_fs_devices(
     Ok(())
 }
 
-fn autoconfigure_console_ports(
+pub(crate) fn autoconfigure_console_ports(
     vmm: &mut Vmm,
     vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
@@ -2119,7 +2143,7 @@ fn setup_terminal_raw_mode(
     }
 }
 
-fn create_explicit_ports(
+pub(crate) fn create_explicit_ports(
     vmm: &mut Vmm,
     port_configs: &[PortConfig],
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
@@ -2235,6 +2259,12 @@ fn attach_unixsock_vsock_device(
         .map_err(RegisterEvent)?;
 
     let id = String::from(unix_vsock.lock().unwrap().id());
+    unix_vsock.lock().unwrap().set_failure_notifier(
+        vmm.exit_evt
+            .try_clone()
+            .map_err(Error::EventFd)
+            .map_err(Internal)?,
+    );
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;

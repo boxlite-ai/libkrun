@@ -1,25 +1,38 @@
+use super::worker::NetQueueStates;
+use crate::virtio::persist::{invalid, VirtioDeviceState};
+use std::io;
+use std::time::Instant;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetCheckpoint {
+    pub device: VirtioDeviceState,
+    pub config: Vec<u8>,
+    pub queues: Option<NetQueueStates>,
+}
+
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
-use crate::virtio::net::Result;
+use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
     VirtioDevice, TYPE_NET,
 };
-use crate::Error as DeviceError;
 
-use super::backend::{ReadError, WriteError};
-use super::worker::NetWorker;
+use super::worker::{NetWorker, NetWorkerControl, NetWorkerHandle};
 
 use std::cmp;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -33,19 +46,6 @@ pub enum FrontendError {
     GuestMemory(GuestMemoryError),
     QueueError(QueueError),
     ReadOnlyDescriptor,
-}
-
-#[derive(Debug)]
-pub enum RxError {
-    Backend(ReadError),
-    DeviceError(DeviceError),
-}
-
-#[derive(Debug)]
-pub enum TxError {
-    Backend(WriteError),
-    DeviceError(DeviceError),
-    QueueError(QueueError),
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -79,6 +79,13 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+    snapshot_queues: Option<NetQueueStates>,
+    snapshot_frozen: bool,
+    snapshot_failed: bool,
+
+    worker_thread: Option<JoinHandle<()>>,
+    worker_stopfd: EventFd,
+    worker_control: Option<NetWorkerHandle>,
 }
 
 impl Net {
@@ -103,12 +110,19 @@ impl Net {
         Ok(Net {
             id,
             cfg_backend,
+            snapshot_queues: None,
+            snapshot_frozen: false,
+            snapshot_failed: false,
 
             avail_features,
             acked_features: 0u64,
 
             device_state: DeviceState::Inactive,
             config,
+
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?,
+            worker_control: None,
         })
     }
 
@@ -117,9 +131,175 @@ impl Net {
         &self.id
     }
 
-    /// Provides the virtio-net backend of this net device.
-    pub fn backend(&self) -> &VirtioNetBackend {
-        &self.cfg_backend
+    pub fn freeze(&mut self, deadline: Instant) -> io::Result<()> {
+        if self.snapshot_failed {
+            return Err(invalid("net checkpoint requires teardown"));
+        }
+        if self.snapshot_frozen {
+            return Ok(());
+        }
+        self.snapshot_failed = true;
+        self.snapshot_queues = self
+            .worker_control
+            .as_ref()
+            .map(|control| {
+                control
+                    .freeze_with_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(io::Error::other)
+            })
+            .transpose()?;
+        self.snapshot_frozen = true;
+        self.snapshot_failed = false;
+        Ok(())
+    }
+
+    pub fn save_state(&self) -> io::Result<NetCheckpoint> {
+        if !self.snapshot_frozen
+            || self.snapshot_failed
+            || self.is_activated() != self.snapshot_queues.is_some()
+        {
+            return Err(invalid("net capture requires confirmed freeze"));
+        }
+        Ok(NetCheckpoint {
+            device: VirtioDeviceState::save(self)?,
+            config: self.config_bytes(),
+            queues: self.snapshot_queues.clone(),
+        })
+    }
+
+    pub fn restore_state(&mut self, state: &NetCheckpoint) -> io::Result<()> {
+        state.device.validate(self)?;
+        if self.is_activated()
+            || self.worker_thread.is_some()
+            || state.config != self.config_bytes()
+            || state.device.activated != state.queues.is_some()
+        {
+            return Err(invalid(
+                "incompatible net checkpoint or endpoint configuration",
+            ));
+        }
+        state.device.restore_features(self)?;
+        self.snapshot_queues = state.queues.clone();
+        self.snapshot_frozen = true;
+        Ok(())
+    }
+
+    pub fn resume(&mut self) -> io::Result<()> {
+        if !self.snapshot_frozen || self.snapshot_failed {
+            return Err(invalid("net resume requires confirmed freeze"));
+        }
+        self.snapshot_failed = true;
+        if let Some(control) = &self.worker_control {
+            control.resume().map_err(io::Error::other)?;
+        } else if self.snapshot_queues.is_some() {
+            return Err(invalid("net worker is not activated"));
+        }
+        self.snapshot_queues = None;
+        self.snapshot_frozen = false;
+        self.snapshot_failed = false;
+        Ok(())
+    }
+
+    /// The complete guest-visible device configuration, byte-exact.
+    pub fn config_bytes(&self) -> Vec<u8> {
+        self.config.as_slice().to_vec()
+    }
+
+    /// Snapshot control handle for the activated worker, if any.
+    #[cfg(test)]
+    pub(super) fn worker_control(&self) -> Option<&NetWorkerHandle> {
+        self.worker_control.as_ref()
+    }
+
+    /// Stop the worker and wait for its thread to exit, closing its backend
+    /// connection; frozen workers stop too. The device stays activated from
+    /// the transport's point of view: this is owner teardown, not a guest
+    /// reset, which this device still does not support.
+    pub fn stop_worker(&mut self) {
+        self.snapshot_failed = true;
+        if let Some(worker) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            if let Err(e) = worker.join() {
+                error!("error waiting for virtio-net worker thread: {e:?}");
+            }
+        }
+        self.worker_control = None;
+    }
+
+    fn activate_impl(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+        start_frozen: bool,
+    ) -> ActivateResult {
+        if self.snapshot_failed {
+            return Err(ActivateError::BadActivate);
+        }
+        if self.worker_thread.is_some() {
+            error!("virtio-net ({}) worker thread already exists", self.id());
+            return Err(ActivateError::BadActivate);
+        }
+        let [rx_q, tx_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
+            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
+            ActivateError::BadActivate
+        })?;
+        if start_frozen {
+            self.snapshot_frozen = true;
+            self.snapshot_queues = Some(NetQueueStates {
+                rx: crate::virtio::persist::QueueState::from_queue(&rx_q.queue),
+                tx: crate::virtio::persist::QueueState::from_queue(&tx_q.queue),
+            });
+        }
+
+        let control_fd = EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?;
+        let (commands, command_receiver) = crossbeam_channel::bounded(16);
+        let control = NetWorkerControl {
+            stop_fd: self
+                .worker_stopfd
+                .try_clone()
+                .map_err(|_| ActivateError::BadActivate)?,
+            control_fd: control_fd
+                .try_clone()
+                .map_err(|_| ActivateError::BadActivate)?,
+            wake_fd: EventFd::new(EFD_NONBLOCK).map_err(|_| ActivateError::BadActivate)?,
+            commands: command_receiver,
+        };
+
+        match NetWorker::new(
+            rx_q,
+            tx_q,
+            interrupt.clone(),
+            mem.clone(),
+            self.acked_features,
+            self.cfg_backend.clone(),
+            control,
+        ) {
+            Ok(worker) => {
+                self.worker_thread = Some(worker.run(start_frozen));
+                self.worker_control = Some(NetWorkerHandle {
+                    control_fd,
+                    commands,
+                    unusable: std::sync::atomic::AtomicBool::new(false),
+                });
+                self.device_state = DeviceState::Activated(mem, interrupt);
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    "Error activating virtio-net ({}) backend: {err:?}",
+                    self.id()
+                );
+                Err(ActivateError::BadActivate)
+            }
+        }
+    }
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        // Never leave a detached worker writing guest RAM after its owner.
+        self.stop_worker();
     }
 }
 
@@ -176,32 +356,16 @@ impl VirtioDevice for Net {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [rx_q, tx_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
-            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
-            ActivateError::BadActivate
-        })?;
+        self.activate_impl(mem, interrupt, queues, false)
+    }
 
-        match NetWorker::new(
-            rx_q,
-            tx_q,
-            interrupt.clone(),
-            mem.clone(),
-            self.acked_features,
-            self.cfg_backend.clone(),
-        ) {
-            Ok(worker) => {
-                worker.run();
-                self.device_state = DeviceState::Activated(mem, interrupt);
-                Ok(())
-            }
-            Err(err) => {
-                error!(
-                    "Error activating virtio-net ({}) backend: {err:?}",
-                    self.id()
-                );
-                Err(ActivateError::BadActivate)
-            }
-        }
+    fn activate_frozen(
+        &mut self,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        queues: Vec<DeviceQueue>,
+    ) -> ActivateResult {
+        self.activate_impl(mem, interrupt, queues, true)
     }
 
     fn is_activated(&self) -> bool {

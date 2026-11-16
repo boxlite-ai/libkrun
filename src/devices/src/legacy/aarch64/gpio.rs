@@ -79,6 +79,34 @@ pub struct Gpio {
 }
 
 impl Gpio {
+    #[cfg(target_os = "macos")]
+    pub fn save_state(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(&[
+            self.data,
+            self.dir,
+            self.isense,
+            self.ibe,
+            self.iev,
+            self.im,
+            self.istate,
+            self.afsel,
+        ])
+        .map_err(std::io::Error::other)
+    }
+    #[cfg(target_os = "macos")]
+    pub fn restore_state(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let registers: [u32; 8] = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+        self.data = registers[0];
+        self.dir = registers[1];
+        self.isense = registers[2];
+        self.ibe = registers[3];
+        self.iev = registers[4];
+        self.im = registers[5];
+        self.istate = registers[6];
+        self.afsel = registers[7];
+        Ok(())
+    }
+
     /// Constructs an PL061 GPIO device.
     pub fn new(shutdown_efd: EventFd, interrupt_evt: EventFd) -> Self {
         Self {

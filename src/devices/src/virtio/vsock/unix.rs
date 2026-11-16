@@ -10,15 +10,18 @@ use nix::sys::socket::{
     Shutdown, SockFlag, SockType, UnixAddr,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use super::super::linux_errno::linux_errno_raw;
 use super::super::Queue as VirtQueue;
+use super::gate::{GateRegistration, VsockGate};
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
@@ -45,6 +48,22 @@ pub struct UnixProxy {
     last_tx_cnt_sent: Wrapping<u32>,
     push_cnt: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
+    shutdown: GateRegistration,
+}
+
+fn set_nonblocking(fd: &OwnedFd, id: u64) {
+    // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK.
+    match fcntl(fd, FcntlArg::F_GETFL) {
+        Ok(flags) => match OFlag::from_bits(flags) {
+            Some(flags) => {
+                if let Err(e) = fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
+                    warn!("error switching to non-blocking: id={id}, err={e}");
+                }
+            }
+            None => error!("invalid fd flags id={id}"),
+        },
+        Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
+    };
 }
 
 fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
@@ -55,19 +74,7 @@ fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
         None,
     )
     .map_err(ProxyError::CreatingSocket)?;
-
-    // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
-    match fcntl(&fd, FcntlArg::F_GETFL) {
-        Ok(flags) => match OFlag::from_bits(flags) {
-            Some(flags) => {
-                if let Err(e) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                    warn!("error switching to non-blocking: id={id}, err={e}");
-                }
-            }
-            None => error!("invalid fd flags id={id}"),
-        },
-        Err(e) => error!("couldn't obtain fd flags id={id}, err={e}"),
-    };
+    set_nonblocking(&fd, id);
 
     #[cfg(target_os = "macos")]
     {
@@ -98,8 +105,10 @@ impl UnixProxy {
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         path: PathBuf,
+        gate: &Arc<VsockGate>,
     ) -> Result<Self, ProxyError> {
         let fd = proxy_fd_create(id)?;
+        let shutdown = gate.register(&fd)?;
 
         Ok(UnixProxy {
             id,
@@ -119,6 +128,7 @@ impl UnixProxy {
             last_tx_cnt_sent: Wrapping(0),
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
+            shutdown,
         })
     }
 
@@ -132,9 +142,11 @@ impl UnixProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
-    ) -> Self {
+        gate: &Arc<VsockGate>,
+    ) -> Result<Self, ProxyError> {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
-        UnixProxy {
+        let shutdown = gate.register(&fd)?;
+        Ok(UnixProxy {
             id,
             cid,
             local_port,
@@ -152,7 +164,8 @@ impl UnixProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             path: Default::default(),
-        }
+            shutdown,
+        })
     }
 
     fn switch_to_connected(&mut self) {
@@ -390,7 +403,10 @@ impl Proxy for UnixProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if !self.shutdown.is_gate_open() {
+            // Quiesced; see `VsockGate` for why this check is needed.
+            -libc::EPIPE
+        } else if let Some(buf) = pkt.buf() {
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
 
@@ -625,9 +641,19 @@ pub struct UnixAcceptorProxy {
     id: u64,
     fd: OwnedFd,
     peer_port: u32,
+    path: PathBuf,
+    /// Device and inode of the socket file this proxy bound at `path`.
+    bound: (u64, u64),
+}
+
+fn file_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 impl UnixAcceptorProxy {
+    /// Bind and listen at `path`. The listener is nonblocking, so a peer
+    /// that disconnects before `accept` cannot block the muxer thread.
     pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
         let fd = socket(
             AddressFamily::Unix,
@@ -636,14 +662,42 @@ impl UnixAcceptorProxy {
             None,
         )
         .map_err(ProxyError::CreatingSocket)?;
+        set_nonblocking(&fd, id);
         bind(
             fd.as_raw_fd(),
             &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
         )
         .map_err(ProxyError::CreatingSocket)?;
-        listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
-            .map_err(ProxyError::CreatingSocket)?;
-        Ok(UnixAcceptorProxy { id, fd, peer_port })
+        // From here on the path is ours: dropping the proxy removes it.
+        let bound = file_identity(path).map_err(|e| {
+            let _ = fs::remove_file(path);
+            ProxyError::SocketIo(e)
+        })?;
+        let proxy = UnixAcceptorProxy {
+            id,
+            fd,
+            peer_port,
+            path: path.clone(),
+            bound,
+        };
+        listen(
+            &proxy.fd,
+            Backlog::new(5).map_err(ProxyError::CreatingSocket)?,
+        )
+        .map_err(ProxyError::CreatingSocket)?;
+        Ok(proxy)
+    }
+}
+
+impl Drop for UnixAcceptorProxy {
+    /// Remove the path only while it is still the socket bound here, never
+    /// a file someone else created there since.
+    fn drop(&mut self) {
+        if file_identity(&self.path).ok() == Some(self.bound) {
+            if let Err(e) = fs::remove_file(&self.path) {
+                warn!("failed to remove vsock socket {:?}: {e}", self.path);
+            }
+        }
     }
 }
 

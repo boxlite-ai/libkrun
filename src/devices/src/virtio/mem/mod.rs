@@ -7,9 +7,11 @@
 
 mod control;
 mod region;
+mod snapshot;
 
 pub use control::{MemoryControl, MemoryStatus, SLOT_MIB, SLOT_SIZE};
 pub use region::HotplugRegion;
+pub use snapshot::MemState;
 
 use std::ops::Range;
 use std::os::fd::AsRawFd;
@@ -51,6 +53,9 @@ pub struct Mem {
     activate_evt: EventFd,
     state: DeviceState,
     queue: Option<DeviceQueue>,
+    frozen: bool,
+    restore_failed: bool,
+    restore_pending_activation: bool,
 }
 
 impl Mem {
@@ -70,6 +75,9 @@ impl Mem {
             activate_evt: EventFd::new(EFD_NONBLOCK)?,
             state: DeviceState::Inactive,
             queue: None,
+            frozen: false,
+            restore_failed: false,
+            restore_pending_activation: false,
         })
     }
 
@@ -287,6 +295,11 @@ impl Subscriber for Mem {
         ]
     }
     fn process(&mut self, event: &EpollEvent, manager: &mut EventManager) {
+        // Keep notifications pending. resume() also re-arms the queue and host
+        // target, so a new process does not depend on old eventfd counters.
+        if self.frozen {
+            return;
+        }
         if !event.event_set().contains(EventSet::IN) {
             return;
         }
@@ -295,6 +308,9 @@ impl Subscriber for Mem {
             let _ = self.activate_evt.read();
             let subscriber = manager.subscriber(fd).unwrap();
             let queue_fd = self.queue.as_ref().unwrap().event.as_raw_fd();
+            if manager.subscriber(queue_fd).is_ok() {
+                return;
+            }
             if let Err(error) = manager.register(
                 queue_fd,
                 EpollEvent::new(EventSet::IN, queue_fd as u64),
@@ -397,5 +413,82 @@ mod tests {
         assert_eq!(device.config.plugged_size, SLOT_SIZE);
         assert_eq!(device.region.mapped_size(), SLOT_SIZE);
         assert_eq!(host_permissions(&device, SLOT_SIZE as usize), "---p");
+    }
+
+    #[test]
+    fn snapshot_restores_sparse_slots_protection_pending_target_and_queue() {
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::queue::tests::VirtQueue;
+        use vm_memory::{GuestAddress, MemoryRegionAddress};
+        let mut source = device(0, 2, 1);
+        let boot = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let memory = boot.insert_region(source.region.memory.clone()).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0x1000), &memory, 128);
+        let interrupt =
+            || InterruptTransport::new(DummyIrqChip::new().into(), "mem-test".into()).unwrap();
+        let event = || Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        source.set_acked_features(1 << 32);
+        source
+            .activate(
+                memory.clone(),
+                interrupt(),
+                vec![DeviceQueue::new(ring.create_queue(), event())],
+            )
+            .unwrap();
+        assert_eq!(source.request(0, source.config.addr, 1).0, 0);
+        source.control.progress(BLOCK_SIZE, SLOT_SIZE, 0);
+        source
+            .region
+            .memory
+            .write_slice(&[0xa5; 4096], MemoryRegionAddress(0))
+            .unwrap();
+        // Accepted before freeze, but not yet applied to device config.
+        source.control.request(512).unwrap();
+        source.freeze();
+        let state = source.save_state().unwrap();
+        assert_eq!(state.requested_size, SLOT_SIZE);
+        assert_eq!(state.status.requested_mib, 512);
+        let mut bytes = Vec::new();
+        source.save_memory(&mut bytes).unwrap();
+        assert_eq!(bytes.len() as u64, SLOT_SIZE);
+        let mut corrupt = state.clone();
+        corrupt.mapped[1] = true;
+        assert!(corrupt.validate().is_err());
+
+        let mut target = device(0, 2, 1);
+        target.freeze();
+        target.restore_state(&state, &mut bytes.as_slice()).unwrap();
+        assert!(target.resume().is_err()); // Active queue must be rebound first.
+        assert_eq!(host_permissions(&target, 0), "rw-p");
+        assert_eq!(host_permissions(&target, SLOT_SIZE as usize), "---p");
+        let mut data = [0; 4096];
+        target
+            .region
+            .memory
+            .read_slice(&mut data, MemoryRegionAddress(0))
+            .unwrap();
+        assert_eq!(data, [0xa5; 4096]);
+        let target_memory = source
+            .boot_memory(&memory)
+            .unwrap()
+            .insert_region(target.region.memory.clone())
+            .unwrap();
+        target
+            .activate_restored(&state, target_memory, interrupt(), event())
+            .unwrap();
+        assert_eq!(target.save_state().unwrap(), state);
+        target.resume().unwrap();
+        target.update_target();
+        assert_eq!(target.config.requested_size, 2 * SLOT_SIZE);
+        target.freeze();
+        assert!(target.save_state().is_ok());
+
+        let mut truncated = device(0, 2, 1);
+        truncated.freeze();
+        assert!(truncated
+            .restore_state(&state, &mut &bytes[..4096])
+            .is_err());
+        assert!(truncated.resume().is_err());
+        assert!(truncated.save_state().is_err());
     }
 }

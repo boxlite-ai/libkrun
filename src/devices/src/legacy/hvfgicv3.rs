@@ -119,6 +119,54 @@ impl HvfGicV3 {
 }
 
 impl IrqChipT for HvfGicV3 {
+    fn is_native(&self) -> bool {
+        true
+    }
+    fn save_state(&self) -> io::Result<Vec<u8>> {
+        type Object = *mut std::ffi::c_void;
+        unsafe {
+            let create: libloading::Symbol<unsafe extern "C" fn() -> Object> =
+                HVF.get(b"hv_gic_state_create").map_err(io::Error::other)?;
+            let size: libloading::Symbol<unsafe extern "C" fn(Object, *mut usize) -> hv_return_t> =
+                HVF.get(b"hv_gic_state_get_size")
+                    .map_err(io::Error::other)?;
+            let data: libloading::Symbol<unsafe extern "C" fn(Object, *mut u8) -> hv_return_t> =
+                HVF.get(b"hv_gic_state_get_data")
+                    .map_err(io::Error::other)?;
+            extern "C" {
+                fn os_release(object: Object);
+            }
+            let object = create();
+            if object.is_null() {
+                return Err(io::Error::other("GIC state unavailable"));
+            }
+            let result = (|| {
+                let mut len = 0;
+                if size(object, &mut len) != HV_SUCCESS || len == 0 || len > 4 * 1024 * 1024 {
+                    return Err(io::Error::other("invalid GIC state size"));
+                }
+                let mut bytes = vec![0; len];
+                if data(object, bytes.as_mut_ptr()) != HV_SUCCESS {
+                    return Err(io::Error::other("GIC capture failed"));
+                }
+                Ok(bytes)
+            })();
+            os_release(object);
+            result
+        }
+    }
+    fn restore_state(&mut self, bytes: &[u8]) -> io::Result<()> {
+        unsafe {
+            let set: libloading::Symbol<unsafe extern "C" fn(*const u8, usize) -> hv_return_t> =
+                HVF.get(b"hv_gic_set_state").map_err(io::Error::other)?;
+            if set(bytes.as_ptr(), bytes.len()) == HV_SUCCESS {
+                Ok(())
+            } else {
+                Err(io::Error::other("incompatible GIC state"))
+            }
+        }
+    }
+
     fn get_mmio_addr(&self) -> u64 {
         0
     }

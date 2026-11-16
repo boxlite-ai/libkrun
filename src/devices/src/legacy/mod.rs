@@ -54,6 +54,8 @@ pub use self::gpio::Gpio;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
+pub use self::i8042::I8042State;
+#[cfg(target_arch = "x86_64")]
 pub use self::i8042::{Error as I8042DeviceError, I8042Device};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::ioapic::IoApic;
@@ -71,6 +73,8 @@ pub use self::kvmioapic::KvmIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
+#[cfg(target_arch = "x86_64")]
+pub use self::serial::SerialState;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 

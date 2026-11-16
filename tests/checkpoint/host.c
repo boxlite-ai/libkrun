@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: Apache-2.0
+#define _GNU_SOURCE
+#include "libkrun.h"
+#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static uint32_t context;
+static const char *destination;
+static sigset_t signals;
+static const char *root;
+static int hotplug;
+static void check(int result, const char *operation);
+
+static void grow_memory(void) {
+#ifdef __linux__
+    int requested = -EAGAIN;
+    for (unsigned i = 0; i < 2000 && requested == -EAGAIN; ++i) {
+        requested = krun_request_memory(context, 384);
+        if (requested == -EAGAIN) usleep(10000);
+    }
+    check(requested, "request memory");
+    struct krun_memory_status status;
+    for (unsigned i = 0; i < 2000; ++i) {
+        check(krun_get_memory_status(context, &status), "memory status");
+        if (status.plugged_mib == 384) break;
+        usleep(10000);
+    }
+    if (status.plugged_mib != 384 || status.mapped_mib != 384) { fprintf(stderr, "MEMORY did not grow: %u %u error=%d\n", status.plugged_mib, status.mapped_mib, status.error); abort(); }
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/allocate-hotplug", root);
+    int fd = open(path, O_WRONLY | O_CREAT, 0600);
+    if (fd < 0) abort(); close(fd);
+    snprintf(path, sizeof(path), "%s/hotplug-ready", root);
+    for (unsigned i = 0; i < 2000 && access(path, F_OK); ++i) usleep(10000);
+    if (access(path, F_OK)) abort();
+    fprintf(stderr, "MEMORY 384 384\n");
+#else
+    abort();
+#endif
+}
+
+static void check(int result, const char *operation) {
+    if (result < 0) { fprintf(stderr, "%s: %d\n", operation, result); exit(1); }
+}
+
+static void *save(void *unused) {
+    (void)unused;
+    int first = 1;
+    for (;;) {
+        int signal;
+        if (sigwait(&signals, &signal)) abort();
+        if (signal == SIGUSR2) {
+            int result = krun_resume(context);
+            if (!result) result = krun_resume(context); /* Idempotent. */
+            fprintf(stderr, "RESUME %d\n", result);
+        } else {
+            if (hotplug && first) grow_memory();
+            if (first) {
+                int result = krun_save_checkpoint(context, destination);
+                if (result != -EBUSY) abort();
+                fprintf(stderr, "RUNNING_SAVE %d\n", result);
+            }
+            int result = krun_pause(context);
+            if (!result) result = krun_pause(context); /* Idempotent. */
+            if (!result) {
+                if (first && getenv("KRUN_TEST_FAIL_EXPORT")) {
+                    char invalid[4096];
+                    snprintf(invalid, sizeof(invalid), "%s/missing/checkpoint", destination);
+                    result = krun_save_checkpoint(context, invalid);
+                } else {
+                    result = krun_save_checkpoint(context, destination);
+                }
+            }
+            first = 0;
+            fprintf(stderr, "CHECKPOINT %d\n", result);
+        }
+        fflush(stderr);
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: %s boot|restore rootfs checkpoint console [raw-disk]\n", argv[0]); return 2; }
+    root = argv[2]; hotplug = getenv("KRUN_TEST_HOTPLUG") != NULL;
+    sigemptyset(&signals); sigaddset(&signals, SIGUSR1); sigaddset(&signals, SIGUSR2);
+    if (pthread_sigmask(SIG_BLOCK, &signals, NULL)) abort();
+    check(krun_set_log_level(3), "log");
+    int ctx = krun_create_ctx(); check(ctx, "create"); context = ctx;
+    if (krun_pause(context) != -EAGAIN || krun_resume(context) != -EAGAIN ||
+        krun_save_checkpoint(context, NULL) != -EINVAL ||
+        krun_save_checkpoint(context, "") != -EINVAL ||
+        krun_build_from_checkpoint(context, "") != -EINVAL) abort();
+    check(krun_set_vm_config(context, 2, 256), "vm config");
+    if (hotplug) {
+#ifdef __linux__
+        check(krun_set_memory_hotplug(context, 384), "hotplug config");
+        check(krun_add_kernel_cmdline(context, "memhp_default_state=online_movable"), "auto-online memory");
+#else
+        abort();
+#endif
+    }
+    int block_root = getenv("KRUN_TEST_BLOCK_ROOT") != NULL;
+    if (!block_root) check(krun_set_root(context, argv[2]), "root");
+    check(krun_set_console_output(context, argv[4]), "console");
+    if (getenv("KRUN_TEST_DAX")) {
+        char path[4096]; snprintf(path, sizeof(path), "%s/dax-share", root);
+        check(krun_add_virtiofs2(context, "dax-test", path, 8 * 1024 * 1024), "DAX share");
+    }
+    const char *extra_fs = getenv("KRUN_TEST_EXTRA_FS");
+    for (unsigned i = 0; extra_fs && i < strtoul(extra_fs, NULL, 10); ++i) {
+        char tag[64]; snprintf(tag, sizeof(tag), "checkpoint-extra-%u", i);
+        check(krun_add_virtiofs2(context, tag, root, 0), "extra share");
+    }
+    // Network lifecycle is tested separately; this fixture isolates the CPU,
+    // virtio-fs, console and disk continuation boundary.
+    if (!getenv("KRUN_TEST_TSI")) check(krun_disable_implicit_vsock(context), "disable implicit vsock");
+    const char *net_path = getenv("KRUN_TEST_NET_SOCKET");
+    if (net_path) {
+        uint8_t mac[6] = {2, 0, 0, 0, 0, 1};
+        check(krun_add_net_unixstream(context, net_path, -1, mac, 0, 0), "net backend");
+    }
+    const char *args[] = {NULL};
+    const char *env[] = {"PATH=/bin:/usr/bin", NULL};
+    check(krun_set_exec(context, "/checkpoint-guest", args, env), "exec");
+    if (argc == 6 && !getenv("KRUN_TEST_MISSING_DISK"))
+        check(krun_add_disk2(context, "data", argv[5], getenv("KRUN_TEST_FLATTEN") ? KRUN_DISK_FORMAT_QCOW2 : KRUN_DISK_FORMAT_RAW, false), "disk");
+    if (strcmp(argv[1], "restore") == 0) {
+        check(krun_build_from_checkpoint(context, argv[3]), "restore configuration");
+    } else {
+        if (block_root) check(krun_set_root_disk_remount(context, "/dev/vda", "ext4", NULL), "block rootfs");
+    }
+    destination = getenv("KRUN_TEST_NEXT_CHECKPOINT");
+    if (!destination) destination = argv[3];
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, save, NULL)) abort();
+    check(krun_start_enter(context), "enter");
+    return 1;
+}

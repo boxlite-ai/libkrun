@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::proxy::Proxy;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
 const TIMEOUT: Duration = Duration::new(5, 0);
@@ -56,19 +57,23 @@ impl ReaperThread {
         timeout
     }
 
+    /// Runs until every sender is gone: the backend stopped.
     fn work(&mut self) {
         loop {
             let timeout = self.check_expiration();
-            if let Ok(id) = self.receiver.recv_timeout(timeout) {
-                self.released_map.insert(id, Instant::now());
+            match self.receiver.recv_timeout(timeout) {
+                Ok(id) => {
+                    self.released_map.insert(id, Instant::now());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self) -> io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock reaper".into())
             .spawn(move || self.work())
-            .unwrap();
     }
 }

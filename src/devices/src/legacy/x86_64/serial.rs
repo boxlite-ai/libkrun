@@ -55,7 +55,7 @@ const DEFAULT_BAUD_DIVISOR: u16 = 12; // 9600 bps
 
 /// Device registers and unread input, without host endpoints or eventfd counters.
 /// This is an in-memory state, not a versioned wire format.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SerialState {
     pub interrupt_enable: u8,
     pub interrupt_identification: u8,

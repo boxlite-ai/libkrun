@@ -155,6 +155,9 @@ impl Balloon {
 
 impl Subscriber for Balloon {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        if self.frozen {
+            return;
+        }
         let source = event.fd();
         let ifq = self.queue_event(IFQ_INDEX).as_raw_fd();
         let dfq = self.queue_event(DFQ_INDEX).as_raw_fd();

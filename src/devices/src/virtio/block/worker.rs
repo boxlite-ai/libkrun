@@ -3,6 +3,9 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 
+use super::snapshot::WorkerCheckpoint;
+use crate::virtio::control::Command;
+use crate::virtio::persist::invalid;
 use crate::virtio::InterruptTransport;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -61,6 +64,7 @@ pub struct BlockWorker {
     mem: GuestMemoryMmap,
     disk: DiskProperties,
     stop_fd: EventFd,
+    checkpoint: WorkerCheckpoint,
 }
 
 impl BlockWorker {
@@ -70,6 +74,7 @@ impl BlockWorker {
         mem: GuestMemoryMmap,
         disk: DiskProperties,
         stop_fd: EventFd,
+        checkpoint: WorkerCheckpoint,
     ) -> Self {
         Self {
             device_queue,
@@ -77,63 +82,112 @@ impl BlockWorker {
             mem,
             disk,
             stop_fd,
+            checkpoint,
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub fn run(self) -> io::Result<thread::JoinHandle<()>> {
         thread::Builder::new()
             .name("block worker".into())
-            .spawn(|| self.work())
-            .unwrap()
+            .spawn(|| {
+                if let Err(error) = self.work() {
+                    error!("block worker stopped: {error}");
+                }
+            })
     }
 
-    fn work(mut self) {
-        let virtq_ev_fd = self.device_queue.event.as_raw_fd();
-        let stop_ev_fd = self.stop_fd.as_raw_fd();
-
-        let epoll = Epoll::new().unwrap();
-
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_ev_fd as u64),
-        );
-
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            stop_ev_fd,
-            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
-        );
-
+    fn work(mut self) -> io::Result<()> {
+        let queue_fd = self.device_queue.event.as_raw_fd();
+        let stop_fd = self.stop_fd.as_raw_fd();
+        let control_fd = self.checkpoint.control.event().as_raw_fd();
+        let epoll = Epoll::new()?;
+        for fd in [stop_fd, control_fd] {
+            epoll.ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            )?;
+        }
+        if !self.checkpoint.frozen {
+            epoll.ctl(
+                ControlOperation::Add,
+                queue_fd,
+                &EpollEvent::new(EventSet::IN, queue_fd as u64),
+            )?;
+        }
+        let mut events: [EpollEvent; 8] =
+            std::array::from_fn(|_| EpollEvent::new(EventSet::empty(), 0));
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
-                Ok(ev_cnt) => {
-                    for event in &epoll_events[0..ev_cnt] {
-                        let source = event.fd();
-                        let event_set = event.event_set();
-                        match event_set {
-                            EventSet::IN if source == virtq_ev_fd => {
-                                self.process_queue_event();
-                            }
-                            EventSet::IN if source == stop_ev_fd => {
-                                debug!("stopping worker thread");
-                                let _ = self.stop_fd.read();
-                                return;
-                            }
-                            _ => {
-                                log::warn!(
-                                    "Received unknown event: {event_set:?} from fd: {source:?}"
-                                );
-                            }
-                        }
+            let count = match epoll.wait(events.len(), -1, &mut events) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            // Stop and control take precedence over queue notifications in the
+            // same batch. No queue callback runs after a freeze acknowledgement.
+            if events[..count].iter().any(|event| event.fd() == stop_fd) {
+                let _ = self.stop_fd.read();
+                return Ok(());
+            }
+            if events[..count].iter().any(|event| event.fd() == control_fd) {
+                let _ = self.checkpoint.control.event().read();
+                while let Ok(request) = self.checkpoint.control.try_recv() {
+                    if request.is_expired() {
+                        return Err(invalid("block control deadline elapsed"));
+                    }
+                    let result = match request.command() {
+                        Command::Freeze => self.freeze(&epoll),
+                        Command::Resume => self.resume(&epoll),
+                    };
+                    if !request.respond(result) {
+                        return Err(invalid("block control outcome is unknown"));
                     }
                 }
-                Err(e) => {
-                    debug!("failed to consume muxer epoll event: {e}");
-                }
+            }
+            if !self.checkpoint.frozen && events[..count].iter().any(|event| event.fd() == queue_fd)
+            {
+                self.process_queue_event();
             }
         }
+    }
+
+    fn freeze(&mut self, epoll: &Epoll) -> io::Result<()> {
+        if !self.checkpoint.frozen {
+            epoll.ctl(
+                ControlOperation::Delete,
+                self.device_queue.event.as_raw_fd(),
+                &EpollEvent::default(),
+            )?;
+            self.checkpoint.frozen = true;
+        }
+        // All imago accesses above are synchronous. No descriptor is held once
+        // process_queue returns. Checkpoint durability applies even to a device
+        // whose guest FLUSH policy is CacheType::Unsafe.
+        let disk = self.disk.file.lock().unwrap();
+        disk.flush()?;
+        disk.sync()?;
+        let queue = self.device_queue.queue.save_state(&self.mem, true)?;
+        if queue.next_avail != queue.next_used {
+            return Err(invalid("block queue has unfinished descriptors"));
+        }
+        *self.checkpoint.queue.lock().unwrap() = Some(queue);
+        Ok(())
+    }
+
+    fn resume(&mut self, epoll: &Epoll) -> io::Result<()> {
+        if !self.checkpoint.frozen {
+            return Err(invalid("block worker is not frozen"));
+        }
+        epoll.ctl(
+            ControlOperation::Add,
+            self.device_queue.event.as_raw_fd(),
+            &EpollEvent::new(EventSet::IN, self.device_queue.event.as_raw_fd() as u64),
+        )?;
+        self.checkpoint.frozen = false;
+        // Restored eventfds start empty. A descriptor that was available at the
+        // freeze boundary must complete without another guest notification.
+        self.process_virtio_queues();
+        Ok(())
     }
 
     fn process_queue_event(&mut self) {
