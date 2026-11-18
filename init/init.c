@@ -726,6 +726,7 @@ static void unescape_exec_strings(int argc, char **argv)
     int i;
 
     for (env = environ; *env; env++) {
+        /* KRUN_* names are reserved for libkrun's unencoded boot parameters. */
         if (strncmp(*env, "KRUN_", 5) != 0) {
             unescape_cmdline_string(*env);
         }
