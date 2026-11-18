@@ -1303,6 +1303,10 @@ pub unsafe extern "C" fn krun_set_workdir(ctx_id: u32, c_workdir_path: *const c_
     KRUN_SUCCESS
 }
 
+fn escape_kernel_cmdline_str(s: &str) -> String {
+    s.replace('\\', "\\u005c").replace('"', "\\u0022")
+}
+
 unsafe fn collapse_str_array(array: &[*const c_char]) -> Result<String, std::str::Utf8Error> {
     let mut strvec = Vec::new();
 
@@ -1311,7 +1315,7 @@ unsafe fn collapse_str_array(array: &[*const c_char]) -> Result<String, std::str
             break;
         } else {
             let s = CStr::from_ptr(*item).to_str()?;
-            strvec.push(format!("\"{s}\""));
+            strvec.push(format!("\"{}\"", escape_kernel_cmdline_str(s)));
         }
     }
 
@@ -1359,7 +1363,13 @@ pub unsafe extern "C" fn krun_set_exec(
         }
     } else {
         env::vars()
-            .map(|(key, value)| format!(" {key}=\"{value}\""))
+            .map(|(key, value)| {
+                format!(
+                    " \"{}={}\"",
+                    escape_kernel_cmdline_str(&key),
+                    escape_kernel_cmdline_str(&value)
+                )
+            })
             .collect()
     };
 
@@ -1391,7 +1401,13 @@ pub unsafe extern "C" fn krun_set_env(ctx_id: u32, c_envp: *const *const c_char)
         }
     } else {
         env::vars()
-            .map(|(key, value)| format!(" {key}=\"{value}\""))
+            .map(|(key, value)| {
+                format!(
+                    " \"{}={}\"",
+                    escape_kernel_cmdline_str(&key),
+                    escape_kernel_cmdline_str(&value)
+                )
+            })
             .collect()
     };
 

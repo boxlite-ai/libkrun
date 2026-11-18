@@ -699,6 +699,43 @@ static void unescape_string(char *string, int len)
     string[i] = '\0';
 }
 
+#if __linux__
+static void unescape_cmdline_string(char *string)
+{
+    char *read = string;
+    char *write = string;
+
+    while (*read) {
+        if (strncmp(read, "\\u005c", 6) == 0) {
+            *write++ = '\\';
+            read += 6;
+        } else if (strncmp(read, "\\u0022", 6) == 0) {
+            *write++ = '"';
+            read += 6;
+        } else {
+            *write++ = *read++;
+        }
+    }
+    *write = '\0';
+}
+
+static void unescape_exec_strings(int argc, char **argv)
+{
+    extern char **environ;
+    char **env;
+    int i;
+
+    for (env = environ; *env; env++) {
+        if (strncmp(*env, "KRUN_", 5) != 0) {
+            unescape_cmdline_string(*env);
+        }
+    }
+    for (i = 1; i < argc; i++) {
+        unescape_cmdline_string(argv[i]);
+    }
+}
+#endif
+
 static void config_parse_env(char *data, jsmntok_t *token)
 {
     jsmntok_t *tenv;
@@ -1207,6 +1244,10 @@ int main(int argc, char **argv)
     bool config_file_mounted = false;
 
     open_console();
+#endif
+
+#if __linux__
+    unescape_exec_strings(argc, argv);
 #endif
 
 #ifdef TDX
