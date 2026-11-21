@@ -29,6 +29,7 @@ use virtio_bindings::{
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+use super::snapshot::{self, SnapshotDisk, SnapshotHandle};
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
@@ -209,6 +210,7 @@ pub struct Block {
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    snapshot: Option<Arc<SnapshotDisk>>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -238,50 +240,98 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
     ) -> io::Result<Block> {
+        Self::new_with_snapshot(
+            id,
+            partuuid,
+            cache_type,
+            disk_image_path,
+            disk_image_format,
+            is_disk_read_only,
+            direct_io,
+            sync_mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_snapshot(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image_path: String,
+        disk_image_format: ImageType,
+        is_disk_read_only: bool,
+        direct_io: bool,
+        sync_mode: SyncMode,
+        snapshot_handle: Option<Arc<SnapshotHandle>>,
+    ) -> io::Result<Block> {
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        let initial = if snapshot_handle.is_some()
+            && disk_image_format == ImageType::Qcow2
+            && !is_disk_read_only
+            && !direct_io
+        {
+            snapshot::open_initial(disk_image)?
+        } else {
+            None
+        };
 
-        let file_opts = StorageOpenOptions::new()
-            .write(!is_disk_read_only)
-            .filename(disk_image_path)
-            .direct(direct_io);
-
-        #[cfg(target_os = "macos")]
-        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
-        let discard_alignment = file.discard_align();
-
-        let disk_image = match disk_image_format {
-            ImageType::Qcow2 => {
-                let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+        let (disk_image, identity, discard_alignment) = if let Some((image, id, alignment)) =
+            initial
+        {
+            (image, Some(id), alignment)
+        } else {
+            let file_opts = StorageOpenOptions::new()
+                .write(!is_disk_read_only)
+                .filename(&disk_image_path)
+                .direct(direct_io);
+            #[cfg(target_os = "macos")]
+            let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+            let file = ImagoFile::open_sync(file_opts)?;
+            let alignment = file.discard_align();
+            let image = match disk_image_format {
+                ImageType::Qcow2 => {
+                    let mut qcow2 =
+                        Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                            Box::new(file),
+                            !is_disk_read_only,
+                        )?;
+                    qcow2.open_implicit_dependencies_sync()?;
+                    SyncFormatAccess::new(qcow2)?
+                }
+                ImageType::Raw => {
+                    let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
-            }
-            ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
-            }
-            ImageType::Vmdk => {
-                let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
-                    Box::new(file),
-                )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
-            }
+                    SyncFormatAccess::new(raw)?
+                }
+                ImageType::Vmdk => {
+                    let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
+                        Box::new(file),
+                    )
+                    .open_sync(PermissiveImplicitOpenGate::default())?;
+                    SyncFormatAccess::new(vmdk)?
+                }
+            };
+            (image, None, alignment)
         };
 
         let disk_image = Arc::new(Mutex::new(disk_image));
+        let snapshot = snapshot_handle.zip(identity).map(|(handle, id)| {
+            let snapshot = Arc::new(SnapshotDisk::new(
+                disk_image_path.into(),
+                disk_image.clone(),
+                id,
+            ));
+            *handle.disk.lock().unwrap() = Some(snapshot.clone());
+            snapshot
+        });
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
@@ -322,6 +372,7 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            snapshot,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -418,12 +469,21 @@ impl VirtioDevice for Block {
             .map_err(|_| ActivateError::BadActivate)?,
         };
 
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.set_queue(Some(
+                blk_q
+                    .event
+                    .try_clone()
+                    .map_err(|_| ActivateError::BadActivate)?,
+            ));
+        }
         let worker = BlockWorker::new(
             blk_q,
             interrupt.clone(),
             mem.clone(),
             disk,
             self.worker_stopfd.try_clone().unwrap(),
+            self.snapshot.clone(),
         );
         self.worker_thread = Some(worker.run());
 
@@ -437,6 +497,9 @@ impl VirtioDevice for Block {
             if let Err(e) = worker.join() {
                 error!("error waiting for worker thread: {e:?}");
             }
+        }
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.set_queue(None);
         }
         self.device_state = DeviceState::Inactive;
         true

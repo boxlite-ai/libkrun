@@ -4,6 +4,8 @@ extern crate log;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+#[cfg(feature = "blk")]
+mod disk_snapshot;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
@@ -148,6 +150,11 @@ struct ContextConfig {
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
+    #[cfg(feature = "blk")]
+    snapshot_control: Option<(
+        String,
+        std::sync::Arc<devices::virtio::block::snapshot::SnapshotHandle>,
+    )>,
     #[cfg(feature = "blk")]
     root_block_cfg: Option<BlockDeviceConfig>,
     #[cfg(feature = "blk")]
@@ -2601,7 +2608,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(feature = "blk")]
     for block_cfg in ctx_cfg.get_block_cfg() {
-        if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
+        let control = ctx_cfg
+            .snapshot_control
+            .as_ref()
+            .filter(|(id, _)| id == &block_cfg.block_id)
+            .map(|(_, handle)| handle.clone());
+        if ctx_cfg
+            .vmr
+            .block
+            .insert_with_snapshot(block_cfg, control)
+            .is_err()
+        {
             error!("Error configuring virtio-blk for block");
             return -libc::EINVAL;
         }
