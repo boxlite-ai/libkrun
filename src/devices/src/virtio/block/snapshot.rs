@@ -10,6 +10,8 @@ use imago::{
 };
 use utils::eventfd::EventFd;
 
+use super::SyncMode;
+
 pub(crate) type Image = SyncFormatAccess<Box<dyn DynStorage>>;
 type QcowImage = Qcow2<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>;
 
@@ -70,6 +72,7 @@ struct SnapshotState {
 
 pub struct SnapshotDisk {
     path: PathBuf,
+    sync_mode: SyncMode,
     image: Arc<Mutex<Image>>,
     state: Mutex<SnapshotState>,
     // Serialize acceptance of one descriptor against flush and backend replacement.
@@ -79,9 +82,15 @@ pub struct SnapshotDisk {
 }
 
 impl SnapshotDisk {
-    pub(crate) fn new(path: PathBuf, image: Arc<Mutex<Image>>, identity: FileIdentity) -> Self {
+    pub(crate) fn new(
+        path: PathBuf,
+        image: Arc<Mutex<Image>>,
+        identity: FileIdentity,
+        sync_mode: SyncMode,
+    ) -> Self {
         Self {
             path,
+            sync_mode,
             image,
             state: Mutex::new(SnapshotState {
                 image: identity,
@@ -132,11 +141,17 @@ impl SnapshotDisk {
 
         self.fenced.store(true, Ordering::Release);
         let _boundary = self.queue_boundary.lock().unwrap();
-        let result = {
+        let sync_image = || -> io::Result<()> {
             let image = self.image.lock().unwrap();
-            image.flush().and_then(|()| image.sync())
+            image.flush()?;
+            image.sync()?;
+            #[cfg(target_os = "macos")]
+            if self.sync_mode == SyncMode::Relaxed {
+                open_verified_file(&self.path, true, source)?.sync_all()?;
+            }
+            Ok(())
         };
-        if let Err(error) = result {
+        if let Err(error) = sync_image() {
             self.unfence();
             return Err(error);
         }
@@ -161,11 +176,11 @@ impl SnapshotDisk {
             return Err(errno(libc::EINVAL));
         }
 
-        let mut child = open_verified(&self.path, true, overlay)?;
+        let mut child = open_verified(&self.path, true, overlay, &self.sync_mode)?;
         if child.implicit_backing_file().map(Path::new) != Some(backing_path) {
             return Err(errno(libc::EINVAL));
         }
-        let mut base = open_verified(backing_path, false, backing)?;
+        let mut base = open_verified(backing_path, false, backing, &self.sync_mode)?;
         base.open_implicit_dependencies_sync()?;
         child.set_backing(Some(Arc::new(FormatAccess::new(base))));
         child.open_implicit_dependencies_sync()?;
@@ -196,7 +211,7 @@ impl SnapshotDisk {
             return Err(errno(libc::EINVAL));
         }
         if state.image != source {
-            let mut original = open_verified(&self.path, true, source)?;
+            let mut original = open_verified(&self.path, true, source, &self.sync_mode)?;
             original.open_implicit_dependencies_sync()?;
             self.replace(SyncFormatAccess::new(original)?)?;
             state.image = source;
@@ -235,7 +250,7 @@ impl SnapshotDisk {
     }
 }
 
-fn open_verified(path: &Path, writable: bool, identity: FileIdentity) -> io::Result<QcowImage> {
+fn open_verified_file(path: &Path, writable: bool, identity: FileIdentity) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(writable)
@@ -244,7 +259,35 @@ fn open_verified(path: &Path, writable: bool, identity: FileIdentity) -> io::Res
     if FileIdentity::of(&file)? != identity {
         return Err(errno(libc::ESTALE));
     }
-    let storage: Box<dyn DynStorage> = Box::new(ImagoFile::try_from(file)?);
+    Ok(file)
+}
+
+fn imago_storage(file: File, _writable: bool, _sync_mode: &SyncMode) -> io::Result<ImagoFile> {
+    #[cfg(target_os = "macos")]
+    if *_sync_mode == SyncMode::Relaxed {
+        use std::os::fd::AsRawFd;
+
+        // Darwin opens /dev/fd/N by duplicating N. Keep the verified descriptor
+        // live while imago applies the configured sync mode to its duplicate.
+        let descriptor = format!("/dev/fd/{}", file.as_raw_fd());
+        return ImagoFile::open_sync(
+            imago::StorageOpenOptions::new()
+                .filename(&descriptor)
+                .write(_writable)
+                .relaxed_sync(true),
+        );
+    }
+    ImagoFile::try_from(file)
+}
+
+fn open_verified(
+    path: &Path,
+    writable: bool,
+    identity: FileIdentity,
+    sync_mode: &SyncMode,
+) -> io::Result<QcowImage> {
+    let file = open_verified_file(path, writable, identity)?;
+    let storage: Box<dyn DynStorage> = Box::new(imago_storage(file, writable, sync_mode)?);
     let qcow = Qcow2::open_image_sync(storage, writable)?;
     if qcow.requires_external_data_file() {
         return Err(errno(libc::ENOTSUP));
@@ -252,9 +295,12 @@ fn open_verified(path: &Path, writable: bool, identity: FileIdentity) -> io::Res
     Ok(qcow)
 }
 
-pub(crate) fn open_initial(file: File) -> io::Result<Option<(Image, FileIdentity, usize)>> {
+pub(crate) fn open_initial(
+    file: File,
+    sync_mode: &SyncMode,
+) -> io::Result<Option<(Image, FileIdentity, usize)>> {
     let identity = FileIdentity::of(&file)?;
-    let storage = ImagoFile::try_from(file)?;
+    let storage = imago_storage(file, true, sync_mode)?;
     let discard_alignment = storage.discard_align();
     let mut qcow: QcowImage =
         Qcow2::open_image_sync(Box::new(storage) as Box<dyn DynStorage>, true)?;

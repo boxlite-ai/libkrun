@@ -276,7 +276,7 @@ impl Block {
             && !is_disk_read_only
             && !direct_io
         {
-            snapshot::open_initial(disk_image)?
+            snapshot::open_initial(disk_image, &sync_mode)?
         } else {
             None
         };
@@ -328,6 +328,7 @@ impl Block {
                 disk_image_path.into(),
                 disk_image.clone(),
                 id,
+                sync_mode.clone(),
             ));
             *handle.disk.lock().unwrap() = Some(snapshot.clone());
             snapshot
