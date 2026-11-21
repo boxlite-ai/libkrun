@@ -242,13 +242,23 @@ Despite being written in Rust, this library provides a simple C API defined in [
 ### Online QCOW2 backend switching
 
 BoxLite's shim can register a writable QCOW2 disk for backend switching before VM
-entry. To capture disk A while the guest runs, fence the disk and flush A, then
-install an overlay backed by A. Release the fence after the host's snapshot
-decision is durable so later writes go to the overlay.
+entry. The host caller owns file renames, durable decisions, and the timeout.
 
-The host caller owns the file renames, transaction journal, and timeout. It can
-restore A and abort the switch before committing. The device keeps the selected
-backend and fence state across virtio resets.
+| Step | Host caller | Block device |
+| --- | --- | --- |
+| Fence | Request a snapshot of disk A | Stop accepting requests and flush A |
+| Install | Place overlay B at the active path | Verify B and its backing A, then install B behind the fence |
+| Commit | Persist the decision and release the fence | Resume accepting requests on B |
+| Abort before commit | Restore A and request abort | Reopen A if B was installed, then resume on A |
+
+The device keeps the selected backend and fence state across virtio resets.
+Ordinary guest flushes retain the configured sync mode. The fence synchronizes
+the outgoing disk before the host changes its path.
+
+For the same VM, the host caller must serialize disk switching with
+[memory checkpoints](docs/memory-checkpoint.md). Keep the checkpoint's pause,
+disk capture, and resume separate from the disk-switch transaction through its
+release or abort.
 
 ## Examples
 

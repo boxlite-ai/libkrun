@@ -211,7 +211,12 @@ impl BlockWorker {
             self.process_queue(&mem);
 
             let pending = self.device_queue.queue.enable_notification(&mem).unwrap();
-            if !pending || self.disk_snapshot.as_ref().is_some_and(|disk| disk.fenced()) {
+            if !pending
+                || self
+                    .disk_snapshot
+                    .as_ref()
+                    .is_some_and(|disk| disk.fenced())
+            {
                 break;
             }
         }
