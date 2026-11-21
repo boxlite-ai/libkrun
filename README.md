@@ -239,6 +239,17 @@ sudo make [FEATURE_OPTIONS] install
 
 Despite being written in Rust, this library provides a simple C API defined in [include/libkrun.h](include/libkrun.h)
 
+### Online QCOW2 backend switching
+
+BoxLite's shim can register a writable QCOW2 disk for backend switching before VM
+entry. To capture disk A while the guest runs, fence the disk and flush A, then
+install an overlay backed by A. Release the fence after the host's snapshot
+decision is durable so later writes go to the overlay.
+
+The host caller owns the file renames, transaction journal, and timeout. It can
+restore A and abort the switch before committing. The device keeps the selected
+backend and fence state across virtio resets.
+
 ## Examples
 
 ### chroot_vm
