@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use devices::virtio::block::disk_snapshot::SnapshotHandle;
 use devices::virtio::{
     block::{ImageType, SyncMode},
     Block, CacheType,
@@ -55,13 +56,30 @@ impl BlockBuilder {
     }
 
     pub fn insert(&mut self, config: BlockDeviceConfig) -> Result<()> {
-        let block_dev = Arc::new(Mutex::new(Self::create_block(config)?));
+        self.insert_with_snapshot(config, None)
+    }
+
+    pub fn insert_with_snapshot(
+        &mut self,
+        config: BlockDeviceConfig,
+        snapshot: Option<Arc<SnapshotHandle>>,
+    ) -> Result<()> {
+        let block_dev = Arc::new(Mutex::new(Self::create_block_with_snapshot(
+            config, snapshot,
+        )?));
         self.list.push_back(block_dev);
         Ok(())
     }
 
     pub fn create_block(config: BlockDeviceConfig) -> Result<Block> {
-        devices::virtio::Block::new(
+        Self::create_block_with_snapshot(config, None)
+    }
+
+    fn create_block_with_snapshot(
+        config: BlockDeviceConfig,
+        snapshot: Option<Arc<SnapshotHandle>>,
+    ) -> Result<Block> {
+        devices::virtio::Block::new_with_snapshot(
             config.block_id,
             None,
             config.cache_type,
@@ -70,6 +88,7 @@ impl BlockBuilder {
             config.is_disk_read_only,
             config.direct_io,
             config.sync_mode,
+            snapshot,
         )
         .map_err(BlockConfigError::CreateBlockDevice)
     }

@@ -8,6 +8,8 @@ mod memory_hotplug;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+#[cfg(feature = "blk")]
+mod disk_snapshot;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
@@ -46,7 +48,7 @@ use vmm::resources::{
     VmResources, VsockConfig,
 };
 #[cfg(feature = "blk")]
-use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
+use vmm::vmm_config::block::{BlockConfigError, BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
@@ -154,6 +156,11 @@ struct ContextConfig {
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
+    #[cfg(feature = "blk")]
+    snapshot_control: Option<(
+        String,
+        std::sync::Arc<devices::virtio::block::disk_snapshot::SnapshotHandle>,
+    )>,
     #[cfg(feature = "blk")]
     root_block_cfg: Option<BlockDeviceConfig>,
     #[cfg(feature = "blk")]
@@ -294,6 +301,19 @@ impl ContextConfig {
         } else {
             self.block_cfgs.clone()
         }
+    }
+
+    #[cfg(feature = "blk")]
+    fn add_block_devices(&mut self) -> Result<(), BlockConfigError> {
+        for config in self.get_block_cfg() {
+            let handle = self
+                .snapshot_control
+                .as_ref()
+                .filter(|(id, _)| id == &config.block_id)
+                .map(|(_, handle)| handle.clone());
+            self.vmr.block.insert_with_snapshot(config, handle)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "net")]
@@ -2699,11 +2719,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     #[cfg(feature = "blk")]
-    for block_cfg in ctx_cfg.get_block_cfg() {
-        if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
-            error!("Error configuring virtio-blk for block");
-            return -libc::EINVAL;
-        }
+    if let Err(error) = ctx_cfg.add_block_devices() {
+        error!("Error configuring virtio-blk block devices: {error}");
+        return -libc::EINVAL;
     }
 
     /*

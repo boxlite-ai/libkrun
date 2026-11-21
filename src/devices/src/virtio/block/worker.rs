@@ -2,7 +2,7 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
-
+use super::disk_snapshot::SnapshotDisk;
 use super::snapshot::WorkerCheckpoint;
 use crate::virtio::control::Command;
 use crate::virtio::persist::invalid;
@@ -10,6 +10,7 @@ use crate::virtio::InterruptTransport;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::result;
+use std::sync::Arc;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -65,6 +66,7 @@ pub struct BlockWorker {
     disk: DiskProperties,
     stop_fd: EventFd,
     checkpoint: WorkerCheckpoint,
+    disk_snapshot: Option<Arc<SnapshotDisk>>,
 }
 
 impl BlockWorker {
@@ -75,6 +77,7 @@ impl BlockWorker {
         disk: DiskProperties,
         stop_fd: EventFd,
         checkpoint: WorkerCheckpoint,
+        disk_snapshot: Option<Arc<SnapshotDisk>>,
     ) -> Self {
         Self {
             device_queue,
@@ -83,6 +86,7 @@ impl BlockWorker {
             disk,
             stop_fd,
             checkpoint,
+            disk_snapshot,
         }
     }
 
@@ -206,14 +210,27 @@ impl BlockWorker {
 
             self.process_queue(&mem);
 
-            if !self.device_queue.queue.enable_notification(&mem).unwrap() {
+            let pending = self.device_queue.queue.enable_notification(&mem).unwrap();
+            if !pending || self.disk_snapshot.as_ref().is_some_and(|disk| disk.fenced()) {
                 break;
             }
         }
     }
 
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
-        while let Some(head) = self.device_queue.queue.pop(mem) {
+        let snapshot = self.disk_snapshot.clone();
+        loop {
+            let _boundary = if let Some(disk) = &snapshot {
+                let Some(guard) = disk.accept_descriptor() else {
+                    break;
+                };
+                Some(guard)
+            } else {
+                None
+            };
+            let Some(head) = self.device_queue.queue.pop(mem) else {
+                break;
+            };
             let mut reader = match Reader::new(mem, head.clone()) {
                 Ok(r) => r,
                 Err(e) => {
