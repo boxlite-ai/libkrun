@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod device;
+pub mod disk_snapshot;
 mod snapshot;
 mod worker;
 pub use snapshot::BlockState;

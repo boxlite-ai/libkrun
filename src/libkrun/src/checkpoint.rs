@@ -281,11 +281,9 @@ pub(crate) mod runtime {
         events: &mut EventManager,
     ) -> i32 {
         #[cfg(feature = "blk")]
-        for config in ctx.get_block_cfg() {
-            if let Err(error) = ctx.vmr.add_block_device(config) {
-                error!("restore disk configuration: {error}");
-                return -libc::EINVAL;
-            }
+        if let Err(error) = ctx.add_block_devices() {
+            error!("restore disk configuration: {error}");
+            return -libc::EINVAL;
         }
         #[cfg(feature = "net")]
         if let Some(config) = ctx.legacy_net_cfg.clone() {
