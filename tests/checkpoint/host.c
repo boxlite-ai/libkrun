@@ -15,6 +15,7 @@ static const char *destination;
 static sigset_t signals;
 static const char *root;
 static int hotplug;
+static int unsupported_pause;
 static void check(int result, const char *operation);
 
 static void grow_memory(void) {
@@ -59,6 +60,8 @@ static void *save(void *unused) {
             int result = krun_resume(context);
             if (!result) result = krun_resume(context); /* Idempotent. */
             fprintf(stderr, "RESUME %d\n", result);
+        } else if (unsupported_pause) {
+            fprintf(stderr, "PAUSE %d\n", krun_pause(context));
         } else {
             if (hotplug && first) grow_memory();
             if (first) {
@@ -87,6 +90,7 @@ static void *save(void *unused) {
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: %s boot|restore rootfs checkpoint console [raw-disk]\n", argv[0]); return 2; }
     root = argv[2]; hotplug = getenv("KRUN_TEST_HOTPLUG") != NULL;
+    unsupported_pause = getenv("KRUN_TEST_UNSUPPORTED_PAUSE") != NULL;
     sigemptyset(&signals); sigaddset(&signals, SIGUSR1); sigaddset(&signals, SIGUSR2);
     if (pthread_sigmask(SIG_BLOCK, &signals, NULL)) abort();
     check(krun_set_log_level(3), "log");
@@ -96,6 +100,7 @@ int main(int argc, char **argv) {
         krun_save_checkpoint(context, "") != -EINVAL ||
         krun_build_from_checkpoint(context, "") != -EINVAL) abort();
     check(krun_set_vm_config(context, 2, 256), "vm config");
+    if (unsupported_pause) check(krun_split_irqchip(context, true), "split irqchip");
     if (hotplug) {
 #ifdef __linux__
         check(krun_set_memory_hotplug(context, 384), "hotplug config");

@@ -5,6 +5,31 @@ use std::process::Command;
 use utils::tempdir::TempDir;
 
 #[test]
+fn publish_does_not_replace_dangling_symlink() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.as_path().join("source");
+    let destination = dir.as_path().join("destination");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("artifact"), b"checkpoint").unwrap();
+
+    super::publish(&source, &destination).unwrap();
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read(destination.join("artifact")).unwrap(),
+        b"checkpoint"
+    );
+
+    let link = dir.as_path().join("link");
+    let missing = dir.as_path().join("missing");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+    let err = super::publish(&destination, &link).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read_link(&link).unwrap(), missing);
+    assert!(!missing.exists());
+    assert!(destination.is_dir());
+}
+
+#[test]
 fn artifact_open_rejects_nonregular_files_without_blocking() {
     const FIFO_PATH: &str = "KRUN_CHECKPOINT_TEST_FIFO";
     if let Some(path) = std::env::var_os(FIFO_PATH) {

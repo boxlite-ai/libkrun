@@ -3,6 +3,8 @@
 
 Build libkrun with blk,net first. Set LD_LIBRARY_PATH to a libkrunfw.so.5
 directory. Artifacts and logs remain under target/run-* for inspection.
+Set KRUN_TEST_TSI=1 KRUN_TEST_UNSUPPORTED_PAUSE=1 to test pause rejection
+with KVM split irqchip support on Linux x86_64 instead of save/restore.
 """
 import platform
 import errno
@@ -18,6 +20,13 @@ import subprocess
 import tempfile
 import threading
 import time
+
+unsupported_pause = "KRUN_TEST_UNSUPPORTED_PAUSE" in os.environ
+if unsupported_pause:
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        sys.exit("KRUN_TEST_UNSUPPORTED_PAUSE requires Linux x86_64 KVM with split irqchip support")
+    if not os.environ.get("KRUN_TEST_TSI"):
+        sys.exit("KRUN_TEST_UNSUPPORTED_PAUSE requires KRUN_TEST_TSI=1")
 
 repo = Path(__file__).resolve().parents[2]
 work = Path(tempfile.mkdtemp(prefix="run-", dir=(repo / "target")))
@@ -113,7 +122,7 @@ class TsiBackend:
         self.listener.listen()
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.bind(("127.0.0.1", self.port))
-        self.connections = []
+        self.echoed_bytes = {}
         threading.Thread(target=self.accept, daemon=True).start()
         threading.Thread(target=self.datagrams, daemon=True).start()
 
@@ -121,7 +130,7 @@ class TsiBackend:
         try:
             while True:
                 connection, _ = self.listener.accept()
-                self.connections.append(connection)
+                self.echoed_bytes[connection] = 0
                 threading.Thread(target=self.echo, args=(connection,), daemon=True).start()
         except OSError:
             pass
@@ -131,8 +140,13 @@ class TsiBackend:
             with connection:
                 while data := connection.recv(4096):
                     connection.sendall(data)
+                    self.echoed_bytes[connection] += len(data)
         except OSError:
             pass
+
+    def active_echo_connection(self):
+        return next((connection for connection, count in self.echoed_bytes.copy().items()
+                     if count > 3 and connection.fileno() != -1), None)
 
     def datagrams(self):
         try:
@@ -145,7 +159,7 @@ class TsiBackend:
     def close(self):
         self.listener.close()
         self.udp.close()
-        for connection in self.connections:
+        for connection in tuple(self.echoed_bytes):
             connection.close()
 
 if os.environ.get("KRUN_TEST_TSI"):
@@ -192,8 +206,8 @@ def start(mode, checkpoint, next_checkpoint=None, missing_disk=False):
 def wait(predicate, process, logs, timeout=45):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        if predicate():
-            return
+        if value := predicate():
+            return value
         if process.poll() is not None:
             break
         time.sleep(.05)
@@ -271,6 +285,23 @@ try:
     assert original[1] > 0 and original[2] > 0 and original[5] == 1, original
     if os.environ.get("KRUN_TEST_TSI"):
         wait(lambda: ticks()[-1][8] > 3 and ticks()[-1][11] > 3 and (os.environ.get("KRUN_TEST_BLOCK_ROOT") or (root / "accept-ready").exists()), source, [log, console])
+    if unsupported_pause:
+        connection = wait(tsi.active_echo_connection, source, [log, console])
+        source.send_signal(signal.SIGUSR1)
+        status = wait(lambda: next((line for line in text(log).splitlines() if line.startswith("PAUSE ")), None),
+                      source, [log, console])
+        assert status == f"PAUSE {-errno.ENOTSUP}", text(log)
+        # The guest issues one byte at a time, waiting for its echo before
+        # sending another. Only count new bytes on this same accepted socket.
+        echoed_at_rejection = tsi.echoed_bytes[connection]
+        wait(lambda: connection.fileno() == -1 or tsi.echoed_bytes[connection] > echoed_at_rejection + 3,
+             source, [log, console])
+        assert connection.fileno() != -1, "pause rejection closed the established TSI TCP connection"
+        result = {"status": "passed", "unsupported_pause": -errno.ENOTSUP,
+                  "same_tsi_tcp_connection_echoed": True, "work": str(work)}
+        (work / "result.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2))
+        raise SystemExit(0)
     if os.environ.get("KRUN_TEST_FREEZE_FAILURE"):
         # Rename this fixture's share so filesystem capture fails after vCPUs
         # and preceding devices have stopped. The API must return, not deadlock
@@ -294,6 +325,15 @@ try:
         resume(source, log, console)
         progress = len(ticks())
         wait(lambda: len(ticks()) > progress + 3, source, [log, console])
+    if platform.system() == "Linux":
+        # The existence check follows symlinks, so a dangling link reaches
+        # renameat2(RENAME_NOREPLACE) with an occupied destination.
+        missing_target = work / "missing-checkpoint"
+        first.symlink_to(missing_target)
+        save_paused(source, first, log, console, -errno.EEXIST)
+        assert first.is_symlink() and os.readlink(first) == str(missing_target)
+        assert not missing_target.exists()
+        first.unlink()
     save_paused(source, first, log, console)
     if os.environ.get("KRUN_TEST_EXTRA_FS"):
         saved = checkpoint_state(first)
