@@ -53,9 +53,9 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
-use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
+use vmm::vmm_config::kernel_bundle::{KernelBundle, KernelBundleSource};
 use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLINE};
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
@@ -2087,6 +2087,7 @@ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
     }
 
     let kernel_bundle = KernelBundle {
+        source: KernelBundleSource::ExternalRaw,
         host_addr: kernel_host_addr as u64,
         guest_addr: 0x8000_0000,
         entry_addr: 0x8000_0000,
@@ -2133,8 +2134,7 @@ pub unsafe extern "C" fn krun_set_kernel(
     };
 
     let format = match kernel_format {
-        // For raw kernels in x86_64, we map the kernel into the
-        // process and treat it as a bundled kernel.
+        // On x86_64, raw kernels use a dedicated guest mapping.
         #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
         0 => return map_kernel(ctx_id, &path),
         #[cfg(target_arch = "aarch64")]
@@ -2237,6 +2237,7 @@ unsafe fn load_krunfw_payload(
         )
     };
     let kernel_bundle = KernelBundle {
+        source: KernelBundleSource::Libkrunfw,
         host_addr: kernel_host_addr as u64,
         guest_addr: kernel_guest_addr,
         entry_addr: kernel_entry_addr,

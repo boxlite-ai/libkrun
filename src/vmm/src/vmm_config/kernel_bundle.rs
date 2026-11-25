@@ -3,9 +3,20 @@
 
 use std::fmt::{Display, Formatter, Result};
 
-/// Data structure holding the attributes read from the `libkrunfw` kernel config.
+/// Source of the kernel image held by a `KernelBundle`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum KernelBundleSource {
+    /// A live, immutable kernel image returned by libkrunfw.
+    Libkrunfw,
+    /// An externally supplied raw kernel image.
+    #[default]
+    ExternalRaw,
+}
+
+/// Data structure holding the attributes of a mapped kernel image.
 #[derive(Debug, Default)]
 pub struct KernelBundle {
+    pub source: KernelBundleSource,
     pub host_addr: u64,
     pub guest_addr: u64,
     pub entry_addr: u64,

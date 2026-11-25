@@ -239,6 +239,41 @@ sudo make [FEATURE_OPTIONS] install
 
 Despite being written in Rust, this library provides a simple C API defined in [include/libkrun.h](include/libkrun.h)
 
+### Transparent huge pages (Linux x86_64, non-TEE)
+
+By default, libkrun leaves `MADV_HUGEPAGE` disabled for anonymous boot RAM; set
+`KRUN_USE_THP=1` to enable `MADV_HUGEPAGE` for eligible anonymous boot RAM. On
+cold boot, the kernel bundled with libkrunfw is copied to its usual guest
+address in the same contiguous low RAM mapping, rather than into a separate
+mapping. This lets kernel bytes and adjacent RAM share huge pages without
+changing guest physical addresses or filling the MMIO gap. Externally supplied
+raw kernels still use a separate mapping.
+
+In the process launching the VM, set `KRUN_USE_THP=1` to explicitly enable the
+hint. Leaving it unset or setting any other value (including `0` or an empty
+value) keeps the hint disabled. This setting does not change the memory layout. A
+mapping is advised only if its host virtual and guest physical addresses have
+the same 2 MiB offset and it contains at least one full, jointly aligned 2 MiB
+page. The hint does not force huge pages or fault memory in advance.
+It does not apply to the EFI blob, device shared memory, hotplug RAM, or
+checkpoint imports. Huge-page allocation and performance gains depend on host
+THP policy and sufficient contiguous 2 MiB physical memory.
+
+On memory-constrained or heavily fragmented hosts (particularly during
+concurrent launches under the common host default
+`transparent_hugepage/defrag=madvise`), enabling `KRUN_USE_THP=1` can trigger
+synchronous direct compaction stalls and 4 KiB fallbacks, increasing memory use
+as well as startup and tail latency (which is why the hint is disabled by
+default). On such hosts, keep `KRUN_USE_THP` disabled, or set host `defrag` to
+`defer` or `never` to avoid synchronous compaction stalls.
+
+To compare, run with the variable unset (or set to `0`) and with `KRUN_USE_THP=1`,
+keeping the guest image, VM settings, host, and firmware fixed. Check
+`AnonHugePages` in `/proc/<pid>/smaps` for the VMM's RAM mappings, and compare KVM
+nested page faults (NPF) and time to interactive (TTI) for serial and 20-concurrent
+launches. A rejected hint does not prevent the VM from starting; an accepted
+hint does not guarantee huge pages or a performance improvement.
+
 ## Examples
 
 ### chroot_vm

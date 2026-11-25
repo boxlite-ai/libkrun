@@ -27,6 +27,8 @@ use crate::resources::{
     DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
 };
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
+#[cfg(any(test, all(target_arch = "x86_64", not(feature = "tee"))))]
+use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleSource};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
 #[cfg(target_arch = "x86_64")]
@@ -114,6 +116,8 @@ pub enum StartMicrovmError {
     CreateRateLimiter(io::Error),
     /// Cannot open the file containing the kernel code.
     ElfOpenKernel(io::Error),
+    /// The bundled kernel image is empty.
+    EmptyKernelBundle,
     /// Cannot load the kernel into the VM.
     ElfLoadKernel(linux_loader::loader::Error),
     /// The firmware can't be loaded into the provided memory address.
@@ -154,6 +158,8 @@ pub enum StartMicrovmError {
     Internal(Error),
     /// Cannot inject the kernel into the guest memory due to a problem with the bundle.
     InvalidKernelBundle(vm_memory::mmap::MmapRegionError),
+    /// Cannot copy the bundled kernel to guest RAM.
+    KernelBundleWrite(vm_memory::GuestMemoryError),
     /// The kernel command line is invalid.
     KernelCmdline(String),
     /// The kernel doesn't fit into the microVM memory.
@@ -312,6 +318,7 @@ impl Display for StartMicrovmError {
             ImageZstdOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code. {err}")
             }
+            EmptyKernelBundle => write!(f, "The bundled kernel image is empty."),
             InitrdLoad => write!(
                 f,
                 "Cannot load initrd due to an invalid memory configuration."
@@ -326,6 +333,9 @@ impl Display for StartMicrovmError {
                     "Cannot inject the kernel into the guest memory due to a problem with the \
                      bundle. {err_msg}"
                 )
+            }
+            KernelBundleWrite(ref err) => {
+                write!(f, "Cannot copy the bundled kernel to guest RAM: {err}")
             }
             KernelCmdline(ref err) => write!(f, "Invalid kernel command line: {err}"),
             KernelDoesNotFit(load_addr, size) => write!(
@@ -1310,6 +1320,99 @@ fn load_external_kernel(
     Ok((entry_addr, initrd_config, external_kernel.cmdline.clone()))
 }
 
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+))]
+const THP_SIZE: usize = 2 * 1024 * 1024;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+fn thp_enabled() -> bool {
+    thp_enabled_from_env(std::env::var_os("KRUN_USE_THP").as_deref())
+}
+
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+))]
+fn thp_enabled_from_env(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+))]
+fn thp_eligible(hva: usize, gpa: u64, len: usize) -> bool {
+    let offset = hva % THP_SIZE;
+    let head = (THP_SIZE - offset) % THP_SIZE;
+    offset as u64 == gpa % THP_SIZE as u64 && len.saturating_sub(head) >= THP_SIZE
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+fn advise_thp(region: &MmapRegion, gpa: GuestAddress) {
+    let hva = region.as_ptr();
+    let len = region.size();
+    let gpa = gpa.0;
+    if !thp_eligible(hva as usize, gpa, len) {
+        debug!(
+            "THP advice skipped for GPA {gpa:#x} (size {len:#x}): no jointly aligned 2 MiB page"
+        );
+        return;
+    }
+
+    // SAFETY: The caller supplies a live anonymous mmap. Its base is page-aligned
+    // and the kernel rounds the length up to the same host page boundary as mmap.
+    if unsafe { libc::madvise(hva.cast(), len, libc::MADV_HUGEPAGE) } == 0 {
+        debug!("THP advice accepted for GPA {gpa:#x} (size {len:#x})");
+    } else {
+        debug!(
+            "THP advice failed for GPA {gpa:#x} (size {len:#x}): {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+fn kernel_uses_contiguous_boot_ram(kernel: &KernelBundle) -> bool {
+    cfg!(target_os = "linux") && kernel.source == KernelBundleSource::Libkrunfw
+}
+
+/// Copies the bundled kernel into the VM's private boot RAM.
+///
+/// # Safety
+/// If the image is nonempty and its guest range fits below the MMIO gap, the
+/// bundle's host address must point to `size` initialized bytes that remain
+/// readable and immutable for this call and do not alias the destination.
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
+))]
+unsafe fn copy_bundled_kernel(
+    guest_mem: &GuestMemoryMmap,
+    kernel: &KernelBundle,
+    ram_below_gap: u64,
+) -> Result<GuestAddress, StartMicrovmError> {
+    if kernel.size == 0 {
+        return Err(StartMicrovmError::EmptyKernelBundle);
+    }
+    let end = kernel.guest_addr.checked_add(kernel.size as u64);
+    if !matches!(end, Some(end) if end <= ram_below_gap) {
+        return Err(StartMicrovmError::KernelDoesNotFit(
+            kernel.guest_addr,
+            kernel.size,
+        ));
+    }
+
+    // SAFETY: The source buffer is guaranteed by the caller.
+    let kernel_data =
+        unsafe { std::slice::from_raw_parts(kernel.host_addr as *const u8, kernel.size) };
+    guest_mem
+        .write_slice(kernel_data, GuestAddress(kernel.guest_addr))
+        .map_err(StartMicrovmError::KernelBundleWrite)?;
+    Ok(GuestAddress(kernel.entry_addr))
+}
+
 fn load_payload(
     _vm_resources: &VmResources,
     guest_mem: GuestMemoryMmap,
@@ -1354,41 +1457,47 @@ fn load_payload(
         }
         #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
         Payload::KernelMmap => {
-            let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
-                if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
-                    (
-                        kernel_bundle.entry_addr,
-                        kernel_bundle.host_addr,
-                        kernel_bundle.guest_addr,
-                        kernel_bundle.size,
-                    )
-                } else {
-                    return Err(StartMicrovmError::MissingKernelConfig);
+            let kernel = _vm_resources
+                .kernel_bundle()
+                .ok_or(StartMicrovmError::MissingKernelConfig)?;
+
+            #[cfg(target_os = "linux")]
+            if kernel_uses_contiguous_boot_ram(kernel) {
+                // SAFETY: The source classification selects only live, immutable
+                // libkrunfw images, separate from the newly allocated guest RAM.
+                let entry_addr = unsafe {
+                    copy_bundled_kernel(&guest_mem, kernel, _arch_mem_info.ram_below_gap)?
                 };
+                return Ok((guest_mem, entry_addr, None, None));
+            }
 
             let kernel_region =
-                MmapRegion::new(kernel_size).map_err(StartMicrovmError::InvalidKernelBundle)?;
+                MmapRegion::new(kernel.size).map_err(StartMicrovmError::InvalidKernelBundle)?;
+            let guest_addr = GuestAddress(kernel.guest_addr);
+            #[cfg(target_os = "linux")]
+            if thp_enabled() {
+                advise_thp(&kernel_region, guest_addr);
+            }
             // Every VM owns its kernel RAM so it can be checkpointed.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    kernel_host_addr as *const u8,
+                    kernel.host_addr as *const u8,
                     kernel_region.as_ptr(),
-                    kernel_size,
+                    kernel.size,
                 );
             }
 
             Ok((
                 guest_mem
                     .insert_region(Arc::new(
-                        GuestRegionMmap::new(kernel_region, GuestAddress(kernel_guest_addr))
-                            .ok_or_else(|| {
-                                StartMicrovmError::GuestMemoryMmap(
-                                    "Failed to create GuestRegionMmap".to_string(),
-                                )
-                            })?,
+                        GuestRegionMmap::new(kernel_region, guest_addr).ok_or_else(|| {
+                            StartMicrovmError::GuestMemoryMmap(
+                                "Failed to create GuestRegionMmap".to_string(),
+                            )
+                        })?,
                     ))
                     .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?,
-                GuestAddress(kernel_entry_addr),
+                GuestAddress(kernel.entry_addr),
                 None,
                 None,
             ))
@@ -1527,13 +1636,15 @@ pub fn create_guest_memory(
     let (arch_mem_info, mut arch_mem_regions) = match payload {
         #[cfg(not(feature = "tee"))]
         Payload::KernelMmap => {
-            let (kernel_guest_addr, kernel_size) =
-                if let Some(kernel_bundle) = &vm_resources.kernel_bundle {
-                    (kernel_bundle.guest_addr, kernel_bundle.size)
-                } else {
-                    return Err(StartMicrovmError::MissingKernelConfig);
-                };
-            arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
+            let kernel = vm_resources
+                .kernel_bundle()
+                .ok_or(StartMicrovmError::MissingKernelConfig)?;
+            if kernel_uses_contiguous_boot_ram(kernel) {
+                // Keep low RAM contiguous so the bundled kernel can share its huge pages.
+                arch::arch_memory_regions(mem_size, None, 0, 0, None)
+            } else {
+                arch::arch_memory_regions(mem_size, Some(kernel.guest_addr), kernel.size, 0, None)
+            }
         }
         Payload::ExternalKernel(external_kernel) => arch::arch_memory_regions(
             mem_size,
@@ -1581,10 +1692,26 @@ pub fn create_guest_memory(
             .map_err(StartMicrovmError::ShmCreate)?;
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    let arch_region_count = arch_mem_regions.len();
     arch_mem_regions.extend(shm_manager.regions());
 
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    if thp_enabled() {
+        use vm_memory::GuestMemoryRegion;
+
+        // Only boot RAM, not the appended device SHM or the EFI blob in the arch map.
+        for region in vm_memory::GuestMemory::iter(&guest_mem).take(arch_region_count) {
+            let gpa = region.start_addr();
+            if arch_mem_info.firmware_addr != 0 && gpa.0 == arch_mem_info.firmware_addr {
+                continue;
+            }
+            advise_thp(region, gpa);
+        }
+    }
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
@@ -2422,7 +2549,167 @@ fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), St
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[test]
+    fn thp_defaults_off_and_only_enables_on_explicit_one() {
+        use std::ffi::OsStr;
+
+        assert!(!thp_enabled_from_env(None));
+        assert!(thp_enabled_from_env(Some(OsStr::new("1"))));
+        for value in ["0", "", "true", "2"] {
+            assert!(!thp_enabled_from_env(Some(OsStr::new(value))));
+        }
+    }
+
+    #[test]
+    fn thp_requires_a_jointly_aligned_full_page() {
+        let page = THP_SIZE;
+        let offset = 4096;
+        assert!(thp_eligible(2 * page, 0, page));
+        assert!(!thp_eligible(2 * page, 0, page - 1));
+        assert!(!thp_eligible(2 * page, offset as u64, 3 * page));
+
+        let hva = 2 * page + offset;
+        let gpa = (page + offset) as u64;
+        assert!(thp_eligible(hva, gpa, 2 * page - offset));
+        assert!(!thp_eligible(hva, gpa, 2 * page - offset - 1));
+        assert!(!thp_eligible(hva, gpa, 0));
+    }
+
+    #[test]
+    fn bundled_kernel_copy_preserves_entry_and_adjacent_bytes() {
+        let data = [0xaa_u8, 0xbb, 0xcc];
+        let kernel = KernelBundle {
+            source: KernelBundleSource::Libkrunfw,
+            host_addr: data.as_ptr() as u64,
+            guest_addr: 0x1000,
+            entry_addr: 0x1001,
+            size: data.len(),
+        };
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
+        let first = GuestAddress(kernel.guest_addr - 1);
+        guest_mem.write_slice(&[0xff; 5], first).unwrap();
+
+        // The exclusive end exactly fits the low RAM bound; the next byte is a sentinel.
+        let ram_below_gap = kernel.guest_addr + kernel.size as u64;
+        // SAFETY: `data` remains live and separate from `guest_mem`.
+        let entry = unsafe { copy_bundled_kernel(&guest_mem, &kernel, ram_below_gap) }.unwrap();
+        assert_eq!(entry, GuestAddress(kernel.entry_addr));
+        let mut copied = [0; 5];
+        guest_mem.read_slice(&mut copied, first).unwrap();
+        assert_eq!(copied, [0xff, 0xaa, 0xbb, 0xcc, 0xff]);
+    }
+
+    #[test]
+    fn bundled_kernel_copy_rejects_gap_crossing_and_overflow() {
+        let data = [0xaa_u8, 0xbb, 0xcc];
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
+        for (guest_addr, ram_below_gap) in [(0x0fff, 0x1000), (u64::MAX - 1, u64::MAX)] {
+            let kernel = KernelBundle {
+                source: KernelBundleSource::Libkrunfw,
+                host_addr: data.as_ptr() as u64,
+                guest_addr,
+                entry_addr: guest_addr,
+                size: data.len(),
+            };
+            // SAFETY: `data` remains live and separate from `guest_mem`.
+            let result = unsafe { copy_bundled_kernel(&guest_mem, &kernel, ram_below_gap) };
+            assert!(
+                matches!(result, Err(StartMicrovmError::KernelDoesNotFit(addr, 3)) if addr == guest_addr)
+            );
+        }
+        let mut untouched = [0xff; 3];
+        guest_mem
+            .read_slice(&mut untouched, GuestAddress(0x0fff))
+            .unwrap();
+        assert_eq!(untouched, [0; 3]);
+    }
+
+    #[test]
+    fn bundled_kernel_copy_rejects_empty_image() {
+        let kernel = KernelBundle {
+            source: KernelBundleSource::Libkrunfw,
+            host_addr: 0,
+            guest_addr: 0x1000,
+            entry_addr: 0x1000,
+            size: 0,
+        };
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
+        // SAFETY: An empty image is rejected before the source address is used.
+        let result = unsafe { copy_bundled_kernel(&guest_mem, &kernel, 0x2000) };
+        assert!(matches!(result, Err(StartMicrovmError::EmptyKernelBundle)));
+    }
+
+    #[test]
+    fn bundled_kernel_copy_reports_short_write() {
+        let data = [0xaa_u8, 0xbb, 0xcc];
+        let kernel = KernelBundle {
+            source: KernelBundleSource::Libkrunfw,
+            host_addr: data.as_ptr() as u64,
+            guest_addr: 0x0fff,
+            entry_addr: 0x0fff,
+            size: data.len(),
+        };
+        // Simulate a mismatch between the low RAM bound and its backing.
+        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        // SAFETY: `data` remains live and separate from `guest_mem`.
+        let result = unsafe { copy_bundled_kernel(&guest_mem, &kernel, 0x2000) };
+        assert!(matches!(
+            result,
+            Err(StartMicrovmError::KernelBundleWrite(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    fn kernel_source_controls_boot_ram_layout_without_mapping_mmio() {
+        use arch::x86_64::layout::{FIRST_ADDR_PAST_32BITS, MMIO_MEM_START};
+        use vm_memory::GuestMemoryRegion;
+
+        const LOAD: u64 = 0x0010_0000;
+        const ENTRY: u64 = LOAD + 0x10;
+        const SIZE: usize = 4096;
+        let kernel_end = LOAD + SIZE as u64;
+        for (low_ram, high_ram) in [(8 << 20, 0), (MMIO_MEM_START, 8 << 20)] {
+            for (source, mut expected) in [
+                (KernelBundleSource::Libkrunfw, vec![(0, low_ram)]),
+                (
+                    KernelBundleSource::ExternalRaw,
+                    vec![
+                        (0, LOAD),
+                        (LOAD, SIZE as u64),
+                        (kernel_end, low_ram - kernel_end),
+                    ],
+                ),
+            ] {
+                if high_ram != 0 {
+                    expected.push((FIRST_ADDR_PAST_32BITS, high_ram));
+                }
+                // Both sources use the same addresses and image bytes. Only the source
+                // classification should determine whether the low RAM layout is split.
+                let mut data = [0xa5_u8; SIZE];
+                let mut vm_resources = VmResources::default();
+                vm_resources.kernel_bundle = Some(KernelBundle {
+                    source,
+                    host_addr: data.as_mut_ptr() as u64,
+                    guest_addr: LOAD,
+                    entry_addr: ENTRY,
+                    size: SIZE,
+                });
+                let mem_size = ((low_ram + high_ram) >> 20) as usize;
+                let payload = choose_payload(&vm_resources).unwrap();
+                let (memory, _, _, config) =
+                    create_guest_memory(mem_size, &vm_resources, &payload).unwrap();
+                let regions: Vec<_> = memory.iter().map(|r| (r.start_addr().0, r.len())).collect();
+                assert_eq!(regions, expected);
+                assert_eq!(config.entry_addr, GuestAddress(ENTRY));
+                data.fill(0xff);
+                let mut copied = [0; SIZE];
+                memory.read_slice(&mut copied, GuestAddress(LOAD)).unwrap();
+                assert_eq!(copied, [0xa5; SIZE]);
+            }
+        }
+    }
 
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
@@ -2454,6 +2741,7 @@ pub mod tests {
     > {
         let mut vm_resources = VmResources::default();
         vm_resources.kernel_bundle = Some(KernelBundle {
+            source: KernelBundleSource::default(),
             host_addr: 0x1000,
             guest_addr: 0x1000,
             entry_addr: 0x1000,
