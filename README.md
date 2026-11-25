@@ -241,16 +241,17 @@ Despite being written in Rust, this library provides a simple C API defined in [
 
 ### Transparent huge pages (Linux x86_64, non-TEE)
 
-By default, libkrun uses `MADV_HUGEPAGE` for eligible anonymous boot RAM. On
+By default, libkrun leaves `MADV_HUGEPAGE` disabled for anonymous boot RAM; set
+`KRUN_USE_THP=1` to enable `MADV_HUGEPAGE` for eligible anonymous boot RAM. On
 cold boot, the kernel bundled with libkrunfw is copied to its usual guest
 address in the same contiguous low RAM mapping, rather than into a separate
 mapping. This lets kernel bytes and adjacent RAM share huge pages without
 changing guest physical addresses or filling the MMIO gap. Externally supplied
 raw kernels still use a separate mapping.
 
-In the process launching the VM, set `KRUN_USE_THP=0` to disable the hint or
-`KRUN_USE_THP=1` to explicitly enable it. Any other value, including an empty
-value, disables the hint. This setting does not change the memory layout. A
+In the process launching the VM, set `KRUN_USE_THP=1` to explicitly enable the
+hint. Leaving it unset or setting any other value (including `0` or an empty
+value) keeps the hint disabled. This setting does not change the memory layout. A
 mapping is advised only if its host virtual and guest physical addresses have
 the same 2 MiB offset and it contains at least one full, jointly aligned 2 MiB
 page. The hint does not force huge pages or fault memory in advance.
@@ -258,7 +259,7 @@ It does not apply to the EFI blob, device shared memory, hotplug RAM, or
 checkpoint imports. Huge-page allocation depends on host THP policy and memory
 availability; it can increase memory use or compaction overhead.
 
-To compare, run with `KRUN_USE_THP=0` and with the variable unset (or set to `1`),
+To compare, run with the variable unset (or set to `0`) and with `KRUN_USE_THP=1`,
 keeping the guest image, VM settings, host, and firmware fixed. Check
 `AnonHugePages` in `/proc/<pid>/smaps` for the VMM's RAM mappings, and compare KVM
 nested page faults (NPF) and time to interactive (TTI) for serial and 20-concurrent

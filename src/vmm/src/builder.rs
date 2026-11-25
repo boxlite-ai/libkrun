@@ -1336,7 +1336,7 @@ fn thp_enabled() -> bool {
     all(target_os = "linux", target_arch = "x86_64", not(feature = "tee"))
 ))]
 fn thp_enabled_from_env(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_none() || value == Some(std::ffi::OsStr::new("1"))
+    value == Some(std::ffi::OsStr::new("1"))
 }
 
 #[cfg(any(
@@ -2551,10 +2551,10 @@ pub mod tests {
     use super::*;
 
     #[test]
-    fn thp_defaults_on_and_only_accepts_explicit_one() {
+    fn thp_defaults_off_and_only_enables_on_explicit_one() {
         use std::ffi::OsStr;
 
-        assert!(thp_enabled_from_env(None));
+        assert!(!thp_enabled_from_env(None));
         assert!(thp_enabled_from_env(Some(OsStr::new("1"))));
         for value in ["0", "", "true", "2"] {
             assert!(!thp_enabled_from_env(Some(OsStr::new(value))));
