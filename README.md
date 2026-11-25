@@ -256,8 +256,16 @@ mapping is advised only if its host virtual and guest physical addresses have
 the same 2 MiB offset and it contains at least one full, jointly aligned 2 MiB
 page. The hint does not force huge pages or fault memory in advance.
 It does not apply to the EFI blob, device shared memory, hotplug RAM, or
-checkpoint imports. Huge-page allocation depends on host THP policy and memory
-availability; it can increase memory use or compaction overhead.
+checkpoint imports. Huge-page allocation and performance gains depend on host
+THP policy and sufficient contiguous 2 MiB physical memory.
+
+On memory-constrained or heavily fragmented hosts (particularly during
+concurrent launches under the common host default
+`transparent_hugepage/defrag=madvise`), enabling `KRUN_USE_THP=1` can trigger
+synchronous direct compaction stalls and 4 KiB fallbacks, increasing memory use
+as well as startup and tail latency (which is why the hint is disabled by
+default). On such hosts, keep `KRUN_USE_THP` disabled, or set host `defrag` to
+`defer` or `never` to avoid synchronous compaction stalls.
 
 To compare, run with the variable unset (or set to `0`) and with `KRUN_USE_THP=1`,
 keeping the guest image, VM settings, host, and firmware fixed. Check
