@@ -114,8 +114,13 @@ pub(crate) mod runtime {
     use utils::epoll::{EpollEvent, EventSet};
     use utils::eventfd::{EventFd, EFD_NONBLOCK};
 
-    static RUNNING: Lazy<Mutex<HashMap<u32, Arc<Control>>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
+    static RUNNING: Lazy<Mutex<HashMap<u32, Running>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    #[derive(Clone)]
+    struct Running {
+        control: Arc<Control>,
+        checkpoint_supported: bool,
+    }
 
     pub(super) enum Operation {
         Pause,
@@ -180,17 +185,34 @@ pub(crate) mod runtime {
 
     impl Pending {
         pub(crate) fn attach(self, id: u32, vmm: Arc<Mutex<vmm::Vmm>>) {
+            let checkpoint_supported = vmm.lock().unwrap().checkpoint_supported();
             self.handler.lock().unwrap().vmm = Some(vmm);
-            RUNNING.lock().unwrap().insert(id, self.control);
+            RUNNING.lock().unwrap().insert(
+                id,
+                Running {
+                    control: self.control,
+                    checkpoint_supported,
+                },
+            );
         }
     }
 
     pub(super) fn request(id: u32, operation: Operation) -> i32 {
-        let Some(control) = RUNNING.lock().unwrap().get(&id).cloned() else {
+        let Some(Running {
+            control,
+            checkpoint_supported,
+        }) = RUNNING.lock().unwrap().get(&id).cloned()
+        else {
             return -libc::EAGAIN;
         };
         if control.busy.swap(true, Ordering::AcqRel) {
             return -libc::EBUSY;
+        }
+        // Reject known-unsupported pauses before quiescing vsock: quiescing
+        // disconnects live streams even if the VM never pauses.
+        if matches!(operation, Operation::Pause) && !checkpoint_supported {
+            control.busy.store(false, Ordering::Release);
+            return -libc::ENOTSUP;
         }
         // A running event loop can be blocked in external I/O. Reject saves
         // without dispatching, and make an already-running resume a no-op.
@@ -347,6 +369,152 @@ pub(crate) mod runtime {
                 RUNNING.lock().unwrap().remove(&id);
                 return -libc::EIO;
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use devices::legacy::{IrqChip, IrqChipDevice};
+        use devices::virtio::vsock::{TsiFlags, Vsock};
+        use devices::virtio::{DeviceQueue, InterruptTransport, Queue, VirtioDevice};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use utils::tempdir::TempDir;
+
+        fn interrupt() -> InterruptTransport {
+            #[cfg(target_os = "macos")]
+            let chip = devices::legacy::GicV3::new(Arc::new(devices::legacy::VcpuList::new(1)));
+            #[cfg(target_os = "linux")]
+            let chip = {
+                struct TestChip;
+                impl devices::BusDevice for TestChip {}
+                impl devices::legacy::IrqChipT for TestChip {
+                    fn get_mmio_addr(&self) -> u64 {
+                        0
+                    }
+                    fn get_mmio_size(&self) -> u64 {
+                        0
+                    }
+                    fn set_irq(
+                        &self,
+                        _: Option<u32>,
+                        _: Option<&EventFd>,
+                    ) -> Result<(), devices::Error> {
+                        Ok(())
+                    }
+                }
+                TestChip
+            };
+            let chip: IrqChip = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(chip))));
+            InterruptTransport::new(chip, "vsock-test".into()).unwrap()
+        }
+
+        #[test]
+        fn unsupported_pause_skips_quiesce_and_releases_busy() {
+            const ID: u32 = u32::MAX;
+            const CID: u64 = 3;
+            const PORT: u32 = 1024;
+            let dir = TempDir::new().unwrap();
+            let path = dir.as_path().join("peer");
+            let listener = UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut vsock = Vsock::new(
+                CID,
+                None,
+                Some(HashMap::from([(PORT, (path, false))])),
+                TsiFlags::empty(),
+            )
+            .unwrap();
+
+            // Registration is private to devices. Submit one guest connection
+            // request so the Unix proxy registers a real stream with the gate.
+            const AVAIL: usize = 0x100;
+            const USED: usize = 0x200;
+            const PACKET: usize = 0x300;
+            const RAM_LEN: usize = 0x4000;
+            const HDR_LEN: u32 = 44;
+            let mut image = b"KRUNRAM\0\x01\0\0\0\x01\0\0\0".to_vec();
+            image.extend_from_slice(&0u64.to_le_bytes()); // Guest address.
+            image.extend_from_slice(&(RAM_LEN as u64).to_le_bytes());
+            image.extend_from_slice(&0u64.to_le_bytes()); // Region attributes.
+            let header_len = image.len();
+            image.resize(header_len + RAM_LEN, 0);
+            let ram = &mut image[header_len..];
+            ram[..8].copy_from_slice(&(PACKET as u64).to_le_bytes());
+            ram[8..12].copy_from_slice(&HDR_LEN.to_le_bytes());
+            ram[AVAIL + 2..AVAIL + 4].copy_from_slice(&1u16.to_le_bytes()); // One descriptor.
+            let hdr = &mut ram[PACKET..PACKET + HDR_LEN as usize];
+            hdr[..8].copy_from_slice(&CID.to_le_bytes());
+            hdr[8..16].copy_from_slice(&2u64.to_le_bytes()); // Host CID.
+            hdr[16..20].copy_from_slice(&PORT.to_le_bytes());
+            hdr[20..24].copy_from_slice(&PORT.to_le_bytes());
+            hdr[28..30].copy_from_slice(&1u16.to_le_bytes()); // STREAM.
+            hdr[30..32].copy_from_slice(&1u16.to_le_bytes()); // REQUEST.
+            let mem = vmm::ram_snapshot::restore(&image).unwrap();
+            let mut tx = Queue::new(1);
+            tx.ready = true;
+            tx.size = 1;
+            tx.avail_ring.0 = AVAIL as u64;
+            tx.used_ring.0 = USED as u64;
+            let queues = [Queue::new(1), tx, Queue::new(1)]
+                .into_iter()
+                .map(|queue| DeviceQueue::new(queue, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())))
+                .collect();
+            vsock.activate(mem, interrupt(), queues).unwrap();
+            assert!(vsock.process_stream_tx());
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_nonblocking(true).unwrap();
+
+            let (sender, requests) = bounded(1);
+            RUNNING.lock().unwrap().insert(
+                ID,
+                Running {
+                    control: Arc::new(Control {
+                        requests: sender,
+                        event: Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+                        busy: AtomicBool::new(false),
+                        paused: AtomicBool::new(false),
+                        gates: vec![vsock.snapshot_control()],
+                    }),
+                    checkpoint_supported: false,
+                },
+            );
+            struct Registration;
+            impl Drop for Registration {
+                fn drop(&mut self) {
+                    unregister(ID);
+                }
+            }
+            let _registration = Registration;
+
+            // Watch the request channel so a regression that dispatches to
+            // the (absent) VM event loop fails instead of hanging the test.
+            std::thread::scope(|scope| {
+                let (done, finished) = bounded::<()>(0);
+                scope.spawn(move || {
+                    let _done = done;
+                    assert_eq!(request(ID, Operation::Pause), -libc::ENOTSUP);
+                    assert_eq!(request(ID, Operation::Pause), -libc::ENOTSUP);
+                    assert_eq!(request(ID, Operation::Save("unused".into())), -libc::EBUSY);
+                    assert_eq!(request(ID, Operation::Resume), 0);
+                });
+                crossbeam_channel::select! {
+                    recv(finished) -> _ => assert!(requests.try_recv().is_err()),
+                    recv(requests) -> unexpected => {
+                        drop(unexpected);
+                        drop(requests);
+                        panic!("checkpoint operation reached the event loop");
+                    }
+                }
+            });
+
+            let mut byte = [0];
+            assert_eq!(
+                peer.read(&mut byte).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            peer.write_all(b"x").unwrap();
         }
     }
 }

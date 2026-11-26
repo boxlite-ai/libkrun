@@ -199,6 +199,12 @@ fn join_device(device: &mut dyn VirtioDevice) {
 }
 
 impl Vmm {
+    /// Whether the static VM configuration permits checkpointing.
+    /// Device support is checked separately at runtime.
+    pub fn checkpoint_supported(&self) -> bool {
+        self.checkpoint_supported
+    }
+
     /// An uncertain CPU/device transition makes this VM permanently unusable.
     pub fn checkpoint_failed(&self) -> bool {
         self.vcpus_failed
@@ -884,7 +890,9 @@ fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     let destination = std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(other)?;
     #[cfg(target_os = "linux")]
     let ret = unsafe {
-        libc::renameat2(
+        // Use the kernel interface on both glibc and musl.
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
